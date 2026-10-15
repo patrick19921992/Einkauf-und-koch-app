@@ -237,8 +237,9 @@ function schliesseDialog(wert, ausVerlauf = false) {
  *   Ist `wert` eine Funktion, wird ihr Ergebnis zurückgegeben. Gibt sie undefined zurück,
  *   bleibt der Dialog offen (z. B. bei ungültiger Eingabe).
  * inhalt: Text, Knoten oder Liste von Knoten.
+ * fokus: false verhindert, dass das erste Eingabefeld (und damit die Tastatur) aktiv wird.
  */
-export function dialog({ titel = '', inhalt = null, knoepfe = [{ text: 'OK', wert: true, art: 'primaer' }], schliessbar = true } = {}) {
+export function dialog({ titel = '', inhalt = null, knoepfe = [{ text: 'OK', wert: true, art: 'primaer' }], schliessbar = true, fokus = true } = {}) {
   if (dialogAufloesen) schliesseDialog(null);
   const d = document.getElementById('dialog');
   return new Promise((resolve) => {
@@ -267,9 +268,16 @@ export function dialog({ titel = '', inhalt = null, knoepfe = [{ text: 'OK', wer
       if (ev.target === d && schliessbar) schliesseDialog(null);
     };
     d.showModal();
-    history.pushState({ ekDialog: true }, '');
-    dialogImVerlauf = true;
-    const erstesFeld = d.querySelector('input, textarea, select');
+    // Eigener Verlaufseintrag, damit die Zurück-Geste nur den Dialog schließt.
+    // Läuft noch das Zurückspulen eines vorherigen Dialogs, erst danach eintragen.
+    const eintragen = () => {
+      if (dialogAufloesen !== resolve) return;
+      history.pushState({ ekDialog: true }, '');
+      dialogImVerlauf = true;
+    };
+    if (verlaufWartet) verlaufWartet.then(eintragen);
+    else eintragen();
+    const erstesFeld = fokus ? d.querySelector('input, textarea, select') : null;
     if (erstesFeld) setTimeout(() => erstesFeld.focus(), 50);
   });
 }
@@ -366,7 +374,8 @@ export async function navigiere(hash, { ersetzen = false } = {}) {
 }
 
 /** Eine Ansicht zurück (oder zur Rezeptliste, wenn es kein Zurück gibt). */
-export function zurueck() {
+export async function zurueck() {
+  if (verlaufWartet) await verlaufWartet;
   if (innerhalbNavigiert && history.length > 1) history.back();
   else navigiere(STANDARD_ROUTE, { ersetzen: true });
 }
@@ -519,6 +528,7 @@ async function registriereServiceWorker() {
     console.warn('Service Worker nicht registriert:', e);
     return;
   }
+  if (!registrierung) return;
   if (registrierung.waiting && navigator.serviceWorker.controller) merkeWartenden(registrierung.waiting);
   registrierung.addEventListener('updatefound', () => {
     const neu = registrierung.installing;
