@@ -57,7 +57,7 @@ export function hostVon(url) {
 
 // Für die Suche: klein, ohne Akzente; ä/ae, ö/oe, ü/ue und ß/ss gelten als gleich
 function falte(text) {
-  return String(text ?? '').toLowerCase().replace(/ß/g, 'ss').normalize('NFD').replace(/[̀-ͯ]/g, '')
+  return String(text ?? '').toLowerCase().replace(/ß/g, 'ss').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/ae/g, 'a').replace(/oe/g, 'o').replace(/ue/g, 'u');
 }
 

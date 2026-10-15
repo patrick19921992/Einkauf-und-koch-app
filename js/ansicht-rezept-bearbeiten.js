@@ -126,6 +126,14 @@ function duplikatHinweis(rezept) {
       el('a', { href: `#/rezept/${encodeURIComponent(rezept.id)}` }, rezept.title || 'Ohne Titel')));
 }
 
+// Wartet auf das nächste popstate (höchstens 700 ms)
+function nachVerlauf() {
+  return new Promise((fertig) => {
+    const t = setTimeout(fertig, 700);
+    window.addEventListener('popstate', () => { clearTimeout(t); setTimeout(fertig, 0); }, { once: true });
+  });
+}
+
 function kuerze(text, max) {
   return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
 }
@@ -142,11 +150,11 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
   let fertig = false;
   let speichert = false;
 
-  const zahlFeld = (wert, platzhalter) => el('input', {
-    type: 'number', inputmode: 'numeric', min: '0', step: 'any', value: wert ?? '', placeholder: platzhalter,
+  const zahlFeld = (wert, platzhalter, art = 'numeric') => el('input', {
+    type: 'number', inputmode: art, min: '0', step: 'any', value: wert ?? '', placeholder: platzhalter,
   });
   const titel = el('input', { type: 'text', value: rezept.title || '', required: true, autocomplete: 'off', enterkeyhint: 'next' });
-  const portionen = zahlFeld(rezept.servings, 'z. B. 4');
+  const portionen = zahlFeld(rezept.servings, 'z. B. 4', 'decimal');
   const gesamt = zahlFeld(rezept.totalMin, 'Min.');
   const vorb = zahlFeld(rezept.prepMin, 'Min.');
   const koch = zahlFeld(rezept.cookMin, 'Min.');
@@ -162,7 +170,11 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
     placeholder: 'Nudeln in Salzwasser 10 Minuten kochen.\n\nZwiebeln würfeln und anbraten.',
   });
   const notizen = el('textarea', { rows: 4, value: rezept.notes || '' });
-  const quelle = el('input', { type: 'url', value: rezept.sourceUrl || rezept.sourceSite || '', placeholder: 'https://… oder z. B. Omas Kochbuch', autocomplete: 'off' });
+  // Quelle darf auch ein freier Hinweis sein (kein type=url)
+  const quelle = el('input', {
+    type: 'text', inputmode: 'url', value: rezept.sourceUrl || rezept.sourceSite || '',
+    placeholder: 'https://… oder z. B. Omas Kochbuch', autocomplete: 'off', autocapitalize: 'off',
+  });
   const bild = el('input', { type: 'url', value: rezept.imageUrl || '', placeholder: 'https://…', autocomplete: 'off' });
 
   // Live-Vorschau der erkannten Zutaten und Schritte
@@ -209,10 +221,7 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
   }
 
   const timer = {};
-  const spaeter = (name, fn) => () => {
-    clearTimeout(timer[name]);
-    timer[name] = setTimeout(fn, 150);
-  };
+  const spaeter = (name, fn) => () => { clearTimeout(timer[name]); timer[name] = setTimeout(fn, 150); };
   zutaten.addEventListener('input', spaeter('zutaten', zeichneZutatenVorschau));
   schritte.addEventListener('input', spaeter('schritte', zeichneSchrittVorschau));
   zeichneZutatenVorschau();
@@ -236,11 +245,7 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
     const bildUrl = bild.value.trim();
     const problem = !t ? [titel, 'Bitte gib einen Titel ein.']
       : bildUrl && !istWebLink(bildUrl) ? [bild, 'Die Bild-Adresse muss mit https:// beginnen.'] : null;
-    if (problem) {
-      toast(problem[1]);
-      problem[0].focus();
-      return;
-    }
+    if (problem) { toast(problem[1]); problem[0].focus(); return; }
     const q = quelle.value.trim();
     const qIstLink = istWebLink(q);
     const minuten = (f) => (zahl(f.value) == null ? null : Math.round(zahl(f.value)));
@@ -273,11 +278,13 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
   async function abbrechen() {
     if (geaendert()) {
       const text = modus === 'import' ? 'Das geladene Rezept wird nicht gespeichert.' : 'Deine Änderungen gehen verloren.';
+      // Der Dialog nimmt beim Schließen seinen Verlaufseintrag zurück; danach erst weiter zurück
+      const verlauf = nachVerlauf();
       if (!(await bestaetige(text, { titel: 'Verwerfen?', ja: 'Verwerfen', nein: 'Weiter bearbeiten', gefahr: true }))) return;
+      await verlauf;
     }
     fertig = true;
-    // erst den Verlaufseintrag des Dialogs abbauen lassen, dann zurück
-    setTimeout(zurueck, 50);
+    zurueck();
   }
 
   kopfAktionen(el('button', { type: 'button', class: 'knopf primaer klein', onclick: speichern }, 'Speichern'));
@@ -331,12 +338,7 @@ async function zeigeImport(container, query, aufraeumer) {
   const urlFeld = el('input', {
     type: 'url', value: url, placeholder: 'https://www.chefkoch.de/rezepte/…', autocomplete: 'off', enterkeyhint: 'go',
   });
-  urlFeld.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Enter') {
-      ev.preventDefault();
-      laden();
-    }
-  });
+  urlFeld.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); laden(); } });
   let dupTimer = null;
   urlFeld.addEventListener('input', () => {
     clearTimeout(dupTimer);
@@ -363,7 +365,8 @@ async function zeigeImport(container, query, aufraeumer) {
     el('label', { class: 'feld' }, el('span', { class: 'nur-sr' }, 'Rezepttext'), textFeld),
     el('div', { class: 'leiste' },
       el('button', { type: 'button', class: 'knopf primaer', onclick: textUebernehmen }, symbol(SYMBOLE.text), 'Text übernehmen')));
-  container.replaceChildren(...(modus === 'text' ? [textKarte, linkKarte] : [linkKarte, textKarte]));
+  const textZuerst = modus === 'text' || (!proxy && !!geteilterText);
+  container.replaceChildren(...(textZuerst ? [textKarte, linkKarte] : [linkKarte, textKarte]));
 
   function zeigeStatus(knoten) {
     status.className = knoten ? '' : 'versteckt';
@@ -419,11 +422,7 @@ async function zeigeImport(container, query, aufraeumer) {
 
   function textUebernehmen() {
     const text = textFeld.value.trim();
-    if (!text) {
-      toast('Bitte zuerst den Rezepttext einfügen.');
-      textFeld.focus();
-      return;
-    }
+    if (!text) { toast('Bitte zuerst den Rezepttext einfügen.'); textFeld.focus(); return; }
     const titelVorgabe = text === geteilterText && geteilt?.title && !findeUrl(geteilt.title) ? geteilt.title.trim() : undefined;
     const quelleUrl = findeUrl(urlFeld.value) || findeUrl(text) || undefined;
     let entwurf;

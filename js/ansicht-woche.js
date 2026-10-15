@@ -20,13 +20,16 @@ const slotVon = (eintrag) => (SLOT_NAMEN[eintrag.slot] ? eintrag.slot : 'abend')
 
 /** Suchtext ohne Groß-/Kleinschreibung und Akzente ('Gemüse' → 'gemuse'). */
 function suchText(text) {
-  return String(text ?? '').toLowerCase().replace(/ß/g, 'ss').normalize('NFD').replace(/[̀-ͯ]/g, '');
+  return String(text ?? '').toLowerCase().replace(/ß/g, 'ss').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 function portionenZahl(wert, ersatz) {
   const n = Math.round(Number(wert));
-  return Number.isFinite(n) && n >= MIN_PORTIONEN ? Math.min(n, MAX_PORTIONEN) : ersatz;
+  return wert != null && Number.isFinite(n) && n >= MIN_PORTIONEN ? Math.min(n, MAX_PORTIONEN) : ersatz;
 }
+
+// Portionen eines Eintrags; fehlt die Angabe, gilt die des Rezepts
+const portionenVon = (eintrag, rezept) => portionenZahl(eintrag.servings, portionenZahl(rezept?.servings, 1));
 
 /** Stepper − / Zahl / +. `aendern(n)` wird bei jedem Klick aufgerufen. */
 function portionenStepper(wert, aendern, { fokus = null, name = 'Portionen' } = {}) {
@@ -182,14 +185,15 @@ export async function zeige(container, route) {
     await speichereEintrag({ ...eintrag, date: w.datum, slot: w.slot });
     const start = wochenstart(w.datum, einst.wochenstart);
     const sichtbar = container.querySelector(`[data-tag="${w.datum}"]`);
-    toast(`Verschoben auf ${formatDatum(w.datum, { wochentag: true })}.`, sichtbar ? {} : {
+    // formatDatum endet schon mit Punkt ('Do, 15.10.')
+    toast(`Verschoben auf ${formatDatum(w.datum, { wochentag: true })}`, sichtbar ? {} : {
       aktion: { text: 'Anzeigen', onclick: () => navigiere(`#/woche/${start}`) },
     });
   }
 
   async function menue(eintrag, rezept, titel) {
     const optionen = [];
-    if (rezept) optionen.push({ text: 'Kochen', wert: 'kochen', beschreibung: `Kochmodus für ${eintrag.servings} Portionen` });
+    if (rezept) optionen.push({ text: 'Kochen', wert: 'kochen', beschreibung: `Kochmodus für ${portionenVon(eintrag, rezept)} Portionen` });
     optionen.push({ text: 'Verschieben', wert: 'verschieben', beschreibung: 'Anderer Tag oder andere Mahlzeit' });
     if (!eintrag.recipeId) optionen.push({ text: 'Umbenennen', wert: 'umbenennen' });
     optionen.push({ text: 'Entfernen', wert: 'entfernen' });
@@ -197,7 +201,7 @@ export async function zeige(container, route) {
     if (!w) return;
     await verlaufFrei();
     if (w === 'kochen') {
-      navigiere(`#/kochen/${encodeURIComponent(rezept.id)}?p=${eintrag.servings}&plan=${encodeURIComponent(eintrag.id)}`);
+      navigiere(`#/kochen/${encodeURIComponent(rezept.id)}?p=${portionenVon(eintrag, rezept)}&plan=${encodeURIComponent(eintrag.id)}`);
     } else if (w === 'verschieben') {
       await verschieben(eintrag);
     } else if (w === 'umbenennen') {
@@ -221,7 +225,7 @@ export async function zeige(container, route) {
       eintrag.note ? el('span', { class: 'nebentext' }, eintrag.note) : null,
       eintrag.recipeId && !rezept ? el('span', { class: 'badge grau' }, 'Rezept gelöscht') : null,
       eintrag.recipeId
-        ? portionenStepper(portionenZahl(eintrag.servings, 1), (n) => {
+        ? portionenStepper(portionenVon(eintrag, rezept), (n) => {
           eintrag.servings = n;
           speichereEintrag(eintrag);
         }, { fokus })

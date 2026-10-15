@@ -13,11 +13,8 @@ import {
   berechneListe, abhakZustand, listeAlsText,
 } from './einkaufsliste.js';
 
-const ZEITRAEUME = [
-  { art: 'diese-woche', text: 'Diese Woche' },
-  { art: 'naechste-woche', text: 'Nächste Woche' },
-  { art: 'sieben-tage', text: '7 Tage' },
-];
+const ZEITRAEUME = [{ art: 'diese-woche', text: 'Diese Woche' }, { art: 'naechste-woche', text: 'Nächste Woche' },
+  { art: 'sieben-tage', text: '7 Tage' }];
 const PFEIL_HOCH = 'M7.4 15.4 12 10.8l4.6 4.6L18 14l-6-6-6 6z';
 const PFEIL_RUNTER = 'M16.6 8.6 12 13.2 7.4 8.6 6 10l6 6 6-6z';
 const BEOBACHTETE = new Set(['recipes', 'planEntries', 'trips', 'shoppingItems', 'aliases', 'settings']);
@@ -43,28 +40,22 @@ function ausText(text) {
   return { name: z.name, qty: z.qty, qty2: z.qty2, unit: z.unit, note: [z.size, z.note].filter(Boolean).join(', ') || null };
 }
 
-/**
- * Wartet, bis app.js den Verlaufseintrag des eben geschlossenen Dialogs entfernt hat.
- * Ein sofort folgender Dialog würde sonst seinen eigenen Eintrag verlieren (Zurück verlässt die App).
- */
+// Wartet, bis app.js den Verlaufseintrag des eben geschlossenen Dialogs entfernt hat –
+// ein sofort folgender Dialog verlöre sonst seinen eigenen Eintrag (Zurück verließe die App).
 async function verlaufFrei() {
   for (let i = 0; i < 25 && history.state?.ekDialog; i += 1) await new Promise((r) => setTimeout(r, 25));
 }
 
-function merkeFokus(container) {
-  const a = document.activeElement;
-  return a && container.contains(a) ? a.dataset?.fokus ?? null : null;
-}
-
-function stelleFokusHer(container, schluessel) {
-  if (!schluessel) return;
-  const ziel = [...container.querySelectorAll('[data-fokus]')].find((x) => x.dataset.fokus === schluessel);
+// Fokus über das Neuzeichnen hinweg behalten (Bedienelemente tragen data-fokus)
+const merkeFokus = (box) => (box.contains(document.activeElement) ? document.activeElement.dataset?.fokus ?? null : null);
+function stelleFokusHer(box, schluessel) {
+  const ziel = schluessel && [...box.querySelectorAll('[data-fokus]')].find((x) => x.dataset.fokus === schluessel);
   if (ziel && !ziel.disabled) ziel.focus({ preventScroll: true });
 }
 
 export async function zeige(container, route) {
   setzeTitel('Einkauf');
-  const s = {}; // aktueller Stand: einst, runde, liste, plan, aliase, zustaende, manuelle
+  const s = {}; // aktueller Stand: einst, runde, offeneRunden, liste, plan, aliase, zustaende, manuelle
   const offen = { erledigt: false, vorrat: false }; // aufgeklappte Bereiche
   let queryGenutzt = false;
   let timer = null;
@@ -89,14 +80,13 @@ export async function zeige(container, route) {
 
   // ------------------------------------------------------------ Laden + Berechnen
   async function laden() {
-    const [einst, rezepte, plan, trips, items, aliasListe] = await Promise.all([
-      db.holeEinstellungen(), db.alle('recipes'), db.alle('planEntries'), db.alle('trips'),
-      db.alle('shoppingItems'), db.alle('aliases'),
-    ]);
+    const [einst, rezepte, plan, trips, items, aliasListe] = await Promise.all([db.holeEinstellungen(),
+      ...['recipes', 'planEntries', 'trips', 'shoppingItems', 'aliases'].map((store) => db.alle(store))]);
     const wunsch = queryGenutzt ? null : bereichAusQuery(route.query);
     queryGenutzt = true;
     // offene Runde: die neueste ohne closedAt; sonst neu anlegen
-    let runde = trips.filter((t) => t.closedAt == null).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+    const offene = trips.filter((t) => t.closedAt == null).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    let runde = offene[0];
     if (!runde) {
       const z = wunsch || standardZeitraum('diese-woche', heute(), einst.wochenstart);
       runde = await db.speichere('trips', { from: z.von, to: z.bis, closedAt: null });
@@ -112,6 +102,7 @@ export async function zeige(container, route) {
     });
     Object.assign(s, {
       einst: { ...einst, vorrat }, runde, liste, plan, aliase,
+      offeneRunden: new Set([runde.id, ...offene.map((t) => t.id)]),
       zustaende: new Map(zustaende.map((z) => [z.id, z])),
       manuelle: new Map(manuelle.map((m) => [m.id, m])),
     });
@@ -241,8 +232,8 @@ export async function zeige(container, route) {
       console.error(e);
       toast('Speichern hat nicht geklappt.');
       plane(0);
-      return undefined;
     }
+    return undefined;
   }
 
   // Toast mit „Rückgängig“
@@ -254,6 +245,7 @@ export async function zeige(container, route) {
     if (!neu) return;
     feld.value = '';
     feld.focus();
+    // section bleibt leer: die Abteilung ergibt sich (mit Korrekturen) beim Berechnen der Liste
     await sicher(() => db.speichere('shoppingItems', { kind: 'manual', ...neu, section: null, checked: false }));
     const aliase = s.aliase || {};
     toast(`${neu.name} → ${abteilungsName(abteilungVon(kanonischerSchluessel(zutatSchluessel(neu.name), aliase), aliase))}`, { dauer: 2000 });
@@ -282,19 +274,17 @@ export async function zeige(container, route) {
     return () => (alt ? db.speichere('aliases', alt) : db.loesche('aliases', schluessel));
   }
 
-  async function herkunft(z) {
-    const quellen = [...(z.quellen || [])].sort((a, b) => String(a.datum).localeCompare(String(b.datum)));
-    await dialog({
-      titel: z.name,
-      inhalt: [
-        z.text ? el('p', null, 'Insgesamt: ', el('span', { class: 'menge' }, z.text)) : null,
-        el('ul', { class: 'liste' }, quellen.map((q) => el('li', { class: 'listen-eintrag' }, el('span', { class: 'haupt' },
-          el('span', { class: 'titel' }, q.titel || 'Ohne Titel'),
-          istSchluessel(q.datum) ? el('span', { class: 'nebentext' }, formatDatum(q.datum, { wochentag: true })) : null)))),
-      ],
-      knoepfe: [{ text: 'Schließen', wert: true, art: 'primaer' }],
-    });
-  }
+  // Gerichte, aus denen die Zeile stammt: 'Gulasch – Mi, 21.10.'
+  const herkunft = (z) => dialog({
+    titel: z.name,
+    inhalt: [
+      z.text ? el('p', null, 'Insgesamt: ', el('span', { class: 'menge' }, z.text)) : null,
+      el('ul', { class: 'liste' }, [...(z.quellen || [])].sort((a, b) => String(a.datum).localeCompare(String(b.datum)))
+        .map((q) => el('li', { class: 'listen-eintrag' }, el('span', { class: 'titel' },
+          [q.titel || 'Ohne Titel', istSchluessel(q.datum) && formatDatum(q.datum, { wochentag: true })].filter(Boolean).join(' – '))))),
+    ],
+    knoepfe: [{ text: 'Schließen', wert: true, art: 'primaer' }],
+  });
 
   async function menue(z) {
     const manuell = z.manuell ? s.manuelle.get(z.manuell.id) || z.manuell : null;
@@ -308,7 +298,7 @@ export async function zeige(container, route) {
       manuell && { text: 'Bearbeiten', wert: 'bearbeiten' },
       { text: 'Abteilung ändern', wert: 'abteilung', beschreibung: `Jetzt: ${abteilungsName(z.abteilung)}` },
       andere.length && { text: 'Zusammenführen mit …', wert: 'zusammen', beschreibung: 'Gleiche Zutat, anderer Name' },
-      verbunden.length && { text: 'Zusammenführung aufheben', wert: 'trennen' },
+      verbunden.length && { text: 'Zusammenführung aufheben', wert: 'trennen', beschreibung: verbunden.map((a) => a.id).join(', ') },
       !manuell && (z.imVorrat
         ? { text: 'Nicht mehr Vorrat', wert: 'vorrat-weg', beschreibung: 'Wieder auf die Liste setzen' }
         : { text: 'Zum Vorrat', wert: 'vorrat', beschreibung: 'Hast du meistens zu Hause' }),
@@ -323,9 +313,11 @@ export async function zeige(container, route) {
       else if (w === 'bearbeiten') await bearbeiten(manuell);
       else if (w === 'abteilung') await abteilungAendern(z, manuell);
       else if (w === 'zusammen') await zusammenfuehren(z, andere);
-      else if (w === 'trennen') await trennen(verbunden);
       else if (w === 'vorrat' || w === 'vorrat-weg') await vorratAendern(z, w === 'vorrat');
-      else if (w === 'ausblenden') {
+      else if (w === 'trennen') {
+        for (const a of verbunden) await speichereAlias(a.id, { kanonisch: null });
+        toast('Zusammenführung aufgehoben.');
+      } else if (w === 'ausblenden') {
         await zustandSpeichern(z, { versteckt: true });
         meldeMitZurueck(`„${z.name}“ ausgeblendet.`, () => zustandSpeichern(z, { versteckt: false }));
       } else if (w === 'loeschen') {
@@ -360,14 +352,6 @@ export async function zeige(container, route) {
     if (ziel) meldeMitZurueck('Zusammengeführt.', await speichereAlias(z.mergeKey, { kanonisch: ziel }));
   }
 
-  async function trennen(verbunden) {
-    const ids = verbunden.length === 1 ? [verbunden[0].id] : await auswahl('Was soll wieder einzeln stehen?',
-      [...verbunden.map((a) => ({ text: a.id, wert: [a.id] })), { text: 'Alle', wert: verbunden.map((a) => a.id) }]);
-    if (!ids) return;
-    for (const id of ids) await speichereAlias(id, { kanonisch: null });
-    toast('Zusammenführung aufgehoben.');
-  }
-
   async function vorratAendern(z, dazu) {
     const vorher = s.einst.vorrat;
     await db.speichereEinstellungen({ vorrat: dazu ? [...new Set([...vorher, z.mergeKey])] : vorher.filter((k) => k !== z.mergeKey) });
@@ -381,13 +365,10 @@ export async function zeige(container, route) {
   }
 
   async function eigenerZeitraum() {
-    const von = el('input', { type: 'date', value: s.runde.from, required: true });
-    const bis = el('input', { type: 'date', value: s.runde.to, required: true });
-    const lesen = () => {
-      const fehlt = [von, bis].find((f) => !istSchluessel(f.value));
-      if (fehlt) return fehlt.focus(), undefined;
-      return von.value <= bis.value ? { von: von.value, bis: bis.value } : { von: bis.value, bis: von.value };
-    };
+    const [von, bis] = [s.runde.from, s.runde.to].map((wert) => el('input', { type: 'date', value: wert, required: true }));
+    // ungültig → undefined: Dialog bleibt offen, Fokus aufs fehlerhafte Feld
+    const lesen = () => bereichAusQuery(new URLSearchParams({ von: von.value, bis: bis.value }))
+      ?? ([von, bis].find((f) => !istSchluessel(f.value))?.focus(), undefined);
     const w = await dialog({
       titel: 'Zeitraum wählen',
       inhalt: [feldMit('Von', von), feldMit('Bis', bis)],
@@ -442,11 +423,13 @@ export async function zeige(container, route) {
     if (!(await bestaetige(text, { titel: 'Einkauf abschließen?', ja: 'Abschließen' }))) return;
     const eintragIds = new Set(liste.eintraege.map((e) => e.id));
     const erledigte = [...s.manuelle.values()].filter((m) => m.checked);
+    // Abhak-Zustände längst abgeschlossener Runden braucht niemand mehr
+    const alteZustaende = [...s.zustaende.values()].filter((z) => !s.offeneRunden.has(z.tripId));
     ruheBis = Date.now() + 300;
     const ok = await sicher(async () => {
       // erst Gerichte und Einträge, zuletzt die Runde – so springt die Liste nicht zwischendurch
       await db.speichereViele('planEntries', s.plan.filter((e) => eintragIds.has(e.id)).map((e) => ({ ...e, tripId: runde.id })));
-      await db.speichereViele('shoppingItems', erledigte.map((m) => ({ ...m, deleted: true })));
+      await db.speichereViele('shoppingItems', [...erledigte, ...alteZustaende].map((m) => ({ ...m, deleted: true })));
       await db.speichere('trips', { ...runde, closedAt: Date.now() });
       return true;
     });
