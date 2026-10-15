@@ -25,13 +25,30 @@ const SORTIERUNG = new Intl.Collator('de', { sensitivity: 'base', numeric: true 
 
 const abteilungsName = (id) => ABTEILUNGEN.find((a) => a.id === id)?.name ?? 'Sonstiges';
 const anzahlText = (n, eins, mehr) => `${n} ${n === 1 ? eins : mehr}`;
+const knopf = (klasse, onclick, ...kinder) => el('button', { type: 'button', class: klasse, onclick }, ...kinder);
+const feldMit = (text, steuerung) => el('label', { class: 'feld' }, el('span', null, text), steuerung);
 
-/** { von, bis } aus ?von=…&bis=… oder null. */
+/** { von, bis } aus ?von=…&bis=… (vertauscht, falls nötig) oder null. */
 function bereichAusQuery(query) {
   const von = query?.get('von');
   const bis = query?.get('bis');
   if (!istSchluessel(von) || !istSchluessel(bis)) return null;
   return von <= bis ? { von, bis } : { von: bis, bis: von };
+}
+
+/** Manueller Eintrag aus einer Textzeile ('2 l Milch') oder null. */
+function ausText(text) {
+  const z = parseZeile(text);
+  if (!z || !z.name) return null;
+  return { name: z.name, qty: z.qty, qty2: z.qty2, unit: z.unit, note: [z.size, z.note].filter(Boolean).join(', ') || null };
+}
+
+/**
+ * Wartet, bis app.js den Verlaufseintrag des eben geschlossenen Dialogs entfernt hat.
+ * Ein sofort folgender Dialog würde sonst seinen eigenen Eintrag verlieren (Zurück verlässt die App).
+ */
+async function verlaufFrei() {
+  for (let i = 0; i < 25 && history.state?.ekDialog; i += 1) await new Promise((r) => setTimeout(r, 25));
 }
 
 function merkeFokus(container) {
@@ -47,31 +64,27 @@ function stelleFokusHer(container, schluessel) {
 
 export async function zeige(container, route) {
   setzeTitel('Einkauf');
-  const s = {}; // aktueller Stand: einst, runde, liste, aliase, zustaende, manuelle
+  const s = {}; // aktueller Stand: einst, runde, liste, plan, aliase, zustaende, manuelle
+  const offen = { erledigt: false, vorrat: false }; // aufgeklappte Bereiche
   let queryGenutzt = false;
   let timer = null;
   let ruheBis = 0;
   let laeuft = false;
   let nochmal = false;
   let beendet = false;
-  let erledigtOffen = false;
-  let vorratOffen = false;
 
   // ------------------------------------------------------------ Grundgerüst (bleibt stehen)
   const feld = el('input', {
     type: 'text', placeholder: 'Hinzufügen, z. B. 2 l Milch', 'aria-label': 'Eintrag hinzufügen',
     autocomplete: 'off', autocapitalize: 'sentences', enterkeyhint: 'enter',
   });
-  const formular = el('form', { class: 'einkauf-eingabe', onsubmit: hinzufuegen },
-    feld,
+  const formular = el('form', { class: 'einkauf-eingabe', onsubmit: hinzufuegen }, feld,
     el('button', { type: 'submit', class: 'icon-knopf primaer', 'aria-label': 'Hinzufügen' }, symbol(SYMBOLE.plus)));
   const zeitraumBox = el('div', { class: 'zeitraum' });
   const listenBox = el('div', { class: 'stapel' });
-  const teilenKnopf = el('button', { type: 'button', class: 'knopf', onclick: teilen }, symbol(SYMBOLE.teilen), 'Teilen');
-  const reihenfolgeKnopf = el('button', { type: 'button', class: 'knopf', onclick: reihenfolge }, 'Reihenfolge');
-  const abschliessenKnopf = el('button', { type: 'button', class: 'knopf primaer', onclick: abschliessen },
-    symbol(SYMBOLE.haken), 'Einkauf abschließen');
-  const aktionen = el('div', { class: 'aktionen-leiste' }, teilenKnopf, reihenfolgeKnopf, abschliessenKnopf);
+  const teilenKnopf = knopf('knopf', teilen, symbol(SYMBOLE.teilen), 'Teilen');
+  const abschliessenKnopf = knopf('knopf primaer', abschliessen, symbol(SYMBOLE.haken), 'Einkauf abschließen');
+  const aktionen = el('div', { class: 'aktionen-leiste' }, teilenKnopf, knopf('knopf', reihenfolge, 'Reihenfolge'), abschliessenKnopf);
   container.append(formular, zeitraumBox, listenBox, aktionen);
 
   // ------------------------------------------------------------ Laden + Berechnen
@@ -98,49 +111,37 @@ export async function zeige(container, route) {
       planEintraege: plan, rezepte, manuelle, zustaende, aliase, vorrat, runde, reihenfolge: einst.abteilungsReihenfolge,
     });
     Object.assign(s, {
-      einst: { ...einst, vorrat }, runde, liste, aliase, plan,
+      einst: { ...einst, vorrat }, runde, liste, plan, aliase,
       zustaende: new Map(zustaende.map((z) => [z.id, z])),
       manuelle: new Map(manuelle.map((m) => [m.id, m])),
     });
   }
 
   // ------------------------------------------------------------ Darstellung
-  function quellText(z) {
-    if (z.manuell) return z.manuell.note || '';
-    const titel = [...new Set((z.quellen || []).map((q) => q.titel).filter(Boolean))];
-    return titel.join(', ');
-  }
-
   function postenZeile(z, { vorrat = false } = {}) {
-    const quelle = quellText(z);
+    const quelle = z.manuell ? z.manuell.note || '' : [...new Set((z.quellen || []).map((q) => q.titel).filter(Boolean))].join(', ');
     // „noch …“ nur, wenn nach dem Abhaken etwas dazukam
-    const offenerRest = !z.manuell && !z.erledigt && z.restText && z.restText !== z.text ? z.restText : '';
+    const rest = !z.manuell && !z.erledigt && z.restText && z.restText !== z.text ? z.restText : '';
     const text = el('span', { class: 'posten-text' },
-      z.text ? el('span', { class: 'menge' }, z.text) : null,
-      z.text ? ' ' : null,
+      z.text ? [el('span', { class: 'menge' }, z.text), ' '] : null,
       z.name,
-      offenerRest ? el('span', { class: 'rest' }, `noch ${offenerRest}`) : null,
+      rest ? el('span', { class: 'rest' }, `noch ${rest}`) : null,
       quelle ? el('span', { class: 'posten-quelle' }, quelle) : null);
     const haken = vorrat ? null : el('input', {
-      type: 'checkbox',
-      checked: z.erledigt === true,
-      dataset: { fokus: `h:${z.mergeKey}` },
+      type: 'checkbox', checked: z.erledigt === true, dataset: { fokus: `h:${z.mergeKey}` },
       onchange: (ev) => abhaken(z, ev.target.checked, ev.target.closest('.posten')),
     });
     return el('li', { class: ['posten', z.erledigt && 'erledigt'] },
       el('label', null, haken, text),
       el('button', {
-        type: 'button',
-        class: 'icon-knopf',
-        'aria-label': `Optionen für ${z.name}`,
-        dataset: { fokus: `m:${z.mergeKey}` },
-        onclick: () => menue(z),
+        type: 'button', class: 'icon-knopf', 'aria-label': `Optionen für ${z.name}`,
+        dataset: { fokus: `m:${z.mergeKey}` }, onclick: () => menue(z),
       }, symbol(SYMBOLE.mehr)));
   }
 
-  function klappe(titel, offen, merken, ...inhalt) {
-    const d = el('details', { class: 'klappe', open: offen }, el('summary', null, titel), ...inhalt);
-    d.addEventListener('toggle', () => merken(d.open));
+  function klappe(art, titel, ...inhalt) {
+    const d = el('details', { class: 'klappe', open: offen[art] }, el('summary', null, titel), ...inhalt);
+    d.addEventListener('toggle', () => { offen[art] = d.open; });
     return d;
   }
 
@@ -166,14 +167,12 @@ export async function zeige(container, route) {
   function zeichneListe() {
     const { liste } = s;
     const teile = [];
-    const leer = !liste.abteilungen.length && !liste.erledigt.length && !liste.vorrat.length;
-    if (leer) {
+    if (!liste.abteilungen.length && !liste.erledigt.length && !liste.vorrat.length) {
       teile.push(el('div', { class: 'leer' },
         el('p', null, 'Für diesen Zeitraum steht nichts auf der Liste.'),
         el('p', { class: 'nebentext' }, 'Plane Gerichte in der Woche oder füge oben eigene Einträge hinzu.'),
-        el('div', { class: 'leiste' }, el('button', {
-          type: 'button', class: 'knopf', onclick: () => navigiere(`#/woche/${s.runde.from}`),
-        }, symbol(SYMBOLE.kalender), 'Zur Woche'))));
+        el('div', { class: 'leiste' },
+          knopf('knopf', () => navigiere(`#/woche/${s.runde.from}`), symbol(SYMBOLE.kalender), 'Zur Woche'))));
     } else if (!liste.abteilungen.length && liste.erledigt.length) {
       teile.push(el('p', { class: 'hinweis erfolg' }, 'Alles erledigt! Du kannst den Einkauf jetzt abschließen.'));
     }
@@ -182,21 +181,19 @@ export async function zeige(container, route) {
         el('ul', { class: 'liste' }, a.zeilen.map((z) => postenZeile(z)))));
     }
     if (liste.erledigt.length) {
-      teile.push(klappe(`Erledigt (${liste.erledigt.length})`, erledigtOffen, (o) => { erledigtOffen = o; },
+      teile.push(klappe('erledigt', `Erledigt (${liste.erledigt.length})`,
         el('ul', { class: 'liste' }, liste.erledigt.map((z) => postenZeile(z)))));
     }
     if (liste.vorrat.length) {
-      teile.push(klappe(`Vorrat (${liste.vorrat.length})`, vorratOffen, (o) => { vorratOffen = o; },
+      teile.push(klappe('vorrat', `Vorrat (${liste.vorrat.length})`,
         el('p', { class: 'nebentext mittig' }, 'Hast du normalerweise zu Hause. Über ⋮ wieder auf die Liste setzen.'),
         el('ul', { class: 'liste' }, liste.vorrat.map((z) => postenZeile(z, { vorrat: true })))));
     }
     const versteckte = [...s.zustaende.values()].filter((z) => z.tripId === s.runde.id && z.versteckt);
     if (versteckte.length) {
-      teile.push(el('div', { class: 'leiste mittig' }, el('button', {
-        type: 'button',
-        class: 'knopf flach klein',
-        onclick: () => sicher(() => db.speichereViele('shoppingItems', versteckte.map((z) => ({ ...z, versteckt: false })))),
-      }, `Ausgeblendete wieder zeigen (${versteckte.length})`)));
+      teile.push(el('div', { class: 'leiste mittig' }, knopf('knopf flach klein',
+        () => sicher(() => db.speichereViele('shoppingItems', versteckte.map((z) => ({ ...z, versteckt: false })))),
+        `Ausgeblendete wieder zeigen (${versteckte.length})`)));
     }
     listenBox.replaceChildren(...teile);
     teilenKnopf.disabled = liste.anzahlOffen === 0;
@@ -248,25 +245,24 @@ export async function zeige(container, route) {
     }
   }
 
+  // Toast mit „Rückgängig“
+  const meldeMitZurueck = (text, zurueck) => toast(text, { aktion: { text: 'Rückgängig', onclick: () => sicher(zurueck) } });
+
   async function hinzufuegen(ev) {
     ev.preventDefault();
-    const z = parseZeile(feld.value);
-    if (!z || !z.name) return;
+    const neu = ausText(feld.value);
+    if (!neu) return;
     feld.value = '';
     feld.focus();
-    const note = [z.size, z.note].filter(Boolean).join(', ') || null;
-    await sicher(() => db.speichere('shoppingItems', {
-      kind: 'manual', name: z.name, qty: z.qty, qty2: z.qty2, unit: z.unit, note, section: null, checked: false,
-    }));
-    const schluessel = kanonischerSchluessel(zutatSchluessel(z.name), s.aliase || {});
-    toast(`${z.name} → ${abteilungsName(abteilungVon(schluessel, s.aliase || {}))}`, { dauer: 2000 });
+    await sicher(() => db.speichere('shoppingItems', { kind: 'manual', ...neu, section: null, checked: false }));
+    const aliase = s.aliase || {};
+    toast(`${neu.name} → ${abteilungsName(abteilungVon(kanonischerSchluessel(zutatSchluessel(neu.name), aliase), aliase))}`, { dauer: 2000 });
   }
 
   function zustandSpeichern(z, felder) {
     const id = `${s.runde.id}|${z.mergeKey}`;
-    const alt = s.zustaende.get(id);
     return db.speichere('shoppingItems', {
-      abgehakt: null, erledigt: false, versteckt: false, ...(alt || {}),
+      abgehakt: null, erledigt: false, versteckt: false, ...(s.zustaende.get(id) || {}),
       id, kind: 'state', tripId: s.runde.id, mergeKey: z.mergeKey, ...felder,
     });
   }
@@ -274,33 +270,27 @@ export async function zeige(container, route) {
   async function abhaken(z, an, zeile) {
     zeile?.classList.toggle('erledigt', an);
     ruheBis = Date.now() + 700;
-    await sicher(() => {
-      if (z.manuell) return db.speichere('shoppingItems', { ...(s.manuelle.get(z.manuell.id) || z.manuell), checked: an });
-      return zustandSpeichern(z, an ? { ...abhakZustand(z), versteckt: false } : { erledigt: false, abgehakt: null });
-    });
+    await sicher(() => (z.manuell
+      ? db.speichere('shoppingItems', { ...(s.manuelle.get(z.manuell.id) || z.manuell), checked: an })
+      : zustandSpeichern(z, an ? { ...abhakZustand(z), versteckt: false } : { erledigt: false, abgehakt: null })));
   }
 
+  /** Speichert eine Korrektur (Alias) und liefert die Funktion zum Zurücknehmen. */
   async function speichereAlias(schluessel, felder) {
     const alt = s.aliase[schluessel];
     await db.speichere('aliases', { kanonisch: null, section: null, ...(alt || {}), id: schluessel, ...felder });
     return () => (alt ? db.speichere('aliases', alt) : db.loesche('aliases', schluessel));
   }
 
-  function alleZeilen() {
-    const { liste } = s;
-    return [...liste.abteilungen.flatMap((a) => a.zeilen), ...liste.erledigt, ...liste.vorrat];
-  }
-
   async function herkunft(z) {
-    const quellen = [...(z.quellen || [])].sort((a, b) => (a.datum || '').localeCompare(b.datum || ''));
+    const quellen = [...(z.quellen || [])].sort((a, b) => String(a.datum).localeCompare(String(b.datum)));
     await dialog({
       titel: z.name,
       inhalt: [
         z.text ? el('p', null, 'Insgesamt: ', el('span', { class: 'menge' }, z.text)) : null,
-        el('ul', { class: 'liste' }, quellen.map((q) => el('li', { class: 'listen-eintrag' },
-          el('span', { class: 'haupt' },
-            el('span', { class: 'titel' }, q.titel || 'Ohne Titel'),
-            istSchluessel(q.datum) ? el('span', { class: 'nebentext' }, formatDatum(q.datum, { wochentag: true })) : null)))),
+        el('ul', { class: 'liste' }, quellen.map((q) => el('li', { class: 'listen-eintrag' }, el('span', { class: 'haupt' },
+          el('span', { class: 'titel' }, q.titel || 'Ohne Titel'),
+          istSchluessel(q.datum) ? el('span', { class: 'nebentext' }, formatDatum(q.datum, { wochentag: true })) : null)))),
       ],
       knoepfe: [{ text: 'Schließen', wert: true, art: 'primaer' }],
     });
@@ -308,43 +298,39 @@ export async function zeige(container, route) {
 
   async function menue(z) {
     const manuell = z.manuell ? s.manuelle.get(z.manuell.id) || z.manuell : null;
-    const andere = manuell ? [] : alleZeilen().filter((x) => !x.manuell && x.mergeKey !== z.mergeKey);
-    const zusammengefuehrt = manuell ? [] : Object.values(s.aliase).filter((a) => a.kanonisch === z.mergeKey);
-    const optionen = [];
-    if (!manuell && z.quellen?.length) {
-      optionen.push({ text: 'Herkunft anzeigen', wert: 'herkunft', beschreibung: anzahlText(z.quellen.length, 'Gericht', 'Gerichte') });
-    }
-    if (manuell) optionen.push({ text: 'Bearbeiten', wert: 'bearbeiten' });
-    optionen.push({ text: 'Abteilung ändern', wert: 'abteilung', beschreibung: `Jetzt: ${abteilungsName(z.abteilung)}` });
-    if (andere.length) optionen.push({ text: 'Zusammenführen mit …', wert: 'zusammen', beschreibung: 'Gleiche Zutat, anderer Name' });
-    if (zusammengefuehrt.length) optionen.push({ text: 'Zusammenführung aufheben', wert: 'trennen' });
-    if (!manuell) {
-      optionen.push(z.imVorrat
+    const { liste } = s;
+    const andere = manuell ? [] : [...liste.abteilungen.flatMap((a) => a.zeilen), ...liste.erledigt, ...liste.vorrat]
+      .filter((x) => !x.manuell && x.mergeKey !== z.mergeKey);
+    const verbunden = manuell ? [] : Object.values(s.aliase).filter((a) => a.kanonisch === z.mergeKey);
+    const optionen = [
+      !manuell && z.quellen?.length
+        && { text: 'Herkunft anzeigen', wert: 'herkunft', beschreibung: anzahlText(z.quellen.length, 'Gericht', 'Gerichte') },
+      manuell && { text: 'Bearbeiten', wert: 'bearbeiten' },
+      { text: 'Abteilung ändern', wert: 'abteilung', beschreibung: `Jetzt: ${abteilungsName(z.abteilung)}` },
+      andere.length && { text: 'Zusammenführen mit …', wert: 'zusammen', beschreibung: 'Gleiche Zutat, anderer Name' },
+      verbunden.length && { text: 'Zusammenführung aufheben', wert: 'trennen' },
+      !manuell && (z.imVorrat
         ? { text: 'Nicht mehr Vorrat', wert: 'vorrat-weg', beschreibung: 'Wieder auf die Liste setzen' }
-        : { text: 'Zum Vorrat', wert: 'vorrat', beschreibung: 'Hast du meistens zu Hause' });
-      if (!z.imVorrat) optionen.push({ text: 'Ausblenden', wert: 'ausblenden', beschreibung: 'Nur für diesen Einkauf' });
-    } else {
-      optionen.push({ text: 'Löschen', wert: 'loeschen' });
-    }
+        : { text: 'Zum Vorrat', wert: 'vorrat', beschreibung: 'Hast du meistens zu Hause' }),
+      !manuell && !z.imVorrat && { text: 'Ausblenden', wert: 'ausblenden', beschreibung: 'Nur für diesen Einkauf' },
+      manuell && { text: 'Löschen', wert: 'loeschen' },
+    ].filter(Boolean);
     const w = await auswahl(z.name, optionen);
     if (!w) return;
+    await verlaufFrei();
     await sicher(async () => {
       if (w === 'herkunft') await herkunft(z);
       else if (w === 'bearbeiten') await bearbeiten(manuell);
       else if (w === 'abteilung') await abteilungAendern(z, manuell);
       else if (w === 'zusammen') await zusammenfuehren(z, andere);
-      else if (w === 'trennen') await trennen(z, zusammengefuehrt);
+      else if (w === 'trennen') await trennen(verbunden);
       else if (w === 'vorrat' || w === 'vorrat-weg') await vorratAendern(z, w === 'vorrat');
       else if (w === 'ausblenden') {
         await zustandSpeichern(z, { versteckt: true });
-        toast(`„${z.name}“ ausgeblendet.`, {
-          aktion: { text: 'Rückgängig', onclick: () => sicher(() => zustandSpeichern(z, { versteckt: false })) },
-        });
+        meldeMitZurueck(`„${z.name}“ ausgeblendet.`, () => zustandSpeichern(z, { versteckt: false }));
       } else if (w === 'loeschen') {
         await db.loesche('shoppingItems', manuell.id);
-        toast(`„${z.name}“ gelöscht.`, {
-          aktion: { text: 'Rückgängig', onclick: () => sicher(() => db.wiederherstellen('shoppingItems', manuell.id)) },
-        });
+        meldeMitZurueck(`„${z.name}“ gelöscht.`, () => db.wiederherstellen('shoppingItems', manuell.id));
       }
     });
   }
@@ -354,10 +340,8 @@ export async function zeige(container, route) {
       wert: formatZutat({ qty: item.qty, qty2: item.qty2, unit: item.unit, size: null, name: item.name, note: item.note }),
       pflicht: true, ok: 'Speichern',
     });
-    const z = text ? parseZeile(text) : null;
-    if (!z || !z.name) return;
-    const note = [z.size, z.note].filter(Boolean).join(', ') || null;
-    await db.speichere('shoppingItems', { ...item, name: z.name, qty: z.qty, qty2: z.qty2, unit: z.unit, note });
+    const neu = text ? ausText(text) : null;
+    if (neu) await db.speichere('shoppingItems', { ...item, ...neu });
   }
 
   async function abteilungAendern(z, manuell) {
@@ -373,14 +357,12 @@ export async function zeige(container, route) {
     const ziel = await auswahl(`„${z.name}“ zusammenführen mit …`, [...andere]
       .sort((a, b) => SORTIERUNG.compare(a.name, b.name))
       .map((x) => ({ text: x.name, wert: x.mergeKey, beschreibung: x.text || undefined })));
-    if (!ziel) return;
-    const rueckgaengig = await speichereAlias(z.mergeKey, { kanonisch: ziel });
-    toast('Zusammengeführt.', { aktion: { text: 'Rückgängig', onclick: () => sicher(rueckgaengig) } });
+    if (ziel) meldeMitZurueck('Zusammengeführt.', await speichereAlias(z.mergeKey, { kanonisch: ziel }));
   }
 
-  async function trennen(z, zusammengefuehrt) {
-    const ids = zusammengefuehrt.length === 1 ? [zusammengefuehrt[0].id] : await auswahl('Was soll wieder einzeln stehen?',
-      [...zusammengefuehrt.map((a) => ({ text: a.id, wert: [a.id] })), { text: 'Alle', wert: zusammengefuehrt.map((a) => a.id) }]);
+  async function trennen(verbunden) {
+    const ids = verbunden.length === 1 ? [verbunden[0].id] : await auswahl('Was soll wieder einzeln stehen?',
+      [...verbunden.map((a) => ({ text: a.id, wert: [a.id] })), { text: 'Alle', wert: verbunden.map((a) => a.id) }]);
     if (!ids) return;
     for (const id of ids) await speichereAlias(id, { kanonisch: null });
     toast('Zusammenführung aufgehoben.');
@@ -388,11 +370,9 @@ export async function zeige(container, route) {
 
   async function vorratAendern(z, dazu) {
     const vorher = s.einst.vorrat;
-    const neu = dazu ? [...new Set([...vorher, z.mergeKey])] : vorher.filter((k) => k !== z.mergeKey);
-    await db.speichereEinstellungen({ vorrat: neu });
-    toast(dazu ? `„${z.name}“ zählt jetzt zum Vorrat.` : `„${z.name}“ steht wieder auf der Liste.`, {
-      aktion: { text: 'Rückgängig', onclick: () => sicher(() => db.speichereEinstellungen({ vorrat: vorher })) },
-    });
+    await db.speichereEinstellungen({ vorrat: dazu ? [...new Set([...vorher, z.mergeKey])] : vorher.filter((k) => k !== z.mergeKey) });
+    meldeMitZurueck(dazu ? `„${z.name}“ zählt jetzt zum Vorrat.` : `„${z.name}“ steht wieder auf der Liste.`,
+      () => db.speichereEinstellungen({ vorrat: vorher }));
   }
 
   async function setzeZeitraum(z) {
@@ -403,21 +383,15 @@ export async function zeige(container, route) {
   async function eigenerZeitraum() {
     const von = el('input', { type: 'date', value: s.runde.from, required: true });
     const bis = el('input', { type: 'date', value: s.runde.to, required: true });
+    const lesen = () => {
+      const fehlt = [von, bis].find((f) => !istSchluessel(f.value));
+      if (fehlt) return fehlt.focus(), undefined;
+      return von.value <= bis.value ? { von: von.value, bis: bis.value } : { von: bis.value, bis: von.value };
+    };
     const w = await dialog({
       titel: 'Zeitraum wählen',
-      inhalt: [el('label', { class: 'feld' }, el('span', null, 'Von'), von), el('label', { class: 'feld' }, el('span', null, 'Bis'), bis)],
-      knoepfe: [
-        { text: 'Abbrechen', wert: null, art: 'flach' },
-        {
-          text: 'Übernehmen',
-          art: 'primaer',
-          wert: () => {
-            if (!istSchluessel(von.value)) return von.focus(), undefined;
-            if (!istSchluessel(bis.value)) return bis.focus(), undefined;
-            return von.value <= bis.value ? { von: von.value, bis: bis.value } : { von: bis.value, bis: von.value };
-          },
-        },
-      ],
+      inhalt: [feldMit('Von', von), feldMit('Bis', bis)],
+      knoepfe: [{ text: 'Abbrechen', wert: null, art: 'flach' }, { text: 'Übernehmen', wert: lesen, art: 'primaer' }],
     });
     if (w) await setzeZeitraum(w);
   }
@@ -430,30 +404,22 @@ export async function zeige(container, route) {
   async function reihenfolge() {
     const liste = sortierteAbteilungen(s.einst.abteilungsReihenfolge).map((a) => ({ id: a.id, name: a.name }));
     const ul = el('ul', { class: 'liste' });
-    const zeichneReihe = (fokus) => {
-      ul.replaceChildren(...liste.map((a, i) => el('li', { class: 'listen-eintrag' },
-        el('span', { class: 'titel' }, a.name),
-        el('button', {
-          type: 'button', class: 'icon-knopf', 'aria-label': `${a.name} nach oben`, disabled: i === 0,
-          dataset: { fokus: `${a.id}:-1` }, onclick: () => schiebe(i, -1),
-        }, symbol(PFEIL_HOCH)),
-        el('button', {
-          type: 'button', class: 'icon-knopf', 'aria-label': `${a.name} nach unten`, disabled: i === liste.length - 1,
-          dataset: { fokus: `${a.id}:1` }, onclick: () => schiebe(i, 1),
-        }, symbol(PFEIL_RUNTER)))));
-      if (fokus) {
-        const [id, richtung] = fokus;
-        stelleFokusHer(ul, `${id}:${richtung}`);
-        if (!ul.contains(document.activeElement)) stelleFokusHer(ul, `${id}:${-richtung}`);
-      }
-    };
-    const schiebe = (i, richtung) => {
-      const j = i + richtung;
+    const pfeil = (a, i, r) => el('button', {
+      type: 'button', class: 'icon-knopf', 'aria-label': `${a.name} nach ${r < 0 ? 'oben' : 'unten'}`,
+      disabled: r < 0 ? i === 0 : i === liste.length - 1, dataset: { fokus: `${a.id}:${r}` }, onclick: () => schiebe(i, r),
+    }, symbol(r < 0 ? PFEIL_HOCH : PFEIL_RUNTER));
+    const zeichneReihe = () => ul.replaceChildren(...liste.map((a, i) => el('li', { class: 'listen-eintrag' },
+      el('span', { class: 'titel' }, a.name), pfeil(a, i, -1), pfeil(a, i, 1))));
+    function schiebe(i, r) {
+      const j = i + r;
       if (j < 0 || j >= liste.length) return;
       [liste[i], liste[j]] = [liste[j], liste[i]];
-      zeichneReihe([liste[j].id, richtung]);
-    };
-    zeichneReihe(null);
+      zeichneReihe();
+      // Fokus bleibt beim verschobenen Eintrag (am Rand auf dem anderen Pfeil)
+      stelleFokusHer(ul, `${liste[j].id}:${r}`);
+      if (!ul.contains(document.activeElement)) stelleFokusHer(ul, `${liste[j].id}:${-r}`);
+    }
+    zeichneReihe();
     const w = await dialog({
       titel: 'Reihenfolge der Abteilungen',
       inhalt: [el('p', { class: 'nebentext' }, 'So, wie du durch deinen Laden gehst.'), ul],
@@ -463,43 +429,38 @@ export async function zeige(container, route) {
         { text: 'Speichern', wert: 'speichern', art: 'primaer' },
       ],
     });
-    if (w === 'speichern') await sicher(() => db.speichereEinstellungen({ abteilungsReihenfolge: liste.map((a) => a.id) }));
-    else if (w === 'standard') await sicher(() => db.speichereEinstellungen({ abteilungsReihenfolge: null }));
+    if (!w) return;
+    await sicher(() => db.speichereEinstellungen({ abteilungsReihenfolge: w === 'speichern' ? liste.map((a) => a.id) : null }));
   }
 
   async function abschliessen() {
     const { runde, liste } = s;
-    const offen = liste.anzahlOffen;
-    const text = offen > 0
-      ? `Noch ${anzahlText(offen, 'Posten', 'Posten')} offen. Zutaten der geplanten Gerichte verschwinden danach von der Liste, offene eigene Einträge bleiben.`
+    const text = liste.anzahlOffen > 0
+      ? `Noch ${anzahlText(liste.anzahlOffen, 'Posten', 'Posten')} offen. Zutaten der geplanten Gerichte verschwinden danach `
+        + 'von der Liste, offene eigene Einträge bleiben.'
       : 'Die geplanten Gerichte werden als eingekauft markiert, abgehakte eigene Einträge werden entfernt.';
     if (!(await bestaetige(text, { titel: 'Einkauf abschließen?', ja: 'Abschließen' }))) return;
     const eintragIds = new Set(liste.eintraege.map((e) => e.id));
-    const eintraege = s.plan.filter((e) => eintragIds.has(e.id));
-    const erledigteManuelle = [...s.manuelle.values()].filter((m) => m.checked);
+    const erledigte = [...s.manuelle.values()].filter((m) => m.checked);
     ruheBis = Date.now() + 300;
     const ok = await sicher(async () => {
       // erst Gerichte und Einträge, zuletzt die Runde – so springt die Liste nicht zwischendurch
-      await db.speichereViele('planEntries', eintraege.map((e) => ({ ...e, tripId: runde.id })));
-      await db.speichereViele('shoppingItems', erledigteManuelle.map((m) => ({ ...m, deleted: true })));
+      await db.speichereViele('planEntries', s.plan.filter((e) => eintragIds.has(e.id)).map((e) => ({ ...e, tripId: runde.id })));
+      await db.speichereViele('shoppingItems', erledigte.map((m) => ({ ...m, deleted: true })));
       await db.speichere('trips', { ...runde, closedAt: Date.now() });
       return true;
     });
-    if (!ok) return;
-    toast('Einkauf abgeschlossen.', {
-      aktion: { text: 'Rückgängig', onclick: () => sicher(() => abschlussZuruecknehmen(runde, eintragIds, erledigteManuelle)) },
-    });
+    if (ok) meldeMitZurueck('Einkauf abgeschlossen.', () => abschlussZuruecknehmen(runde, eintragIds, erledigte));
   }
 
-  async function abschlussZuruecknehmen(runde, eintragIds, manuelle) {
+  async function abschlussZuruecknehmen(runde, eintragIds, erledigte) {
     ruheBis = Date.now() + 300;
     // zuerst wieder öffnen, damit beim Zeichnen keine weitere Runde angelegt wird
     await db.speichere('trips', { ...runde, closedAt: null });
     const [trips, plan] = await Promise.all([db.alle('trips'), db.alle('planEntries')]);
-    await db.speichereViele('planEntries', plan
-      .filter((e) => eintragIds.has(e.id) && e.tripId === runde.id)
+    await db.speichereViele('planEntries', plan.filter((e) => eintragIds.has(e.id) && e.tripId === runde.id)
       .map((e) => ({ ...e, tripId: null })));
-    for (const m of manuelle) await db.wiederherstellen('shoppingItems', m.id);
+    for (const m of erledigte) await db.wiederherstellen('shoppingItems', m.id);
     for (const t of trips) if (t.closedAt == null && t.id !== runde.id) await db.loesche('trips', t.id);
   }
 

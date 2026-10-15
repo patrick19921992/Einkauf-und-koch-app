@@ -46,6 +46,14 @@ function portionenStepper(wert, aendern, { fokus = null, name = 'Portionen' } = 
   return el('span', { class: 'stepper', role: 'group', 'aria-label': name }, minus, ausgabe, plus);
 }
 
+/**
+ * Wartet, bis app.js den Verlaufseintrag des eben geschlossenen Dialogs entfernt hat.
+ * Ein sofort folgender Dialog würde sonst seinen eigenen Eintrag verlieren (Zurück verlässt die App).
+ */
+async function verlaufFrei() {
+  for (let i = 0; i < 25 && history.state?.ekDialog; i += 1) await new Promise((r) => setTimeout(r, 25));
+}
+
 function merkeFokus(container) {
   const a = document.activeElement;
   return a && container.contains(a) ? a.dataset?.fokus ?? null : null;
@@ -76,7 +84,7 @@ export async function zeige(container, route) {
 
   // ------------------------------------------------------------ Planen
   async function planen(datum, slot) {
-    const liste = [...rezepte.values()].sort((a, b) =>
+    const liste = (await db.alle('recipes')).sort((a, b) =>
       (b.favorite === true) - (a.favorite === true) || SORTIERUNG.compare(a.title || '', b.title || ''));
     let portionen = portionenZahl(einst.standardPortionen, 4);
     let gewaehlt;
@@ -131,6 +139,7 @@ export async function zeige(container, route) {
     uebernehmen?.classList.add('versteckt');
     const w = await ergebnis;
     if (!w) return;
+    await verlaufFrei();
     let neu = { date: datum, slot, servings: portionen, note: '', cooked: false, tripId: null };
     if (w.rezept) {
       neu = { ...neu, recipeId: w.rezept.id, title: w.rezept.title || '' };
@@ -185,6 +194,8 @@ export async function zeige(container, route) {
     if (!eintrag.recipeId) optionen.push({ text: 'Umbenennen', wert: 'umbenennen' });
     optionen.push({ text: 'Entfernen', wert: 'entfernen' });
     const w = await auswahl(titel, optionen);
+    if (!w) return;
+    await verlaufFrei();
     if (w === 'kochen') {
       navigiere(`#/kochen/${encodeURIComponent(rezept.id)}?p=${eintrag.servings}&plan=${encodeURIComponent(eintrag.id)}`);
     } else if (w === 'verschieben') {

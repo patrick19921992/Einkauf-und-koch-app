@@ -5,7 +5,7 @@ import { el, symbol, SYMBOLE, setzeTitel, kopfAktionen, toast, bestaetige, navig
 import * as db from './db.js';
 import { parseZeilen, zutatenAlsText } from './zutaten.js';
 import { ImportFehler, findeUrl, textOhneUrl, rezeptAusText, ladeRezept, findeTimer } from './rezept-import.js';
-import { zutatSpalten, istWebLink, hostVon } from './ansicht-rezepte.js';
+import { zutatSpalten, istWebLink, hostVon, nichtGefunden } from './ansicht-rezepte.js';
 
 const FEHLER_TEXTE = {
   'kein-proxy': 'Zum Laden über Links brauchst du den Import-Dienst (Mehr → Import-Dienst). Du kannst das Rezept aber unten als Text einfügen.',
@@ -20,28 +20,17 @@ const KOPF_TITEL = { neu: 'Neues Rezept', bearbeiten: 'Rezept bearbeiten', impor
 export async function zeige(container, route) {
   // Aufräum-Funktionen sammeln: der Import wechselt später noch ins Formular
   const aufraeumer = [];
-  const aufraeumen = () => {
-    while (aufraeumer.length) {
-      try {
-        aufraeumer.pop()();
-      } catch (e) {
-        console.error(e);
-      }
-    }
-  };
+  const aufraeumen = () => aufraeumer.splice(0).reverse().forEach((f) => {
+    try { f(); } catch (e) { console.error(e); }
+  });
   const [art, id, zusatz] = route.teile;
   if (art === 'import') {
     await zeigeImport(container, route.query, aufraeumer);
   } else if (art === 'rezept' && zusatz === 'bearbeiten') {
     setzeTitel(KOPF_TITEL.bearbeiten);
     const rezept = await db.hole('recipes', id);
-    if (rezept) {
-      zeigeFormular(container, { rezept, modus: 'bearbeiten', aufraeumer });
-    } else {
-      container.replaceChildren(el('div', { class: 'leer' },
-        el('p', null, 'Dieses Rezept gibt es nicht (mehr).'),
-        el('a', { class: 'knopf', href: '#/rezepte' }, 'Zur Rezeptliste')));
-    }
+    if (rezept) zeigeFormular(container, { rezept, modus: 'bearbeiten', aufraeumer });
+    else nichtGefunden(container);
   } else {
     setzeTitel(KOPF_TITEL.neu);
     zeigeFormular(container, { rezept: leeresRezept(await db.holeEinstellungen()), modus: 'neu', aufraeumer });
@@ -65,14 +54,10 @@ function zahl(text) {
   return t && Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null;
 }
 
+// 'Pasta, schnell,pasta' → ['Pasta', 'schnell'] (ohne Doppelte, höchstens 20)
 function tagsAusText(text) {
-  const gesehen = new Set();
-  return String(text ?? '').split(/[,;]/).map((t) => t.replace(/\s+/g, ' ').trim()).filter((t) => {
-    const k = t.toLowerCase();
-    if (!t || gesehen.has(k)) return false;
-    gesehen.add(k);
-    return true;
-  }).slice(0, 20);
+  const tags = String(text ?? '').split(/[,;]/).map((t) => t.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  return tags.filter((t, i) => tags.findIndex((x) => x.toLowerCase() === t.toLowerCase()) === i).slice(0, 20);
 }
 
 // Überschrift in der Zubereitung? → Name, null (setzt zurück) oder undefined (keine)
@@ -124,12 +109,9 @@ export function schritteAlsText(schritte) {
 
 // Vergleichsschlüssel für Quell-Links (ohne www., Abfrage und Schrägstrich am Ende)
 function urlSchluessel(url) {
-  try {
-    const u = new URL(String(url).trim());
-    return `${u.hostname.replace(/^www\./, '').toLowerCase()}${u.pathname.replace(/\/+$/, '')}`;
-  } catch {
-    return null;
-  }
+  let u;
+  try { u = new URL(String(url ?? '').trim()); } catch { return null; }
+  return /^https?:$/.test(u.protocol) ? `${u.hostname.replace(/^www\./, '').toLowerCase()}${u.pathname.replace(/\/+$/, '')}` : null;
 }
 
 async function findeDuplikat(url) {
@@ -148,8 +130,8 @@ function kuerze(text, max) {
   return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
 }
 
-function feld(beschriftung, steuerung, zusatz = null) {
-  return el('label', { class: 'feld' }, el('span', null, beschriftung), steuerung,
+function feld(beschriftung, steuerung, zusatz = null, style = null) {
+  return el('label', { class: 'feld', style }, el('span', null, beschriftung), steuerung,
     zusatz ? el('span', { class: 'nebentext' }, zusatz) : null);
 }
 
@@ -241,11 +223,7 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
   const zustand = () => JSON.stringify(felder.map((f) => f.value));
   const startZustand = zustand();
   const geaendert = () => !fertig && (modus === 'import' || zustand() !== startZustand);
-  const vorVerlassen = (ev) => {
-    if (!geaendert()) return;
-    ev.preventDefault();
-    ev.returnValue = '';
-  };
+  const vorVerlassen = (ev) => { if (geaendert()) { ev.preventDefault(); ev.returnValue = ''; } };
   window.addEventListener('beforeunload', vorVerlassen);
   aufraeumer.push(() => {
     window.removeEventListener('beforeunload', vorVerlassen);
@@ -255,15 +233,12 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
   async function speichern() {
     if (speichert) return;
     const t = titel.value.replace(/\s+/g, ' ').trim();
-    if (!t) {
-      toast('Bitte gib einen Titel ein.');
-      titel.focus();
-      return;
-    }
     const bildUrl = bild.value.trim();
-    if (bildUrl && !istWebLink(bildUrl)) {
-      toast('Die Bild-Adresse muss mit https:// beginnen.');
-      bild.focus();
+    const problem = !t ? [titel, 'Bitte gib einen Titel ein.']
+      : bildUrl && !istWebLink(bildUrl) ? [bild, 'Die Bild-Adresse muss mit https:// beginnen.'] : null;
+    if (problem) {
+      toast(problem[1]);
+      problem[0].focus();
       return;
     }
     const q = quelle.value.trim();
@@ -272,18 +247,12 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
     const prepMin = minuten(vorb);
     const cookMin = minuten(koch);
     const neu = {
-      ...rezept,
-      title: t,
-      servings: zahl(portionen.value),
-      prepMin,
-      cookMin,
+      ...rezept, title: t, servings: zahl(portionen.value), prepMin, cookMin,
       totalMin: minuten(gesamt) ?? (prepMin || cookMin ? (prepMin || 0) + (cookMin || 0) : null),
       tags: tagsAusText(tags.value),
       sourceUrl: qIstLink ? q : '',
       sourceSite: qIstLink ? (q === rezept.sourceUrl && rezept.sourceSite ? rezept.sourceSite : hostVon(q)) : q,
-      imageUrl: bildUrl,
-      notes: notizen.value.trim(),
-      favorite: rezept.favorite === true,
+      imageUrl: bildUrl, notes: notizen.value.trim(), favorite: rezept.favorite === true,
       // unveränderter Text: geparste Zeilen (mit ihren ids) behalten
       ingredients: zutaten.value === startZutaten && Array.isArray(rezept.ingredients) ? rezept.ingredients : parseZeilen(zutaten.value),
       steps: schritte.value === startSchritte && Array.isArray(rezept.steps) ? rezept.steps : parseSchritte(schritte.value),
@@ -312,15 +281,11 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
   }
 
   kopfAktionen(el('button', { type: 'button', class: 'knopf primaer klein', onclick: speichern }, 'Speichern'));
-  const zeitFeld = (beschriftung, f) => {
-    const l = feld(beschriftung, f);
-    l.style.flex = '1 1 9rem';
-    return l;
-  };
-  const zeiten = el('div', { class: 'leiste' },
+  // Zahlenfelder: zwei pro Zeile auf dem Handy, vier nebeneinander auf breiten Bildschirmen
+  const zeitFeld = (beschriftung, f) => feld(beschriftung, f, null, { flex: '1 1 9rem' });
+  const zeiten = el('div', { class: 'leiste', style: { alignItems: 'flex-end' } },
     zeitFeld('Portionen', portionen), zeitFeld('Gesamt (Min.)', gesamt),
     zeitFeld('Vorbereitung (Min.)', vorb), zeitFeld('Kochzeit (Min.)', koch));
-  zeiten.style.alignItems = 'flex-end';
 
   container.replaceChildren(
     ...hinweise,
@@ -352,9 +317,7 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
 async function zeigeImport(container, query, aufraeumer) {
   setzeTitel('Rezept importieren');
   let aktiv = true;
-  aufraeumer.push(() => {
-    aktiv = false;
-  });
+  aufraeumer.push(() => { aktiv = false; });
   const geteilt = holeGeteiltes();
   const einstellungen = await db.holeEinstellungen();
   const proxy = String(einstellungen.proxyUrl || '').trim();
@@ -436,6 +399,8 @@ async function zeigeImport(container, query, aufraeumer) {
       return;
     }
     urlFeld.value = u;
+    clearTimeout(dupTimer);
+    pruefeDuplikat(u).catch(console.error);
     ladeKnopf.disabled = true;
     zeigeStatus(el('p', { class: 'hinweis', role: 'status' }, 'Lade Rezept…'));
     try {
