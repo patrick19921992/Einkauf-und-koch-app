@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EINHEITEN, parseZahl, parseZeile, parseZeilen, zutatenAlsText, zutatSchluessel, skaliere, familieVon,
-  inBasis, zusammenfassen, formatZahl, formatMenge, formatZutat, teileAlsText,
+  inBasis, zusammenfassen, formatZahl, formatMenge, formatZutat, teileAlsText, produktName,
 } from '../js/zutaten.js';
 
 // Kurzform: nur die interessanten Felder einer geparsten Zeile
@@ -147,7 +147,7 @@ test('zutatSchluessel: Einzahl, Adjektive, Marken und Ausnahmen', () => {
     ['Zwiebel(n)', 'zwiebel'], ['Kirschtomaten', 'kirschtomate'], ['Knoblauchzehen', 'knoblauchzehe'],
     ['Nudeln', 'nudel'], ['Walnüsse', 'walnuss'], ['Lorbeerblätter', 'lorbeerblatt'], ['Champignons', 'champignon'],
     ['Bio-Zitrone', 'zitrone'], ['frische Petersilie', 'petersilie'], ['gehackte Mandeln', 'mandel'],
-    ['getrocknete Tomaten', 'getrocknete tomate'], ['Kritharaki-Nudeln', 'kritharaki-nudel'],
+    ['getrocknete Tomaten', 'tomate, getrocknet'], ['Kritharaki-Nudeln', 'kritharaki-nudel'],
     ['LE GUSTO Salz', 'salz'], ['TK-Erbsen', 'tk-erbse'], ['TK Erbsen', 'tk erbse'], ['Weizenmehl Type 405', 'weizenmehl'],
     ['Pfeffer aus der Mühle', 'pfeffer'], ['Butter (weich)', 'butter'], ['Kirschen', 'kirsche'],
     ['Brötchen', 'brötchen'], ['Würstchen', 'würstchen'], ['Basmatireis', 'basmatireis'], ['Chiasamen', 'chiasamen'],
@@ -158,6 +158,70 @@ test('zutatSchluessel: Einzahl, Adjektive, Marken und Ausnahmen', () => {
   // idempotent: ein Schlüssel bleibt sein eigener Schlüssel
   for (const [, aus] of faelle) assert.equal(zutatSchluessel(aus), aus);
   assert.equal(zutatSchluessel(''), '');
+});
+
+test('zutatSchluessel: Produkt-Zusätze bleiben im Schlüssel, Zubereitung nicht', () => {
+  const gleich = (namen, aus) => {
+    for (const n of namen) assert.equal(zutatSchluessel(n), aus, `zutatSchluessel('${n}')`);
+  };
+  // anderes Produkt als frische Ware
+  gleich(['Tomate(n), passierte', 'passierte Tomaten', 'Tomaten, passiert', 'Tomaten (passiert)'], 'tomate, passiert');
+  gleich(['stückige Tomaten', 'Tomaten, stückig'], 'tomate, stückig');
+  gleich(['geschälte Tomaten', 'ganze geschälte Tomaten', 'Tomate(n), geschälte'], 'tomate, geschält');
+  gleich(['getrocknete Tomaten', 'Tomaten, getrocknet'], 'tomate, getrocknet');
+  gleich(['Thymian, getrockneter', 'getrockneter Thymian', 'Thymian, getrocknet'], 'thymian, getrocknet');
+  gleich(['Koriander, gemahlener', 'gemahlener Koriander', 'Koriander, fein gemahlen'], 'koriander, gemahlen');
+  gleich(['gemahlene Mandeln', 'Mandeln, gemahlen', 'BACK FAMILY gemahlene Mandeln'], 'mandel, gemahlen');
+  gleich(['geräuchertes Paprikapulver'], 'paprikapulver, geräuchert');
+  // Zubereitung: gleiche Ware
+  gleich(['Zwiebel, gewürfelt', 'gehackte Zwiebel', 'Zwiebeln', 'Zwiebel(n), fein gehackt', 'gewürfelte Zwiebeln'], 'zwiebel');
+  gleich(['frische Petersilie', 'Petersilie, gehackt', 'Petersilie (frisch)'], 'petersilie');
+  gleich(['Schalotten (geschält und halbiert)', 'Schalotten'], 'schalotte');
+  gleich(['gehackte Mandeln', 'ganze Mandeln'], 'mandel');
+  gleich(['Gehacktes'], 'gehacktes');
+  // gemahlen/getrocknet ist hier ohnehin üblich
+  gleich(['frisch gemahlener Pfeffer', 'Pfeffer, gemahlen', 'Pfeffer'], 'pfeffer');
+  gleich(['frisch gemahlener schwarzer Pfeffer', 'schwarzer Pfeffer, gemahlen'], 'schwarzer pfeffer');
+  gleich(['getrockneter Majoran', 'Majoran, getrocknet', 'Majoran'], 'majoran');
+  gleich(['Zimt, gemahlen', 'Zimt'], 'zimt');
+  // idempotent
+  for (const k of ['tomate, passiert', 'mandel, gemahlen', 'thymian, getrocknet', 'tomaten in öl, getrocknet']) gleich([k], k);
+});
+
+test('produktName: Produkt-Zusatz aus der Notiz', () => {
+  assert.equal(produktName(parseZeile('500 g Tomate(n), passierte')), 'Tomaten, passierte');
+  assert.equal(produktName(parseZeile('1 TL Thymian, getrockneter')), 'Thymian, getrockneter');
+  assert.equal(produktName(parseZeile('1 TL Koriander (gemahlen)')), 'Koriander, gemahlen');
+  assert.equal(produktName(parseZeile('1 Dose Tomaten, stückig, aus der Dose')), 'Tomaten, stückig');
+  assert.equal(produktName(parseZeile('2 Zwiebeln, gehackt')), 'Zwiebeln');
+  assert.equal(produktName(parseZeile('1 Knoblauchzehe (geschält, klein geschnitten)')), 'Knoblauchzehe');
+  assert.equal(produktName(parseZeile('1/2 TL Majoran, getrocknet')), 'Majoran');
+  // gezählte Tomaten sind frisch, Dose/Gramm meint die Konserve
+  assert.equal(produktName(parseZeile('3 Tomaten, geschält')), 'Tomaten');
+  assert.equal(produktName(parseZeile('2 Dosen Tomate(n), geschälte')), 'Tomaten, geschälte');
+  assert.equal(produktName(parseZeile('400 g Tomaten, gehackt')), 'Tomaten, gehackt');
+  assert.equal(produktName({ name: 'Mehl' }), 'Mehl');
+  assert.equal(produktName(null), '');
+});
+
+test('zusammenfassen: frische und verarbeitete Ware getrennt, Zubereitung zusammen', () => {
+  const liste = zusammenfassen(['3 Tomaten', '500 g Tomate(n), passierte', '200 g passierte Tomaten',
+    '1 Dose stückige Tomaten', '2 Zwiebeln', '1 Zwiebel, gewürfelt', '1 gehackte Zwiebel', '1 Bund frische Petersilie',
+    '1 Bund Petersilie', '1 TL Thymian, getrockneter', '2 Zweige Thymian', '100 g gemahlene Mandeln', '50 g Mandeln',
+    '1 TL Koriander, gemahlen', '1 Bund Koriander'].map((l) => parseZeile(l)));
+  assert.deepEqual(liste.map((x) => [x.key, x.name, teileAlsText(x.teile)]), [
+    ['tomate', 'Tomaten', '3'],
+    ['tomate, passiert', 'Tomaten, passierte', '700 g'],
+    ['tomate, stückig', 'stückige Tomaten', '1 Dose'],
+    ['zwiebel', 'Zwiebeln', '4'],
+    ['petersilie', 'frische Petersilie', '2 Bund'],
+    ['thymian, getrocknet', 'Thymian, getrockneter', '1 TL'],
+    ['thymian', 'Thymian', '2 Zweige'],
+    ['mandel, gemahlen', 'gemahlene Mandeln', '100 g'],
+    ['mandel', 'Mandeln', '50 g'],
+    ['koriander, gemahlen', 'Koriander, gemahlen', '1 TL'],
+    ['koriander', 'Koriander', '1 Bund'],
+  ]);
 });
 
 test('skaliere, familieVon und inBasis', () => {

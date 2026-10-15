@@ -1,7 +1,7 @@
 // Einkaufslisten-Logik ohne DOM: Abteilungen erkennen, Zutaten der geplanten Gerichte
 // zusammenfassen, Abhak-Stand auswerten und die Liste als Text ausgeben. Läuft auch in Node.
 
-import { zutatSchluessel, zusammenfassen, teileAlsText, inBasis, skaliere } from './zutaten.js';
+import { zutatSchluessel, produktName, zusammenfassen, teileAlsText, inBasis, skaliere } from './zutaten.js';
 import { wochenstart, plusTage, heute } from './datum.js';
 
 // ---------------------------------------------------------------- Abteilungen
@@ -87,7 +87,7 @@ const STICHWOERTER = {
     saucenbinder ~dressing worcester worcestershire tabasco sambal sriracha harissa currypaste ~paste sesampaste
     tahin tahini tomatenmark miso meerrettich chutney relish hoisin teriyaki pesto ajvar aioli`,
   konserven: `konserve passierte_tomate passata passiert stückige_tomate geschälte_tomate tomate_geschält
-    tomate_stückig tomate_gehackt pizzatomate dosentomate
+    tomate_stückig tomate_gehackt gehackte_tomate pizzatomate dosentomate
     polpa kokosmilch kokosnussmilch kokoscreme kichererbse kidneybohne weiße_bohne schwarze_bohne baked_beans
     wachsbohne mais maiskorn maiskölbchen thunfisch sardine sardelle anchovis gewürzgurke essiggurke cornichon
     sauerkraut olive kaper artischockenherz getrocknete_tomate apfelmus weinblatt jackfruit röstzwiebel
@@ -162,7 +162,7 @@ function besterTreffer(k) {
 // Abteilung nur aus dem Text des Schlüssels (ohne Korrekturen); Ergebnisse werden gemerkt.
 // Was nach 'in', 'mit' … steht, entscheidet nicht ('Thunfisch in Öl', 'Wasser mit Kohlensäure').
 const MERKER = new Map();
-const KONSERVE_RE = /(?:^|[\s-])(?:dose|konserve)|aus der dose|in stücken|in öl|in salzlake|im eigenen saft/;
+const KONSERVE_RE = /(?:^|[\s-])(?:dose|konserve)|aus der dose|im glas|in stücken|in öl|in salzlake|im eigenen saft|eingelegt/;
 function abteilungAusText(k) {
   if (MERKER.has(k)) return MERKER.get(k);
   const kern = k.split(/ (?:in|im|mit|ohne|aus|für|vom|von) /)[0];
@@ -189,24 +189,57 @@ function aliasVon(aliase, key) {
   return a && typeof a === 'object' && !a.deleted ? a : null;
 }
 
-// Zusätze aus der Notiz, die die Abteilung ändern ('Tomate(n), passierte', 'Thymian, getrockneter')
-const ZUSATZ_RE = /(?:passiert|geschält|stückig|gehackt|getrocknet|gemahlen|tiefgekühlt|gefroren)\p{L}*|(?<!\p{L})tk(?!\p{L})|aus der dose/u;
-function zusatzAus(notiz) {
-  const m = String(notiz ?? '').toLowerCase().match(ZUSATZ_RE);
-  return m ? m[0] : null;
+// Schlüssel mit Produkt-Zusatz als Text für die Stichwörter:
+// 'tomate, passiert' → 'passierte tomate', 'erbse, dose' → 'erbse aus der dose'
+function alsText(k) {
+  const i = k.lastIndexOf(', ');
+  if (i < 0) return k;
+  const zusaetze = k.slice(i + 2).split(' ').filter(Boolean);
+  const behaelter = { dose: 'aus der dose', glas: 'im glas' };
+  return [...zusaetze.filter((z) => !behaelter[z]).map((z) => `${z}e`), k.slice(0, i),
+    ...zusaetze.filter((z) => behaelter[z]).map((z) => behaelter[z])].join(' ');
 }
 
-function abteilungIntern(key, aliase, einheiten, zusatz) {
+function abteilungIntern(key, aliase, einheiten) {
   const roh = String(key ?? '').trim();
   const korrektur = aliasVon(aliase, roh)?.section;
   if (korrektur && NACH_ID.has(korrektur)) return korrektur;
-  const k = (zutatSchluessel(roh) || roh.toLowerCase()).replace(/\s+/g, ' ');
+  // Schlüssel mit Zusatz ('tomate, passiert') sind schon fertig, sonst erst zum Schlüssel machen
+  const k = (roh.includes(', ') ? roh.toLowerCase() : zutatSchluessel(roh) || roh.toLowerCase()).replace(/\s+/g, ' ');
   if (!k) return 'sonstiges';
-  const id = abteilungAusText(zusatz ? `${k} ${zusatz}` : k);
+  const id = abteilungAusText(alsText(k));
   const liste = [...(einheiten || [])].filter(Boolean);
   if (liste.length && liste.every((u) => u === 'Dose') && DOSE_WIRD_KONSERVE.has(id)) return 'konserven';
   if (liste.length && liste.every((u) => u === 'Glas') && id === 'obst-gemuese') return 'konserven';
   return id;
+}
+
+// Dose/Glas in Notiz oder Name ('Tomaten (aus der Dose)', 'Tomaten aus der Dose')
+const DOSE_NOTIZ_RE = /(?:^|[^\p{L}])(?:dosen?|konserven?)(?!\p{L})/iu;
+const GLAS_NOTIZ_RE = /(?:^|[^\p{L}])glas(?!\p{L})/iu;
+const BEHAELTER_NAME_RE = / (?:aus der dose|aus der konserve|in der dose|aus dem glas|im glas)$/;
+
+/**
+ * Schlüssel einer Zutat für die Einkaufsliste: zutatSchluessel samt Produkt-Zusatz aus der Notiz.
+ * Frisches aus Dose oder Glas ist ein anderes Produkt: '1 Dose Tomaten' → 'tomate, dose' (Konserven),
+ * '3 Tomaten' → 'tomate'. Was ohnehin Konserve ist ('1 Dose Kichererbsen'), behält seinen Schlüssel.
+ */
+export function postenSchluessel(zutat) {
+  let k = zutatSchluessel(produktName(zutat));
+  const note = String(zutat?.note ?? '');
+  let dose = zutat?.unit === 'Dose' || DOSE_NOTIZ_RE.test(note);
+  let glas = !dose && (zutat?.unit === 'Glas' || GLAS_NOTIZ_RE.test(note));
+  const m = k.match(BEHAELTER_NAME_RE);
+  if (m) {
+    k = zutatSchluessel(k.slice(0, m.index));
+    if (m[0].includes('glas')) glas = !dose;
+    else dose = true;
+  }
+  if (!k || k.includes(', ') || (!dose && !glas)) return k;
+  const id = abteilungAusText(k);
+  if (dose && DOSE_WIRD_KONSERVE.has(id)) return `${k}, dose`;
+  if (glas && id === 'obst-gemuese') return `${k}, glas`;
+  return k;
 }
 
 /**
@@ -214,7 +247,15 @@ function abteilungIntern(key, aliase, einheiten, zusatz) {
  * → Stichwort → 'sonstiges'. `einheiten` (optional): Einheiten der Zeile, z. B. ['Dose'] → Konserven.
  */
 export function abteilungVon(key, aliase = {}, einheiten = null) {
-  return abteilungIntern(key, aliase, einheiten, null);
+  return abteilungIntern(key, aliase, einheiten);
+}
+
+/** Abteilung eines eigenen Eintrags wie in der Liste: gewählte Abteilung, sonst aus Name, Notiz und Einheit. */
+export function abteilungEintrag(eintrag, aliase = {}) {
+  if (NACH_ID.has(eintrag?.section)) return eintrag.section;
+  const key = kanonischerSchluessel(postenSchluessel(eintrag), aliase);
+  const einheiten = eintrag?.qty != null && eintrag.qty !== '' ? [inBasis(eintrag.qty, eintrag.unit).basis] : [];
+  return abteilungIntern(key, aliase, einheiten);
 }
 
 /** Folgt alias.kanonisch (höchstens 5 Schritte). Bei Kreisen gewinnt der kleinste Schlüssel im Kreis. */
@@ -302,20 +343,31 @@ function nachAbhaken(teile, zustand) {
   return { erledigt: rest.length === 0, rest };
 }
 
+// 'salz und pfeffer' → ['salz', 'pfeffer'] (ein Komma trennt dagegen den Produkt-Zusatz ab)
+const ZUSAMMEN_RE = / und | & |\//;
+const teileVon = (key) => (ZUSAMMEN_RE.test(key) ? key.split(ZUSAMMEN_RE).map((t) => zutatSchluessel(t)) : []);
+// Schlüssel, für die ein Vorrat-Eintrag steht (auch über Zusammenführungen)
+function vorratSchluessel(v, aliase) {
+  if (typeof v !== 'string' || !v.trim()) return [];
+  return [v, zutatSchluessel(v)].filter(Boolean).flatMap((k) => [k, kanonischerSchluessel(k, aliase)]);
+}
+
 // Vorrat: Schlüssel selbst oder 'salz und pfeffer', wenn alle Teile im Vorrat sind
 function vorratPruefer(vorrat, aliase) {
-  const menge = new Set();
-  for (const v of vorrat || []) {
-    if (typeof v !== 'string' || !v.trim()) continue;
-    for (const k of [v, zutatSchluessel(v)]) if (k) menge.add(k).add(kanonischerSchluessel(k, aliase));
-  }
-  return (key) => menge.has(key) || (/ und | & |\/|, /.test(key) &&
-    key.split(/ und | & |\/|, /).every((teil) => menge.has(zutatSchluessel(teil))));
+  const menge = new Set((vorrat || []).flatMap((v) => vorratSchluessel(v, aliase)));
+  return (key) => menge.has(key) || (teileVon(key).length > 0 && teileVon(key).every((k) => menge.has(k)));
+}
+
+/** Vorrat-Einträge, wegen derer `key` als Vorrat gilt (für „Nicht mehr Vorrat“; bei 'salz und pfeffer' beide). */
+export function vorratEintraegeFuer(key, vorrat = [], aliase = {}) {
+  const ziele = new Set([key, ...teileVon(key)]);
+  return (vorrat || []).filter((v) => vorratSchluessel(v, aliase).some((k) => ziele.has(k)));
 }
 
 /**
- * Berechnet die Einkaufsliste einer Runde → { abteilungen, erledigt, vorrat, anzahlOffen, anzahlGesamt, eintraege }.
- * Rezept-Zeilen werden über alle geplanten Gerichte zusammengefasst; eigene Einträge bleiben einzeln.
+ * Berechnet die Einkaufsliste einer Runde → { abteilungen, erledigt, vorrat, anzahlOffen, anzahlGesamt, eintraege,
+ * ausgeblendet }. Rezept-Zeilen werden über alle geplanten Gerichte zusammengefasst (Schlüssel: postenSchluessel);
+ * eigene Einträge bleiben einzeln. `ausgeblendet`: versteckte Zeilen (nirgends sonst, nicht gezählt).
  */
 export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [], zustaende = [], aliase = {},
   vorrat = [], runde = null, reihenfolge = null } = {}) {
@@ -323,7 +375,6 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
     : new Map((rezepte || []).filter((r) => r && r.id != null).map((r) => [r.id, r]));
   const eintraege = planEintraegeFuerRunde(planEintraege, runde);
   const posten = [];
-  const zusaetze = new Map(); // Schlüssel → Zusatz je Posten ('passierte' …) oder null
   for (const e of eintraege) {
     const r = e.recipeId != null ? rezeptMap.get(e.recipeId) : null;
     if (!r || r.deleted) continue;
@@ -332,10 +383,8 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
     for (const z of r.ingredients || []) {
       if (!istZutat(z)) continue;
       const s = skaliere(z, faktor);
-      const key = kanonischerSchluessel(zutatSchluessel(z.name), aliase);
-      posten.push({ key, name: z.name, qty: s.qty, qty2: s.qty2, unit: z.unit, vague: Boolean(z.vague), quelle });
-      if (!zusaetze.has(key)) zusaetze.set(key, []);
-      zusaetze.get(key).push(zusatzAus(z.note));
+      const key = kanonischerSchluessel(postenSchluessel(z), aliase);
+      posten.push({ key, name: produktName(z), qty: s.qty, qty2: s.qty2, unit: z.unit, vague: Boolean(z.vague), quelle });
     }
   }
 
@@ -348,21 +397,17 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
   }
   const imVorrat = vorratPruefer(vorrat, aliase);
   const zeilen = [];
+  const ausgeblendet = [];
   for (const g of zusammenfassen(posten)) {
     const zustand = zustandNach.get(g.key);
-    if (zustand?.versteckt) continue;
     const { erledigt, rest } = nachAbhaken(g.teile, zustand);
-    // Zusatz zählt nur, wenn er bei allen Posten steht (frische und passierte Tomaten → Gemüse);
-    // ändert er die Abteilung, steht er auch im Namen ('Tomaten, passierte' bei den Konserven)
-    const einheiten = g.teile.map((t) => t.unit);
-    const zusatz = zusaetze.get(g.key)?.every(Boolean) ? zusaetze.get(g.key)[0] : null;
-    const abteilung = abteilungIntern(g.key, aliase, einheiten, zusatz);
-    const name = zusatz && abteilung !== abteilungIntern(g.key, aliase, einheiten, null) ? `${g.name}, ${zusatz}` : g.name;
-    zeilen.push({
-      mergeKey: g.key, name, teile: g.teile, vage: g.vage, text: teileAlsText(g.teile),
-      rest, restText: teileAlsText(rest), erledigt, versteckt: false, abteilung,
+    const zeile = {
+      mergeKey: g.key, name: g.name, teile: g.teile, vage: g.vage, text: teileAlsText(g.teile),
+      rest, restText: teileAlsText(rest), erledigt, versteckt: Boolean(zustand?.versteckt),
+      abteilung: abteilungIntern(g.key, aliase, g.teile.map((t) => t.unit)),
       quellen: g.quellen, manuell: null, imVorrat: imVorrat(g.key),
-    });
+    };
+    (zeile.versteckt ? ausgeblendet : zeilen).push(zeile);
   }
 
   // Eigene Einträge: eigene Zeile, nie mit Rezept-Zeilen zusammengefasst
@@ -370,13 +415,10 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
     if (!m || m.deleted || (m.kind ?? 'manual') !== 'manual' || !String(m.name ?? '').trim()) continue;
     const teile = m.qty != null && m.qty !== '' ? [{ qty: m.qty, qty2: m.qty2 ?? null, unit: m.unit ?? null }] : [];
     const text = teileAlsText(teile);
-    const key = kanonischerSchluessel(zutatSchluessel(m.name), aliase);
     zeilen.push({
       mergeKey: `manuell:${m.id}`, name: String(m.name).trim(), teile, vage: teile.length === 0, text,
       rest: teile, restText: text, erledigt: m.checked === true, versteckt: false,
-      abteilung: NACH_ID.has(m.section) ? m.section
-        : abteilungIntern(key, aliase, teile.map((t) => inBasis(t.qty, t.unit).basis), zusatzAus(m.note)),
-      quellen: [], manuell: m, imVorrat: false,
+      abteilung: abteilungEintrag(m, aliase), quellen: [], manuell: m, imVorrat: false,
     });
   }
 
@@ -394,6 +436,7 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
     anzahlOffen: offen.length,
     anzahlGesamt: offen.length + erledigt.length,
     eintraege,
+    ausgeblendet: ausgeblendet.sort(nachName),
   };
 }
 

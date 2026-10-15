@@ -336,8 +336,9 @@ async function planeDialog(rezept, portionen, einstellungen) {
   if (!slots.length) slots.push('abend');
   const slotWahl = el('select', null, slots.map((m) => el('option', { value: m, selected: m === 'abend' }, MAHLZEIT_NAMEN[m])));
   const st = stepper(portionen);
+  // fokus: false – Auswahlfelder und Zähler brauchen keine Tastatur
   const wahl = await dialog({
-    titel: 'In Woche planen', inhalt: [
+    titel: 'In Woche planen', fokus: false, inhalt: [
       el('p', { class: 'fett' }, rezept.title),
       el('label', { class: 'feld' }, el('span', null, 'Tag'), tagWahl),
       slots.length > 1 ? el('label', { class: 'feld' }, el('span', null, 'Mahlzeit'), slotWahl) : null,

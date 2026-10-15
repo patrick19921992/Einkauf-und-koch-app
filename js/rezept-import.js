@@ -3,20 +3,62 @@
 
 import { parseZahl, parseZeile, parseZeilen } from './zutaten.js';
 
+// Verständliche Meldung je Grund: Kennungen aus proxy/worker.js ({ fehler }) und eigene der App
+const DIENST = 'Mehr → Import-Dienst';
+const SPAETER = 'Versuch es später noch einmal.';
 const MELDUNGEN = {
-  'kein-proxy': 'Für Links wird der Import-Dienst gebraucht (Mehr → Import-Dienst).',
-  netz: 'Der Import-Dienst ist nicht erreichbar.', blockiert: 'Die Webseite erlaubt das automatische Laden nicht.',
-  'kein-rezept': 'Auf der Seite wurde kein Rezept gefunden – nutze „Text einfügen“.',
-  limit: 'Der Import-Dienst ist gerade ausgelastet.', ungueltig: 'Ungültiger Link oder ungültige Antwort.',
+  'kein-proxy': `Für Links brauchst du den Import-Dienst (${DIENST}). Bis dahin kannst du den Rezepttext einfügen.`,
+  'proxy-adresse': `Die Adresse des Import-Dienstes ist ungültig (${DIENST}).`,
+  link: 'Bitte einen vollständigen Link (https://…) angeben.',
+  origin: 'Der Import-Dienst lehnt Anfragen dieser App ab. Trag die Adresse der App im Worker unter ERLAUBTE_ORIGINS '
+    + 'ein (Cloudflare → Worker → Settings → Variables and Secrets).',
+  host: ({ host }) => `${host ? `„${host}“` : 'Diese Webseite'} ist im Import-Dienst nicht freigeschaltet. Du kannst die `
+    + 'Domain in proxy/worker.js unter ERLAUBTE_HOSTS ergänzen und den Worker neu veröffentlichen – oder den Rezepttext einfügen.',
+  blockiert: 'Die Webseite lässt das automatische Laden nicht zu. Kopiere den Rezepttext von der Seite und füge ihn als Text ein.',
+  url: 'Diesen Link kann der Import-Dienst nicht laden – es gehen nur vollständige https-Links ohne Port.',
+  weiterleitungen: 'Der Link leitet zu oft weiter. Öffne ihn im Browser und teile die eigentliche Rezeptseite.',
+  methode: `Der Import-Dienst hat die Anfrage abgelehnt. Stimmt die Adresse unter ${DIENST}?`,
+  'zu-gross': 'Die Seite ist zu groß für den Import-Dienst. Kopiere den Rezepttext und füge ihn als Text ein.',
+  'kein-html': 'Unter dem Link liegt keine Webseite, sondern z. B. ein Bild oder PDF.',
+  upstream: ({ status }) => `Die Webseite hat mit einem Fehler geantwortet${status ? ` (HTTP ${status})` : ''}. Stimmt der Link? ${SPAETER}`,
+  netz: `Der Import-Dienst hat die Webseite nicht erreicht. ${SPAETER}`,
+  zeitueberschreitung: `Die Webseite hat zu lange nicht geantwortet. ${SPAETER}`,
+  limit: `Der Import-Dienst ist gerade ausgelastet. ${SPAETER}`,
+  'nicht-erreichbar': `Der Import-Dienst ist nicht erreichbar. Prüfe die Internetverbindung und unter ${DIENST} die Adresse `
+    + '(und ob die App im Worker unter ERLAUBTE_ORIGINS steht).',
+  offline: 'Du bist offline. Zum Laden über Links braucht es Internet – den Rezepttext kannst du auch so einfügen.',
+  zeit: 'Zeitüberschreitung beim Laden. Versuch es noch einmal.',
+  dienst: ({ status }) => `Der Import-Dienst hat einen Fehler gemeldet (HTTP ${status}). ${SPAETER}`,
+  antwort: ({ status }) => `Der Import-Dienst hat keine gültige Antwort geschickt${status ? ` (HTTP ${status})` : ''}. `
+    + `Stimmt die Adresse unter ${DIENST}?`,
+  'kein-rezept': 'Auf der Seite wurde kein Rezept gefunden. Kopiere den Rezepttext und nutze „Text einfügen“.',
+  ungueltig: 'Ungültiger Link oder ungültige Antwort.',
 };
+// Grund → Code der App (danach richtet sich, was die Ansicht anbietet); sonst Grund = Code
+const CODES = {
+  'proxy-adresse': 'kein-proxy', link: 'ungueltig', url: 'ungueltig', weiterleitungen: 'ungueltig', methode: 'ungueltig',
+  antwort: 'ungueltig', 'zu-gross': 'kein-rezept', 'kein-html': 'kein-rezept', upstream: 'netz', zeitueberschreitung: 'netz',
+  'nicht-erreichbar': 'netz', offline: 'netz', zeit: 'netz', dienst: 'netz',
+};
+// Kennungen, die proxy/worker.js im Feld `fehler` schickt
+const DIENST_GRUENDE = new Set(['origin', 'host', 'blockiert', 'url', 'weiterleitungen', 'methode', 'zu-gross', 'kein-html',
+  'upstream', 'netz', 'zeitueberschreitung', 'limit']);
 
-/** Fehler beim Import; code: 'kein-proxy' | 'netz' | 'blockiert' | 'kein-rezept' | 'limit' | 'ungueltig'. */
+/**
+ * Fehler beim Import. code: 'kein-proxy' | 'origin' | 'host' | 'blockiert' | 'kein-rezept' | 'limit' | 'netz' | 'ungueltig'.
+ * grund: genauere Kennung (z. B. `fehler` aus proxy/worker.js), host/status: Angaben aus der Antwort.
+ */
 export class ImportFehler extends Error {
-  constructor(code, message) {
-    super(message || MELDUNGEN[code] || 'Import fehlgeschlagen.');
-    this.name = 'ImportFehler';
-    this.code = code;
+  constructor(code, message, { grund = code, host = null, status = null } = {}) {
+    const m = MELDUNGEN[grund] ?? MELDUNGEN[code];
+    super(message || (typeof m === 'function' ? m({ host, status }) : m) || 'Import fehlgeschlagen.');
+    Object.assign(this, { name: 'ImportFehler', code, grund, host, status });
   }
+}
+
+/** ImportFehler zu einem Grund (Kennung aus proxy/worker.js oder der App) mit passendem Code. */
+export function importFehler(grund, { host = null, status = null } = {}) {
+  return new ImportFehler(CODES[grund] ?? (MELDUNGEN[grund] ? grund : 'ungueltig'), null, { grund, host, status });
 }
 
 const neueId = () =>
@@ -317,9 +359,13 @@ const PORTIONEN_RE = [
   /^(\d+)(?:\s*[-–]\s*\d+)?\s*(?:portionen|personen|pers\.|port\.)\s*:?$/i,
   /^(?:portionen|personen|anzahl portionen|ergibt)\s*:?\s*(?:ca\.\s*)?(\d+)\b/i,
 ];
-const ZEIT_RE = new RegExp('^(arbeitszeit|vorbereitung(?:szeit)?|zubereitungs(?:zeit|dauer)|kochzeit|backzeit|garzeit|' +
-  'bratzeit|gesamtzeit|ruhezeit|wartezeit|zeit|dauer)\\s*:?\\s*(?:ca\\.\\s*|etwa\\s*)?(?=\\d|eine?\\b)', 'i');
+// auch 'Koch-/Backzeit' und 'Koch- und Backzeit' (Chefkoch)
+const ZEIT_RE = new RegExp('^(arbeitszeit|vorbereitung(?:szeit)?|zubereitungs(?:zeit|dauer)|(?:koch|back|gar|brat)' +
+  '(?:-?\\s*(?:\\/|und|&)\\s*(?:koch|back|gar|brat))?-?zeit|gesamtzeit|ruhezeit|wartezeit|zeit|dauer)\\s*:?\\s*(?:ca\\.\\s*|etwa\\s*)?(?=\\d|eine?\\b)', 'i');
 const META_RE = /^(?:schwierigkeit(?:sgrad)?|kalorien|brennwert|niveau|level)\b/i;
+// Grußformel am Ende ist kein Schritt; 'Portionen' allein mit der Zahl in der nächsten Zeile (kopierte Tabelle)
+const SCHLUSS_RE = /^(?:guten appetit|lass(?:t)? (?:es )?(?:dir|euch) schmecken|viel spa(?:ß|ss)(?: beim \p{L}+)?)[\s!.]*$/iu;
+const PORTIONEN_ALLEIN_RE = /^(?:portionen|personen)\s*:?$/i;
 // Vorspann geteilter Texte ('Schau dir dieses Rezept an: Spaghetti Carbonara')
 const TEILEN_RE = new RegExp('^(?:(?:schau|sieh) dir (?:mal )?(?:dieses|das|mein) rezept an|ich habe (?:da )?(?:ein|dieses) ' +
   'rezept[^:]*gefunden|hier (?:ist )?(?:ein|das) rezept[^:]*|check out this recipe|rezept)\\s*[:–-]\\s*', 'i');
@@ -370,9 +416,10 @@ export function rezeptAusText(text, { titel, quelleUrl } = {}) {
   const zutatenKopf = koepfe.some((k) => k?.art === 'zutaten');
   const schrittKopfDa = koepfe.some((k) => k?.art === 'schritte');
   const zutaten = [], schritte = [], notizen = [], vorspann = [], zeiten = {};
-  let abschnitt = null, phase = null, servings = null, erkannt = '';
+  let abschnitt = null, phase = null, servings = null, erkannt = '', weiter = -1;
 
   zeilen.forEach((roh, i) => {
+    if (i === weiter) return;
     const z = !erkannt && !zutaten.length ? roh.replace(TEILEN_RE, '') : roh;
     const kopf = koepfe[i];
     if (kopf) {
@@ -386,6 +433,12 @@ export function rezeptAusText(text, { titel, quelleUrl } = {}) {
     }
     const portionen = PORTIONEN_RE.map((re) => z.match(re)).find(Boolean);
     if (portionen) { servings ??= Number(portionen[1]) || null; return; }
+    if (PORTIONEN_ALLEIN_RE.test(z) && /^\d{1,3}$/.test(zeilen[i + 1] ?? '')) {
+      servings ??= Number(zeilen[i + 1]) || null;
+      weiter = i + 1;
+      return;
+    }
+    if (SCHLUSS_RE.test(z)) return;
     const zeit = z.match(ZEIT_RE);
     if (zeit) {
       const feld = /ruhe|warte/i.test(zeit[1]) ? null : /koch|back|gar|brat/i.test(zeit[1]) ? 'cookMin'
@@ -478,21 +531,14 @@ export function findeTimer(text) {
 
 // ---------------------------------------------------------------- Laden über den Import-Dienst
 
-// Fehler-Kennungen aus proxy/worker.js → Codes der App
-const FEHLER_DIENST = {
-  blockiert: 'blockiert', origin: 'blockiert', limit: 'limit', url: 'ungueltig', host: 'ungueltig', methode: 'ungueltig',
-  weiterleitungen: 'ungueltig', 'zu-gross': 'kein-rezept', 'kein-html': 'kein-rezept', upstream: 'netz', netz: 'netz',
-  zeitueberschreitung: 'netz',
-};
-
-/** Lädt ein Rezept über den Import-Dienst → Entwurf; wirft ImportFehler. */
+/** Lädt ein Rezept über den Import-Dienst → Entwurf; wirft ImportFehler (Grund siehe MELDUNGEN). */
 export async function ladeRezept(url, { proxyUrl, fetchFn = (...a) => globalThis.fetch(...a), timeoutMs = 15000 } = {}) {
   let basis = String(proxyUrl ?? '').trim();
-  if (!basis) throw new ImportFehler('kein-proxy');
+  if (!basis) throw importFehler('kein-proxy');
   if (!/^https?:\/\//i.test(basis)) basis = `https://${basis}`;
-  if (!absoluteUrl(basis)) throw new ImportFehler('kein-proxy', 'Die Adresse des Import-Dienstes ist ungültig.');
+  if (!absoluteUrl(basis)) throw importFehler('proxy-adresse');
   const ziel = findeUrl(url);
-  if (!ziel) throw new ImportFehler('ungueltig', 'Bitte einen vollständigen Link (https://…) angeben.');
+  if (!ziel) throw importFehler('link');
 
   const abbruch = new AbortController();
   const uhr = setTimeout(() => abbruch.abort(), timeoutMs);
@@ -503,7 +549,8 @@ export async function ladeRezept(url, { proxyUrl, fetchFn = (...a) => globalThis
     });
     roh = await antwort.text();
   } catch {
-    throw new ImportFehler('netz', abbruch.signal.aborted ? 'Zeitüberschreitung beim Laden.' : undefined);
+    // Auch eine Absage ohne CORS-Header landet hier: der Browser zeigt die Antwort dann nicht
+    throw importFehler(abbruch.signal.aborted ? 'zeit' : globalThis.navigator?.onLine === false ? 'offline' : 'nicht-erreichbar');
   } finally {
     clearTimeout(uhr);
   }
@@ -513,16 +560,19 @@ export async function ladeRezept(url, { proxyUrl, fetchFn = (...a) => globalThis
   if (!daten || typeof daten !== 'object' || Array.isArray(daten)) daten = null;
   const fehler = typeof daten?.fehler === 'string' ? daten.fehler : null;
   const status = Number(antwort.status) || 0;
-  if (status === 403 || status === 451) throw new ImportFehler('blockiert');
-  if (status === 429 || fehler === 'limit') throw new ImportFehler('limit');
-  if (!antwort.ok || fehler) {
-    const code = FEHLER_DIENST[fehler] ?? (status >= 400 && status < 500 ? 'ungueltig' : 'netz');
-    throw new ImportFehler(code, `${MELDUNGEN[code]} (${fehler || `HTTP ${status}`})`);
-  }
-  if (!daten) throw new ImportFehler('ungueltig', 'Der Import-Dienst hat keine gültige Antwort geschickt.');
+  // Der Dienst nennt den Grund selbst; 'status' ist dort der Status der Webseite, 'host' das abgelehnte Ziel
+  const details = {
+    status: Number(daten?.status) || (antwort.ok ? null : status),
+    host: typeof daten?.host === 'string' ? daten.host : seiteVon(ziel),
+  };
+  if (DIENST_GRUENDE.has(fehler)) throw importFehler(fehler, details);
+  if (status === 403 || status === 451) throw importFehler('blockiert', details);
+  if (status === 429) throw importFehler('limit', details);
+  if (status >= 500) throw importFehler('dienst', { status });
+  if (!antwort.ok || fehler || !daten) throw importFehler('antwort', { status: antwort.ok ? null : status });
 
   const knoten = findeRezeptKnoten(parseJsonLdBloecke(Array.isArray(daten.jsonld) ? daten.jsonld : []));
-  if (!knoten) throw new ImportFehler('kein-rezept');
+  if (!knoten) throw importFehler('kein-rezept');
   const rezept = rezeptAusJsonLd(knoten, absoluteUrl(String(daten.url ?? '')) || ziel);
   if (!rezept.title) rezept.title = einzeilig(daten.title);
   return rezept;

@@ -49,14 +49,6 @@ function portionenStepper(wert, aendern, { fokus = null, name = 'Portionen' } = 
   return el('span', { class: 'stepper', role: 'group', 'aria-label': name }, minus, ausgabe, plus);
 }
 
-/**
- * Wartet, bis app.js den Verlaufseintrag des eben geschlossenen Dialogs entfernt hat.
- * Ein sofort folgender Dialog würde sonst seinen eigenen Eintrag verlieren (Zurück verlässt die App).
- */
-async function verlaufFrei() {
-  for (let i = 0; i < 25 && history.state?.ekDialog; i += 1) await new Promise((r) => setTimeout(r, 25));
-}
-
 function merkeFokus(container) {
   const a = document.activeElement;
   return a && container.contains(a) ? a.dataset?.fokus ?? null : null;
@@ -120,8 +112,17 @@ export async function zeige(container, route) {
         }
         keinTreffer.classList.toggle('versteckt', treffer > 0);
       },
+      // Enter übernimmt das Rezept, wenn nur noch eines passt
+      onkeydown: (ev) => {
+        if (ev.key !== 'Enter') return;
+        ev.preventDefault();
+        const passend = eintraege.filter((x) => !x.li.classList.contains('versteckt'));
+        if (passend.length === 1) passend[0].li.querySelector('button').click();
+      },
     });
+    // fokus: false – die Tastatur soll die Rezeptliste nicht gleich verdecken
     const ergebnis = dialog({
+      fokus: false,
       titel: `${wochentagLang(datum)}, ${formatDatum(datum)} · ${SLOT_NAMEN[slot]}`,
       inhalt: [
         el('div', { class: 'feld-zeile' }, el('span', null, 'Portionen'), portionenStepper(portionen, (n) => { portionen = n; })),
@@ -142,7 +143,6 @@ export async function zeige(container, route) {
     uebernehmen?.classList.add('versteckt');
     const w = await ergebnis;
     if (!w) return;
-    await verlaufFrei();
     let neu = { date: datum, slot, servings: portionen, note: '', cooked: false, tripId: null };
     if (w.rezept) {
       neu = { ...neu, recipeId: w.rezept.id, title: w.rezept.title || '' };
@@ -199,7 +199,6 @@ export async function zeige(container, route) {
     optionen.push({ text: 'Entfernen', wert: 'entfernen' });
     const w = await auswahl(titel, optionen);
     if (!w) return;
-    await verlaufFrei();
     if (w === 'kochen') {
       navigiere(`#/kochen/${encodeURIComponent(rezept.id)}?p=${portionenVon(eintrag, rezept)}&plan=${encodeURIComponent(eintrag.id)}`);
     } else if (w === 'verschieben') {

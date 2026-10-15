@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ImportFehler, findeUrl, textOhneUrl, extrahiereJsonLd, parseJsonLdBloecke, findeRezeptKnoten, parseDauer,
-  parsePortionen, dekodiereEntities, rezeptAusJsonLd, rezeptAusText, findeTimer, ladeRezept,
+  parsePortionen, dekodiereEntities, rezeptAusJsonLd, rezeptAusText, findeTimer, ladeRezept, importFehler,
 } from '../js/rezept-import.js';
 
 // Kurze, erfundene Rezept-Knoten (keine echten Seiten)
@@ -268,6 +268,23 @@ test('rezeptAusText: ohne Überschriften', () => {
   assert.deepEqual(rezeptAusText('Zutaten\n4\n2 Eier').ingredients.map((z) => z.raw), ['4', '2 Eier']);
 });
 
+test('rezeptAusText: kopierte Rezeptseite (Tabelle, Koch-/Backzeit, Grußformel)', () => {
+  const text = [
+    'Schneller Nudelauflauf', 'Portionen', '4', 'Arbeitszeit ca. 15 Minuten', 'Koch-/Backzeit ca. 25 Minuten',
+    'Gesamtzeit ca. 40 Minuten', 'Zutaten', '500 g', 'Nudeln', '200 ml', 'Sahne', '2', 'Ei(er)', 'Zubereitung',
+    'Die Nudeln bissfest kochen.', 'Alles in eine Form geben und 25 Minuten bei 200 °C backen.', 'Guten Appetit!',
+  ].join('\n');
+  const r = rezeptAusText(text);
+  assert.deepEqual([r.title, r.servings, r.prepMin, r.cookMin, r.totalMin], ['Schneller Nudelauflauf', 4, 15, 25, 40]);
+  assert.deepEqual(r.ingredients.map((z) => [z.qty, z.unit, z.name]), [[500, 'g', 'Nudeln'], [200, 'ml', 'Sahne'], [2, null, 'Eier']]);
+  assert.deepEqual(texte(r), ['Die Nudeln bissfest kochen.', 'Alles in eine Form geben und 25 Minuten bei 200 °C backen.']);
+  // 'Koch- und Backzeit: 1 Std.' ohne Gesamtzeit → Summe; 'Ruhezeit' zählt nicht
+  const z = rezeptAusText('Brot\nVorbereitung: 20 Min.\nKoch- und Backzeit: 1 Std.\nRuhezeit: 2 Std.\nZutaten\n500 g Mehl');
+  assert.deepEqual([z.prepMin, z.cookMin, z.totalMin], [20, 60, 80]);
+  // 'Portionen' ohne Zahl danach bleibt ein normales Wort
+  assert.equal(rezeptAusText('Zutaten\n500 g Mehl\nPortionen\nZubereitung\nKneten.').servings, null);
+});
+
 test('findeTimer: Zeitangaben', () => {
   const t = (text) => findeTimer(text).map((x) => [x.label, x.sekunden]);
   assert.deepEqual(t('10 Minuten kochen'), [['10 Min.', 600]]);
@@ -326,25 +343,76 @@ test('ladeRezept: Fehlerfälle', async () => {
   const merker = async () => { aufgerufen = true; return new Response('{}'); };
   assert.equal(await fehlerCode(ladeRezept(url, { proxyUrl: '', fetchFn: merker })), 'kein-proxy');
   assert.equal(await fehlerCode(ladeRezept(url, { fetchFn: merker })), 'kein-proxy');
+  assert.equal(await fehlerCode(ladeRezept(url, { proxyUrl: 'https://', fetchFn: merker })), 'kein-proxy');
   assert.equal(await fehlerCode(ladeRezept('kein Link', { proxyUrl: PROXY, fetchFn: merker })), 'ungueltig');
   assert.equal(aufgerufen, false);
   assert.equal(await fehlerCode(lade(antwortMit({ fehler: 'blockiert', status: 403 }, 403))), 'blockiert');
   assert.equal(await fehlerCode(lade(antwortMit('nicht erlaubt', 451))), 'blockiert');
   assert.equal(await fehlerCode(lade(antwortMit({ fehler: 'limit' }, 429))), 'limit');
   assert.equal(await fehlerCode(lade(antwortMit({ fehler: 'limit' }))), 'limit');
-  assert.equal(await fehlerCode(lade(antwortMit({ fehler: 'host', host: 'x.de' }, 400))), 'ungueltig');
+  assert.equal(await fehlerCode(lade(antwortMit('Too Many Requests', 429))), 'limit');
   assert.equal(await fehlerCode(lade(antwortMit({ fehler: 'upstream', status: 404 }, 502))), 'netz');
   assert.equal(await fehlerCode(lade(antwortMit('<html>Fehler</html>', 500))), 'netz');
+  assert.equal(await fehlerCode(lade(antwortMit('<html>Not Found</html>', 404))), 'ungueltig');
   assert.equal(await fehlerCode(lade(antwortMit('<html>kein JSON</html>'))), 'ungueltig');
   assert.equal(await fehlerCode(lade(antwortMit('[1,2]'))), 'ungueltig');
+  assert.equal(await fehlerCode(lade(antwortMit({ fehler: 'unbekannt' }, 400))), 'ungueltig');
   assert.equal(await fehlerCode(lade(antwortMit({ url, title: 'x', jsonld: ['{"@type":"WebPage"}'] }))), 'kein-rezept');
   assert.equal(await fehlerCode(lade(antwortMit({ url, title: 'x' }))), 'kein-rezept');
-  assert.equal(await fehlerCode(lade(async () => { throw new TypeError('Failed to fetch'); })), 'netz');
+  const offline = await lade(async () => { throw new TypeError('Failed to fetch'); }).catch((x) => x);
+  assert.deepEqual([offline.code, offline.grund], ['netz', 'nicht-erreichbar']);
+  assert.match(offline.message, /nicht erreichbar.*Mehr → Import-Dienst/);
+  // Gerät meldet „offline“ → eigene Meldung
+  const navi = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { value: { onLine: false }, configurable: true });
+  try {
+    const aus = await lade(async () => { throw new TypeError('Failed to fetch'); }).catch((x) => x);
+    assert.deepEqual([aus.code, aus.grund], ['netz', 'offline']);
+    assert.match(aus.message, /offline/);
+  } finally {
+    if (navi) Object.defineProperty(globalThis, 'navigator', navi); else delete globalThis.navigator;
+  }
   // Zeitüberschreitung: fetch hängt, bis abgebrochen wird
   const haengt = (_, { signal }) => new Promise((_ok, nein) => signal.addEventListener('abort', () => nein(new Error('abort'))));
   const e = await ladeRezept(url, { proxyUrl: PROXY, fetchFn: haengt, timeoutMs: 20 }).catch((x) => x);
-  assert.equal(e.code, 'netz');
+  assert.deepEqual([e.code, e.grund], ['netz', 'zeit']);
   assert.match(e.message, /Zeitüberschreitung/);
+});
+
+test('ladeRezept: jede Fehler-Kennung des Import-Dienstes → eigener Code und verständliche Meldung', async () => {
+  const url = 'https://www.example.org/rezept/1';
+  // So antwortet proxy/worker.js (Status und Felder wie dort)
+  const faelle = [
+    [{ fehler: 'origin', meldung: 'Der Import-Dienst läuft, antwortet aber nur der App' }, 403, 'origin', /lehnt Anfragen dieser App ab.*ERLAUBTE_ORIGINS/],
+    [{ fehler: 'host' }, 400, 'host', /„example\.org“ ist im Import-Dienst nicht freigeschaltet.*proxy\/worker\.js unter ERLAUBTE_HOSTS.*Rezepttext einfügen/],
+    [{ fehler: 'host', host: 'www.boese.example' }, 400, 'host', /„www\.boese\.example“.*ERLAUBTE_HOSTS.*Rezepttext einfügen/],
+    [{ fehler: 'blockiert', status: 401 }, 403, 'blockiert', /lässt das automatische Laden nicht zu.*als Text ein/],
+    [{ fehler: 'url' }, 400, 'ungueltig', /nur vollständige https-Links/],
+    [{ fehler: 'weiterleitungen' }, 502, 'ungueltig', /leitet zu oft weiter/],
+    [{ fehler: 'methode' }, 405, 'ungueltig', /Anfrage abgelehnt.*Mehr → Import-Dienst/],
+    [{ fehler: 'zu-gross' }, 413, 'kein-rezept', /zu groß.*als Text ein/],
+    [{ fehler: 'kein-html' }, 415, 'kein-rezept', /keine Webseite/],
+    [{ fehler: 'upstream', status: 404 }, 502, 'netz', /Webseite hat mit einem Fehler geantwortet \(HTTP 404\)/],
+    [{ fehler: 'netz' }, 502, 'netz', /hat die Webseite nicht erreicht/],
+    [{ fehler: 'zeitueberschreitung' }, 504, 'netz', /zu lange nicht geantwortet/],
+    [{ fehler: 'limit' }, 429, 'limit', /ausgelastet/],
+  ];
+  for (const [daten, status, code, meldung] of faelle) {
+    const e = await ladeRezept(url, { proxyUrl: PROXY, fetchFn: antwortMit(daten, status) }).catch((x) => x);
+    assert.ok(e instanceof ImportFehler, daten.fehler);
+    assert.deepEqual([e.code, e.grund], [code, daten.fehler], daten.fehler);
+    assert.match(e.message, meldung, daten.fehler);
+  }
+  // 'origin' darf nicht wie eine blockierende Webseite aussehen (beide kommen mit HTTP 403)
+  const origin = await ladeRezept(url, { proxyUrl: PROXY, fetchFn: antwortMit({ fehler: 'origin' }, 403) }).catch((x) => x);
+  assert.doesNotMatch(origin.message, /Webseite lässt/);
+  // Fehler des Dienstes selbst (z. B. Cloudflare-Fehlerseite) und falsche Adresse des Dienstes
+  const kaputt = await ladeRezept(url, { proxyUrl: PROXY, fetchFn: antwortMit('<html>Error 1101</html>', 503) }).catch((x) => x);
+  assert.deepEqual([kaputt.code, kaputt.grund], ['netz', 'dienst']);
+  assert.match(kaputt.message, /HTTP 503/);
+  const falsch = await ladeRezept(url, { proxyUrl: PROXY, fetchFn: antwortMit('<html>404</html>', 404) }).catch((x) => x);
+  assert.deepEqual([falsch.code, falsch.grund, falsch.status], ['ungueltig', 'antwort', 404]);
+  assert.match(falsch.message, /keine gültige Antwort geschickt \(HTTP 404\)\. Stimmt die Adresse unter Mehr → Import-Dienst\?/);
 });
 
 test('ImportFehler: Code und deutsche Meldung', () => {
@@ -354,4 +422,12 @@ test('ImportFehler: Code und deutsche Meldung', () => {
   assert.equal(e.name, 'ImportFehler');
   assert.match(e.message, /Text einfügen/);
   assert.equal(new ImportFehler('netz', 'Eigene Meldung').message, 'Eigene Meldung');
+  assert.equal(new ImportFehler('netz').grund, 'netz');
+  // importFehler: Code passend zum Grund, Angaben in der Meldung
+  const h = importFehler('host', { host: 'beispiel.de' });
+  assert.deepEqual([h.code, h.grund, h.host], ['host', 'host', 'beispiel.de']);
+  assert.match(h.message, /„beispiel\.de“/);
+  assert.deepEqual([importFehler('zu-gross').code, importFehler('proxy-adresse').code, importFehler('quatsch').code],
+    ['kein-rezept', 'kein-proxy', 'ungueltig']);
+  assert.match(importFehler('kein-proxy').message, /Mehr → Import-Dienst/);
 });

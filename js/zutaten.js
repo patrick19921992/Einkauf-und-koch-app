@@ -327,8 +327,19 @@ export function zutatenAlsText(zutaten) {
 // Marke in GROSSBUCHSTABEN ('LE GUSTO'), aber nicht 'TK'
 const istMarke = (t) =>
   /^[A-ZÄÖÜ0-9][A-ZÄÖÜ0-9’'&!.+-]*$/.test(t) && /[A-ZÄÖÜ].*[A-ZÄÖÜ]/.test(t) && !/^TK(?:-|$)/.test(t);
-const ADJEKTIV_VORNE_RE = new RegExp(`^(?:bio|frisch|frisch${ADJ}|gehackt|gehackt${ADJ}|gewürfelt|gewürfelt${ADJ}|` +
-  `fein|fein${ADJ}|grob|grob${ADJ}|geschält|geschält${ADJ}|gerieben|gerieben${ADJ}) +`);
+// Zubereitung vorne fällt weg ('frische Petersilie', 'gewürfelte Zwiebel', 'ganze Mandeln')
+const VORNE_WEG_RE = new RegExp(`^(?:bio|(?:frisch|gewürfelt|fein|grob|gerieben|ganz)(?:${ADJ})?)$`);
+// Zusätze, die ein anderes Produkt meinen ('passierte Tomaten', 'Thymian, getrockneter'): bleiben im
+// Schlüssel als 'tomate, passiert', damit sie nicht mit frischer Ware zusammenlaufen
+const ZUSATZ_RE = new RegExp(`^(passiert|stückig|getrocknet|gemahlen|geräuchert|eingelegt|geschält|gehackt)(?:${ADJ})?$`);
+const ZUSATZ_FUELL_RE = new RegExp(`^(?:fein|grob|frisch|ganz(?:${ADJ})?)$`);
+// geschält/gehackt ist nur bei Tomaten ein eigenes Produkt (Dose), sonst Zubereitung ('gehackte Zwiebel')
+const NUR_TOMATE = new Set(['geschält', 'gehackt']);
+// so ohnehin üblich: 'gemahlener Pfeffer' = 'Pfeffer', 'getrockneter Majoran' = 'Majoran'
+const UEBLICH = {
+  gemahlen: /(?:pfeffer|salz|zimt|muskat|muskatnuss|kurkuma|pulver|mehl|zucker|kaffee)$/,
+  getrocknet: /(?:oregano|majoran|lorbeer|lorbeerblatt|bohnenkraut|flocke|flocken|pulver|rosine|sultanine|korinthe|cranberry|cranberries)$/,
+};
 const NIE_AENDERN_RE = /(?:reis|mais|ananas|couscous|hummus|kürbis|anis|spaghetti|zucchini|brokkoli|gnocchi|samen|kräuter|flocken|[^s]chen)$/;
 // Mehrzahl-Endungen → Einzahl (längste zuerst). Gruppen: '-n weg', '-s weg', '-e weg', Sonderfälle.
 const PLURAL_ENDUNGEN = [
@@ -349,22 +360,73 @@ function einzahl(wort) {
   return wort.length > 4 && wort.endsWith('eln') ? wort.slice(0, -1) : wort;
 }
 
-/** Schlüssel zum Zusammenführen: 'Rote Zwiebeln' → 'rote zwiebel', 'LE GUSTO Salz' → 'salz'. */
+// Produkt-Zusätze eines Notiz-Teils, der nur aus solchen besteht ('passierte', 'fein gemahlen');
+// sonst [] ('geschält und halbiert', 'gemischt' sind Zubereitung bzw. etwas anderes)
+function zusaetzeAus(teil) {
+  const woerter = String(teil ?? '').toLowerCase().split(' ').filter(Boolean);
+  if (!woerter.length || woerter.length > 4) return [];
+  const staemme = [];
+  for (const w of woerter) {
+    const m = w.replace(/[.!:]+$/, '').match(ZUSATZ_RE);
+    if (m) staemme.push(m[1]);
+    else if (!ZUSATZ_FUELL_RE.test(w)) return [];
+  }
+  return staemme;
+}
+
+/**
+ * Schlüssel zum Zusammenführen: 'Rote Zwiebeln' → 'rote zwiebel', 'LE GUSTO Salz' → 'salz'.
+ * Zusätze, die ein anderes Produkt meinen, bleiben: 'passierte Tomaten' / 'Tomate(n), passierte'
+ * → 'tomate, passiert', 'gemahlene Mandeln' → 'mandel, gemahlen'; 'gehackte Zwiebel' → 'zwiebel'.
+ */
 export function zutatSchluessel(name) {
-  let s = String(name ?? '').normalize('NFC').replace(/[\u00a0\u2009\u202f]/g, ' ').replace(ENDUNG_RE, '$1');
-  s = klammernHeraus(s).text.replace(/\s+/g, ' ').trim();
+  let s = String(name ?? '').normalize('NFC').replace(/[   ]/g, ' ').replace(ENDUNG_RE, '$1');
+  const k = klammernHeraus(s);
+  s = k.text.replace(/\s+/g, ' ').trim();
+  const zusaetze = k.notizen.flatMap((n) => n.text.split(/[,;]/).flatMap(zusaetzeAus));
   const ki = kommaIndex(s);
-  if (ki >= 0) s = s.slice(0, ki);
+  if (ki >= 0) {
+    zusaetze.push(...s.slice(ki + 1).split(/[,;]/).flatMap(zusaetzeAus));
+    s = s.slice(0, ki);
+  }
   const ti = s.search(NOTIZ_TRENNER_RE);
   if (ti > 0) s = s.slice(0, ti);
   const toks = slashAlternative(s.trim()).split(' ').filter(Boolean);
   while (toks.length > 1 && istMarke(toks[0])) toks.shift();
   s = toks.join(' ').toLowerCase().replace(/^(?:beste wahl|feine welt|gut & günstig) +/, '');
-  for (let vorher = ''; vorher !== s;) [vorher, s] = [s, s.replace(/^bio-/, '').replace(ADJEKTIV_VORNE_RE, '')];
+  // vorne: Produkt-Zusätze merken, Zubereitung und 'bio' weg
+  for (;;) {
+    s = s.replace(/^bio-/, '');
+    const leer = s.indexOf(' ');
+    if (leer < 0) break;
+    const wort = s.slice(0, leer);
+    const m = wort.match(ZUSATZ_RE);
+    if (m) zusaetze.push(m[1]);
+    else if (!VORNE_WEG_RE.test(wort)) break;
+    s = s.slice(leer + 1);
+  }
   s = s.replace(/ +type +\d+$/, '');
   while (/[.,;: ]$/.test(s)) s = s.slice(0, -1);
   const i = Math.max(s.lastIndexOf(' '), s.lastIndexOf('-')) + 1;
-  return s.slice(0, i) + einzahl(s.slice(i));
+  const basis = s.slice(0, i) + einzahl(s.slice(i));
+  const bleiben = [...new Set(zusaetze)]
+    .filter((z) => !(NUR_TOMATE.has(z) && !/tomate$/.test(basis)) && !UEBLICH[z]?.test(basis)).sort();
+  return basis && bleiben.length ? `${basis}, ${bleiben.join(' ')}` : basis;
+}
+
+/**
+ * Name samt Produkt-Zusatz aus der Notiz: { name: 'Tomaten', note: 'passierte' } → 'Tomaten, passierte'.
+ * Reine Zubereitung bleibt weg ('Zwiebeln, gehackt'), ebenso bei gezählten Tomaten ('3 Tomaten, geschält').
+ */
+export function produktName(zutat) {
+  const name = String(zutat?.name ?? '').trim();
+  const teile = String(zutat?.note ?? '').split(/[,;]/).map((t) => t.replace(/\s+/g, ' ').trim())
+    .filter((t) => zusaetzeAus(t).length);
+  if (!name || !teile.length) return name;
+  const gezaehlt = zahlOk(zutat.qty) && (zutat.unit == null || einheitId(zutat.unit) === 'Stück');
+  const relevant = gezaehlt ? teile.filter((t) => zusaetzeAus(t).some((z) => !NUR_TOMATE.has(z))) : teile;
+  const mit = relevant.length ? `${name}, ${relevant.join(', ')}` : name;
+  return zutatSchluessel(mit) === zutatSchluessel(name) ? name : mit;
 }
 
 // ---------------------------------------------------------------- Rechnen
@@ -396,12 +458,15 @@ export function inBasis(qty, unit) {
 const gleicheQuelle = (a, b) => a === b ||
   (typeof a === 'object' && typeof b === 'object' && a && b && JSON.stringify(a) === JSON.stringify(b));
 
-/** Fasst Posten gleicher Zutat zusammen → [{ key, name, teile, vage, quellen }] in Reihenfolge des Auftretens. */
+/**
+ * Fasst Posten gleicher Zutat zusammen → [{ key, name, teile, vage, quellen }] in Reihenfolge des Auftretens.
+ * Produkt-Zusätze aus der Notiz zählen mit ('Tomaten' + 'passierte' ≠ frische Tomaten).
+ */
 export function zusammenfassen(posten) {
   const gruppen = new Map();
   for (const p of posten || []) {
     if (!p) continue;
-    const name = String(p.name ?? '').trim();
+    const name = produktName(p);
     const key = p.key || zutatSchluessel(name);
     if (!key) continue;
     if (!gruppen.has(key)) gruppen.set(key, { key, namen: new Map(), teile: new Map(), vage: false, quellen: [] });

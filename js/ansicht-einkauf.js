@@ -7,10 +7,10 @@ import {
 } from './app.js';
 import * as db from './db.js';
 import { heute, istSchluessel, formatDatum, formatZeitraum } from './datum.js';
-import { parseZeile, zutatSchluessel, formatZutat } from './zutaten.js';
+import { parseZeile, formatZutat } from './zutaten.js';
 import {
-  ABTEILUNGEN, sortierteAbteilungen, abteilungVon, kanonischerSchluessel, standardZeitraum,
-  berechneListe, abhakZustand, listeAlsText,
+  ABTEILUNGEN, sortierteAbteilungen, abteilungEintrag, standardZeitraum, berechneListe, abhakZustand, listeAlsText,
+  vorratEintraegeFuer,
 } from './einkaufsliste.js';
 
 const ZEITRAEUME = [{ art: 'diese-woche', text: 'Diese Woche' }, { art: 'naechste-woche', text: 'Nächste Woche' },
@@ -40,12 +40,6 @@ function ausText(text) {
   return { name: z.name, qty: z.qty, qty2: z.qty2, unit: z.unit, note: [z.size, z.note].filter(Boolean).join(', ') || null };
 }
 
-// Wartet, bis app.js den Verlaufseintrag des eben geschlossenen Dialogs entfernt hat –
-// ein sofort folgender Dialog verlöre sonst seinen eigenen Eintrag (Zurück verließe die App).
-async function verlaufFrei() {
-  for (let i = 0; i < 25 && history.state?.ekDialog; i += 1) await new Promise((r) => setTimeout(r, 25));
-}
-
 // Fokus über das Neuzeichnen hinweg behalten (Bedienelemente tragen data-fokus)
 const merkeFokus = (box) => (box.contains(document.activeElement) ? document.activeElement.dataset?.fokus ?? null : null);
 function stelleFokusHer(box, schluessel) {
@@ -57,7 +51,11 @@ export async function zeige(container, route) {
   setzeTitel('Einkauf');
   const s = {}; // aktueller Stand: einst, runde, offeneRunden, liste, plan, aliase, zustaende, manuelle
   const offen = { erledigt: false, vorrat: false }; // aufgeklappte Bereiche
-  let queryGenutzt = false;
+  // ?von=…&bis=… gilt einmal; danach ohne Zeitraum im Verlauf, sonst setzte „Zurück“ eine spätere Wahl zurück
+  let wunsch = bereichAusQuery(route.query);
+  if ((route.query.has('von') || route.query.has('bis')) && location.hash === route.hash) {
+    history.replaceState(history.state, '', '#/einkauf');
+  }
   let timer = null;
   let ruheBis = 0;
   let laeuft = false;
@@ -82,8 +80,6 @@ export async function zeige(container, route) {
   async function laden() {
     const [einst, rezepte, plan, trips, items, aliasListe] = await Promise.all([db.holeEinstellungen(),
       ...['recipes', 'planEntries', 'trips', 'shoppingItems', 'aliases'].map((store) => db.alle(store))]);
-    const wunsch = queryGenutzt ? null : bereichAusQuery(route.query);
-    queryGenutzt = true;
     // offene Runde: die neueste ohne closedAt; sonst neu anlegen
     const offene = trips.filter((t) => t.closedAt == null).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     let runde = offene[0];
@@ -93,6 +89,7 @@ export async function zeige(container, route) {
     } else if (wunsch && (wunsch.von !== runde.from || wunsch.bis !== runde.to)) {
       runde = await db.speichere('trips', { ...runde, from: wunsch.von, to: wunsch.bis });
     }
+    wunsch = null;
     const manuelle = items.filter((i) => i.kind === 'manual');
     const zustaende = items.filter((i) => i.kind === 'state');
     const aliase = Object.fromEntries(aliasListe.map((a) => [a.id, a]));
@@ -180,7 +177,8 @@ export async function zeige(container, route) {
         el('p', { class: 'nebentext mittig' }, 'Hast du normalerweise zu Hause. Über ⋮ wieder auf die Liste setzen.'),
         el('ul', { class: 'liste' }, liste.vorrat.map((z) => postenZeile(z, { vorrat: true })))));
     }
-    const versteckte = [...s.zustaende.values()].filter((z) => z.tripId === s.runde.id && z.versteckt);
+    // nur Ausgeblendete, die es in diesem Zeitraum noch gibt
+    const versteckte = liste.ausgeblendet.map((z) => s.zustaende.get(`${s.runde.id}|${z.mergeKey}`)).filter(Boolean);
     if (versteckte.length) {
       teile.push(el('div', { class: 'leiste mittig' }, knopf('knopf flach klein',
         () => sicher(() => db.speichereViele('shoppingItems', versteckte.map((z) => ({ ...z, versteckt: false })))),
@@ -203,6 +201,7 @@ export async function zeige(container, route) {
       const fokus = merkeFokus(container);
       zeichneZeitraum();
       zeichneListe();
+      for (const k of [formular, zeitraumBox, aktionen]) k.classList.remove('versteckt');
       stelleFokusHer(container, fokus);
     } catch (e) {
       console.error(e);
@@ -246,9 +245,10 @@ export async function zeige(container, route) {
     feld.value = '';
     feld.focus();
     // section bleibt leer: die Abteilung ergibt sich (mit Korrekturen) beim Berechnen der Liste
-    await sicher(() => db.speichere('shoppingItems', { kind: 'manual', ...neu, section: null, checked: false }));
-    const aliase = s.aliase || {};
-    toast(`${neu.name} → ${abteilungsName(abteilungVon(kanonischerSchluessel(zutatSchluessel(neu.name), aliase), aliase))}`, { dauer: 2000 });
+    const item = { kind: 'manual', ...neu, section: null, checked: false };
+    if (await sicher(() => db.speichere('shoppingItems', item))) {
+      toast(`${neu.name} → ${abteilungsName(abteilungEintrag(item, s.aliase || {}))}`, { dauer: 2000 });
+    }
   }
 
   function zustandSpeichern(z, felder) {
@@ -307,7 +307,6 @@ export async function zeige(container, route) {
     ].filter(Boolean);
     const w = await auswahl(z.name, optionen);
     if (!w) return;
-    await verlaufFrei();
     await sicher(async () => {
       if (w === 'herkunft') await herkunft(z);
       else if (w === 'bearbeiten') await bearbeiten(manuell);
@@ -354,7 +353,9 @@ export async function zeige(container, route) {
 
   async function vorratAendern(z, dazu) {
     const vorher = s.einst.vorrat;
-    await db.speichereEinstellungen({ vorrat: dazu ? [...new Set([...vorher, z.mergeKey])] : vorher.filter((k) => k !== z.mergeKey) });
+    // weg damit auch Einträge, über die die Zeile zum Vorrat zählt ('salz und pfeffer' → salz, pfeffer)
+    const weg = new Set(vorratEintraegeFuer(z.mergeKey, vorher, s.aliase));
+    await db.speichereEinstellungen({ vorrat: dazu ? [...new Set([...vorher, z.mergeKey])] : vorher.filter((k) => !weg.has(k)) });
     meldeMitZurueck(dazu ? `„${z.name}“ zählt jetzt zum Vorrat.` : `„${z.name}“ steht wieder auf der Liste.`,
       () => db.speichereEinstellungen({ vorrat: vorher }));
   }

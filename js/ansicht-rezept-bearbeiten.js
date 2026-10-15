@@ -7,14 +7,6 @@ import { parseZeilen, zutatenAlsText } from './zutaten.js';
 import { ImportFehler, findeUrl, textOhneUrl, rezeptAusText, ladeRezept, findeTimer } from './rezept-import.js';
 import { zutatSpalten, istWebLink, hostVon, nichtGefunden } from './ansicht-rezepte.js';
 
-const FEHLER_TEXTE = {
-  'kein-proxy': 'Zum Laden über Links brauchst du den Import-Dienst (Mehr → Import-Dienst). Du kannst das Rezept aber unten als Text einfügen.',
-  netz: 'Die Seite konnte nicht geladen werden. Prüfe die Internetverbindung und versuch es noch einmal – oder füge den Rezepttext unten ein.',
-  blockiert: 'Diese Webseite lässt sich nicht automatisch laden. Kopiere den Rezepttext von der Seite und füge ihn unten ein.',
-  'kein-rezept': 'Auf dieser Seite wurde kein Rezept gefunden. Kopiere den Rezepttext und füge ihn unten ein.',
-  limit: 'Der Import-Dienst ist gerade ausgelastet. Versuch es später noch einmal oder füge den Text unten ein.',
-  ungueltig: 'Mit diesem Link klappt das Laden nicht (Adresse nicht erlaubt oder ungültige Antwort). Füge den Rezepttext unten ein.',
-};
 const KOPF_TITEL = { neu: 'Neues Rezept', bearbeiten: 'Rezept bearbeiten', import: 'Rezept prüfen' };
 
 export async function zeige(container, route) {
@@ -126,14 +118,6 @@ function duplikatHinweis(rezept) {
       el('a', { href: `#/rezept/${encodeURIComponent(rezept.id)}` }, rezept.title || 'Ohne Titel')));
 }
 
-// Wartet auf das nächste popstate (höchstens 700 ms)
-function nachVerlauf() {
-  return new Promise((fertig) => {
-    const t = setTimeout(fertig, 700);
-    window.addEventListener('popstate', () => { clearTimeout(t); setTimeout(fertig, 0); }, { once: true });
-  });
-}
-
 function kuerze(text, max) {
   return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
 }
@@ -229,13 +213,24 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
 
   // Ungespeicherte Änderungen erkennen
   const felder = [titel, portionen, gesamt, vorb, koch, tags, zutaten, schritte, notizen, quelle, bild];
-  const zustand = () => JSON.stringify(felder.map((f) => f.value));
-  const startZustand = zustand();
-  const geaendert = () => !fertig && (modus === 'import' || zustand() !== startZustand);
+  const startWert = new Map(felder.map((f) => [f, f.value]));
+  const gleich = (...f) => f.every((x) => x.value === startWert.get(x));
+  const geaendert = () => !fertig && (modus === 'import' || !gleich(...felder));
   const vorVerlassen = (ev) => { if (geaendert()) { ev.preventDefault(); ev.returnValue = ''; } };
+  // Zurück-Pfeil und App-Links (Navigation unten, Hinweise): bei Änderungen erst nachfragen wie bei
+  // „Abbrechen“. Capture-Phase, damit es vor dem Klick-Handler in app.js läuft.
+  const vorKlick = (ev) => {
+    const ziel = ev.target?.closest?.('#kopf-zurueck, a[href^="#/"]');
+    if (!ziel || !geaendert()) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    abbrechen(ziel.id === 'kopf-zurueck' ? null : ziel.getAttribute('href'));
+  };
   window.addEventListener('beforeunload', vorVerlassen);
+  document.addEventListener('click', vorKlick, true);
   aufraeumer.push(() => {
     window.removeEventListener('beforeunload', vorVerlassen);
+    document.removeEventListener('click', vorKlick, true);
     Object.values(timer).forEach(clearTimeout);
   });
 
@@ -248,19 +243,23 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
     if (problem) { toast(problem[1]); problem[0].focus(); return; }
     const q = quelle.value.trim();
     const qIstLink = istWebLink(q);
+    // Unveränderte Felder behalten den gespeicherten Wert (keine Rundung, Zutaten-ids bleiben)
+    const behalte = (f, alt, neuWert) => (gleich(f) && alt !== undefined ? alt : neuWert());
     const minuten = (f) => (zahl(f.value) == null ? null : Math.round(zahl(f.value)));
-    const prepMin = minuten(vorb);
-    const cookMin = minuten(koch);
+    const prepMin = behalte(vorb, rezept.prepMin, () => minuten(vorb));
+    const cookMin = behalte(koch, rezept.cookMin, () => minuten(koch));
+    const totalMin = gleich(gesamt, vorb, koch) && rezept.totalMin !== undefined ? rezept.totalMin
+      : minuten(gesamt) ?? (prepMin || cookMin ? (prepMin || 0) + (cookMin || 0) : null);
     const neu = {
-      ...rezept, title: t, servings: zahl(portionen.value), prepMin, cookMin,
-      totalMin: minuten(gesamt) ?? (prepMin || cookMin ? (prepMin || 0) + (cookMin || 0) : null),
-      tags: tagsAusText(tags.value),
-      sourceUrl: qIstLink ? q : '',
-      sourceSite: qIstLink ? (q === rezept.sourceUrl && rezept.sourceSite ? rezept.sourceSite : hostVon(q)) : q,
-      imageUrl: bildUrl, notes: notizen.value.trim(), favorite: rezept.favorite === true,
-      // unveränderter Text: geparste Zeilen (mit ihren ids) behalten
-      ingredients: zutaten.value === startZutaten && Array.isArray(rezept.ingredients) ? rezept.ingredients : parseZeilen(zutaten.value),
-      steps: schritte.value === startSchritte && Array.isArray(rezept.steps) ? rezept.steps : parseSchritte(schritte.value),
+      ...rezept, title: behalte(titel, rezept.title || undefined, () => t),
+      servings: behalte(portionen, rezept.servings, () => zahl(portionen.value)), prepMin, cookMin, totalMin,
+      tags: behalte(tags, Array.isArray(rezept.tags) ? rezept.tags : undefined, () => tagsAusText(tags.value)),
+      sourceUrl: behalte(quelle, rezept.sourceUrl, () => (qIstLink ? q : '')),
+      sourceSite: behalte(quelle, rezept.sourceSite, () => (qIstLink ? hostVon(q) : q)),
+      imageUrl: behalte(bild, rezept.imageUrl, () => bildUrl), notes: behalte(notizen, rezept.notes, () => notizen.value.trim()),
+      favorite: rezept.favorite === true,
+      ingredients: behalte(zutaten, Array.isArray(rezept.ingredients) ? rezept.ingredients : undefined, () => parseZeilen(zutaten.value)),
+      steps: behalte(schritte, Array.isArray(rezept.steps) ? rezept.steps : undefined, () => parseSchritte(schritte.value)),
     };
     speichert = true;
     try {
@@ -275,16 +274,16 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
     }
   }
 
-  async function abbrechen() {
+  // Verlassen ohne Speichern; nach: Ziel-Hash (sonst eine Ansicht zurück)
+  async function abbrechen(nach = null) {
     if (geaendert()) {
       const text = modus === 'import' ? 'Das geladene Rezept wird nicht gespeichert.' : 'Deine Änderungen gehen verloren.';
-      // Der Dialog nimmt beim Schließen seinen Verlaufseintrag zurück; danach erst weiter zurück
-      const verlauf = nachVerlauf();
+      // zurueck() wartet selbst, bis der Dialog seinen Verlaufseintrag zurückgenommen hat
       if (!(await bestaetige(text, { titel: 'Verwerfen?', ja: 'Verwerfen', nein: 'Weiter bearbeiten', gefahr: true }))) return;
-      await verlauf;
     }
     fertig = true;
-    zurueck();
+    if (nach) navigiere(nach);
+    else zurueck();
   }
 
   kopfAktionen(el('button', { type: 'button', class: 'knopf primaer klein', onclick: speichern }, 'Speichern'));
@@ -314,7 +313,7 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
       feld('Quelle', quelle, 'Link zur Webseite oder ein Hinweis wie „Kochbuch S. 12“.'),
       feld('Bild-URL', bild)),
     el('div', { class: 'leiste ende' },
-      el('button', { type: 'button', class: 'knopf flach', onclick: abbrechen }, 'Abbrechen'),
+      el('button', { type: 'button', class: 'knopf flach', onclick: () => abbrechen() }, 'Abbrechen'),
       el('button', { type: 'button', class: 'knopf primaer', onclick: speichern }, symbol(SYMBOLE.haken), 'Speichern')));
   if (modus === 'neu') titel.focus();
 }
@@ -324,6 +323,7 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
 async function zeigeImport(container, query, aufraeumer) {
   setzeTitel('Rezept importieren');
   let aktiv = true;
+  let laedt = false;
   aufraeumer.push(() => { aktiv = false; });
   const geteilt = holeGeteiltes();
   const einstellungen = await db.holeEinstellungen();
@@ -342,7 +342,7 @@ async function zeigeImport(container, query, aufraeumer) {
   let dupTimer = null;
   urlFeld.addEventListener('input', () => {
     clearTimeout(dupTimer);
-    dupTimer = setTimeout(() => pruefeDuplikat(findeUrl(urlFeld.value)), 300);
+    dupTimer = setTimeout(() => pruefeDuplikat(findeUrl(urlFeld.value)).catch(console.error), 300);
   });
   aufraeumer.push(() => clearTimeout(dupTimer));
   const ladeKnopf = el('button', { type: 'button', class: 'knopf primaer', disabled: !proxy, onclick: () => laden() },
@@ -373,6 +373,28 @@ async function zeigeImport(container, query, aufraeumer) {
     status.replaceChildren(...(knoten ? [knoten] : []));
   }
 
+  // Nach einem Fehler: zum Textfeld (auch wenn es über der Link-Karte steht)
+  function zumText() {
+    textKarte.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    textFeld.focus({ preventScroll: true });
+  }
+
+  // Fehlerkasten mit verständlicher Meldung (aus rezept-import.js) und passenden Knöpfen
+  function fehlerKasten(e) {
+    const code = e instanceof ImportFehler ? e.code : null;
+    const dienstPruefen = ['kein-proxy', 'origin'].includes(code) || ['methode', 'antwort', 'nicht-erreichbar'].includes(e?.grund);
+    return el('div', { class: 'fehler', role: 'alert' },
+      el('p', null, code ? e.message : 'Das Rezept konnte nicht geladen werden. Füge den Rezepttext als Text ein.'),
+      code === 'origin' ? el('p', { class: 'nebentext' }, `Adresse dieser App: ${location.origin}`) : null,
+      code ? null : el('p', { class: 'nebentext' }, String(e?.message || e)),
+      el('div', { class: 'leiste' },
+        code === 'netz' || code === 'limit'
+          ? el('button', { type: 'button', class: 'knopf klein', onclick: () => laden() }, 'Nochmal versuchen') : null,
+        dienstPruefen ? el('a', { class: 'knopf klein', href: '#/mehr' },
+          code === 'kein-proxy' ? 'Import-Dienst einrichten' : 'Import-Dienst prüfen') : null,
+        el('button', { type: 'button', class: 'knopf klein', onclick: zumText }, symbol(SYMBOLE.text), 'Als Text einfügen')));
+  }
+
   async function pruefeDuplikat(u) {
     const d = await findeDuplikat(u);
     if (!aktiv) return null;
@@ -395,12 +417,14 @@ async function zeigeImport(container, query, aufraeumer) {
   }
 
   async function laden() {
+    if (laedt) return;
     const u = findeUrl(urlFeld.value);
     if (!u) {
       zeigeStatus(fehlerAnzeige('Bitte einen vollständigen Link einfügen (beginnt mit https://).'));
       urlFeld.focus();
       return;
     }
+    laedt = true;
     urlFeld.value = u;
     clearTimeout(dupTimer);
     pruefeDuplikat(u).catch(console.error);
@@ -412,22 +436,22 @@ async function zeigeImport(container, query, aufraeumer) {
     } catch (e) {
       if (!aktiv) return;
       console.warn(e);
-      ladeKnopf.disabled = !proxy;
-      const code = e instanceof ImportFehler ? e.code : null;
-      zeigeStatus(fehlerAnzeige(FEHLER_TEXTE[code] || 'Das Rezept konnte nicht geladen werden. Füge den Rezepttext unten ein.',
-        FEHLER_TEXTE[code] ? null : e));
+      zeigeStatus(fehlerKasten(e));
       if (!textFeld.value.trim() && geteilterText) textFeld.value = geteilterText;
+    } finally {
+      laedt = false;
+      ladeKnopf.disabled = !proxy;
     }
   }
 
   function textUebernehmen() {
     const text = textFeld.value.trim();
     if (!text) { toast('Bitte zuerst den Rezepttext einfügen.'); textFeld.focus(); return; }
-    const titelVorgabe = text === geteilterText && geteilt?.title && !findeUrl(geteilt.title) ? geteilt.title.trim() : undefined;
     const quelleUrl = findeUrl(urlFeld.value) || findeUrl(text) || undefined;
     let entwurf;
     try {
-      entwurf = rezeptAusText(text, { titel: titelVorgabe, quelleUrl });
+      // Titel aus dem Text hat Vorrang; der Titel des Teilens (oft Seitenname) nur als Ersatz, siehe zeigeEntwurf
+      entwurf = rezeptAusText(text, { quelleUrl });
     } catch (e) {
       console.error(e);
       toast('Der Text konnte nicht gelesen werden.');
@@ -436,10 +460,11 @@ async function zeigeImport(container, query, aufraeumer) {
     zeigeEntwurf(entwurf).catch(console.error);
   }
 
-  // Geteilter Link: Duplikat prüfen und – wenn möglich – gleich laden
+  // Geteilter Link: Duplikat prüfen und – wenn möglich – gleich laden. Fokus nur auf leere Felder,
+  // die man jetzt braucht (sonst springt auf dem Handy unnötig die Tastatur auf)
   const dup = url ? await pruefeDuplikat(url) : null;
   if (!aktiv) return;
   if (url && proxy && !dup && modus !== 'text') laden();
-  else if (modus === 'text') textFeld.focus();
-  else if (!url) urlFeld.focus();
+  else if (modus === 'text' && !textFeld.value) textFeld.focus();
+  else if (modus === 'link' && proxy && !url) urlFeld.focus();
 }
