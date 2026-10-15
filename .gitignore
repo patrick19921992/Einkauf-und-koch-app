@@ -1,0 +1,19 @@
+# Sicherungsdateien der App – gehören NIE ins öffentliche Repo
+rezepte-backup-*.json
+rezepte-backup-*.txt
+
+# Build-Ausgabe (wird von GitHub Actions erzeugt)
+_site/
+
+# Systemdateien
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editoren
+.vscode/
+.idea/
+*.swp
+
+# Node (nur falls lokal Tests laufen)
+node_modules/
