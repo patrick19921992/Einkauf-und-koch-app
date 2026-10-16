@@ -424,7 +424,8 @@ async function zeigeRezept(container, id, query) {
         el('a', { class: 'knopf', href: rezeptLink(id, '/bearbeiten') }, symbol(SYMBOLE.bearbeiten), 'Bearbeiten'),
         el('button', { type: 'button', class: 'knopf', onclick: () => teileText(rezept.title, rezeptAlsText(rezept, portionen)) },
           symbol(SYMBOLE.teilen), 'Teilen'),
-        el('button', { type: 'button', class: 'knopf', onclick: () => loescheRezept(rezept) }, symbol(SYMBOLE.loeschen), 'Löschen')));
+        // rot: zerstörerische Aktion (mit Nachfrage und „Rückgängig“)
+        el('button', { type: 'button', class: 'knopf gefahr', onclick: () => loescheRezept(rezept) }, symbol(SYMBOLE.loeschen), 'Löschen')));
   }
 
   zeichne();

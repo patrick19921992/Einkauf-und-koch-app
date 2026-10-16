@@ -21,7 +21,9 @@ export async function zeige(container, route) {
   } else if (art === 'rezept' && zusatz === 'bearbeiten') {
     setzeTitel(KOPF_TITEL.bearbeiten);
     const rezept = await db.hole('recipes', id);
-    if (rezept) zeigeFormular(container, { rezept, modus: 'bearbeiten', aufraeumer });
+    // Ältere Importe ohne Portionszahl: Feld markieren (nur wenn es Mengen gibt)
+    const portionenPruefen = ohnePortionen(rezept) && (rezept?.ingredients || []).some((z) => z?.qty != null);
+    if (rezept) zeigeFormular(container, { rezept, modus: 'bearbeiten', aufraeumer, portionenPruefen });
     else nichtGefunden(container);
   } else {
     setzeTitel(KOPF_TITEL.neu);
@@ -38,6 +40,8 @@ function leeresRezept(einstellungen) {
     prepMin: null, cookMin: null, totalMin: null, tags: [], notes: '', favorite: false, ingredients: [], steps: [],
   };
 }
+
+const ohnePortionen = (r) => !(Number(r?.servings) > 0);
 
 /** '1,5' / '4' → Zahl > 0, sonst null. */
 function zahl(text) {
@@ -129,7 +133,7 @@ function feld(beschriftung, steuerung, zusatz = null, style = null) {
 
 // ---------------------------------------------------------------- Formular
 
-function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) {
+function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [], portionenPruefen = false }) {
   setzeTitel(KOPF_TITEL[modus]);
   let fertig = false;
   let speichert = false;
@@ -139,6 +143,17 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
   });
   const titel = el('input', { type: 'text', value: rezept.title || '', required: true, autocomplete: 'off', enterkeyhint: 'next' });
   const portionen = zahlFeld(rezept.servings, 'z. B. 4', 'decimal');
+  // Keine Portionszahl im Rezept: Feld markieren und erklären – sonst rechnen Woche und
+  // Einkaufsliste die Mengen mal die geplanten Portionen (1 kg Kartoffeln → 4 kg)
+  let portionenHinweis = null;
+  if (portionenPruefen) {
+    portionenHinweis = el('div', { class: 'hinweis warnung', id: 'portionen-hinweis' }, el('p', null,
+      el('span', { class: 'fett' }, `Keine Portionszahl ${modus === 'bearbeiten' ? 'angegeben' : 'gefunden'} – für wie viele Personen sind die Mengen?`),
+      rezept.servings ? ` Vorgeschlagen: ${rezept.servings}. Bitte prüfen.` : ' Ohne Angabe gelten sie für 1 Portion.'));
+    portionen.setAttribute('aria-describedby', 'portionen-hinweis');
+    Object.assign(portionen.style, { borderColor: 'var(--warn-rand)', backgroundColor: 'var(--warn-bg)' });
+    portionen.addEventListener('input', () => Object.assign(portionen.style, { borderColor: '', backgroundColor: '' }), { once: true });
+  }
   const gesamt = zahlFeld(rezept.totalMin, 'Min.');
   const vorb = zahlFeld(rezept.prepMin, 'Min.');
   const koch = zahlFeld(rezept.cookMin, 'Min.');
@@ -241,6 +256,15 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
     const problem = !t ? [titel, 'Bitte gib einen Titel ein.']
       : bildUrl && !istWebLink(bildUrl) ? [bild, 'Die Bild-Adresse muss mit https:// beginnen.'] : null;
     if (problem) { toast(problem[1]); problem[0].focus(); return; }
+    // Mengen ohne Portionszahl gelten für 1 Portion – geplant für 4 wird alles vervierfacht
+    if (zahl(portionen.value) == null && (modus !== 'bearbeiten' || !gleich(portionen))
+      && parseZeilen(zutaten.value).some((z) => z.qty != null)) {
+      speichert = true;
+      const trotzdem = await bestaetige('Ohne Portionszahl gelten die Mengen für 1 Portion. Planst du das Rezept für 4 Personen, kommt alles 4-mal auf die Einkaufsliste.',
+        { titel: 'Ohne Portionen speichern?', ja: 'Trotzdem speichern', nein: 'Portionen eintragen' });
+      speichert = false;
+      if (!trotzdem) { portionen.focus(); return; }
+    }
     const q = quelle.value.trim();
     const qIstLink = istWebLink(q);
     // Unveränderte Felder behalten den gespeicherten Wert (keine Rundung, Zutaten-ids bleiben)
@@ -298,6 +322,7 @@ function zeigeFormular(container, { rezept, modus, aufraeumer, hinweise = [] }) 
     el('section', { class: 'abschnitt' },
       feld('Titel *', titel),
       zeiten,
+      portionenHinweis,
       feld('Tags', tags, 'Mit Komma trennen.')),
     el('section', { class: 'abschnitt' },
       el('h2', null, 'Zutaten'),
@@ -404,7 +429,11 @@ async function zeigeImport(container, query, aufraeumer) {
   }
 
   async function zeigeEntwurf(entwurf) {
-    const rezept = { ...leeresRezept(null), ...entwurf };
+    // Ohne Portionszahl (Text ohne „Portionen“, Seite ohne recipeYield) die Standard-Portionen
+    // vorschlagen und markieren, statt leer (= 1 Portion) zu speichern
+    const portionenPruefen = ohnePortionen(entwurf);
+    const rezept = { ...leeresRezept(einstellungen), ...entwurf };
+    if (portionenPruefen) rezept.servings = leeresRezept(einstellungen).servings;
     if (!rezept.title && geteilt?.title && !findeUrl(geteilt.title)) rezept.title = geteilt.title.trim();
     const dup = await findeDuplikat(rezept.sourceUrl);
     if (!aktiv) return;
@@ -412,7 +441,7 @@ async function zeigeImport(container, query, aufraeumer) {
       el('p', { class: 'fett' }, 'Bitte prüfen und speichern.'),
       rezept.ingredients?.length ? null : el('p', null, 'Es wurden keine Zutaten erkannt – trag sie unten ein.'))];
     if (dup) hinweise.push(duplikatHinweis(dup));
-    zeigeFormular(container, { rezept, modus: 'import', aufraeumer, hinweise });
+    zeigeFormular(container, { rezept, modus: 'import', aufraeumer, hinweise, portionenPruefen });
     window.scrollTo(0, 0);
   }
 

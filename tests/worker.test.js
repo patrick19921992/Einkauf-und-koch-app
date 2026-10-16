@@ -195,8 +195,13 @@ test('Origin-Prüfung: fremde oder fehlende Origin → 403, Zusatz per env', asy
   for (const origin of ['https://evil.example', 'https://patrick19921992.github.io.evil.example', 'null', null]) {
     const antwort = await worker.fetch(anfrage('?url=' + encodeURIComponent(REZEPT), { origin }), {});
     assert.equal(antwort.status, 403, String(origin));
-    assert.equal((await json(antwort)).fehler, 'origin');
-    assert.equal(antwort.headers.get('Access-Control-Allow-Origin'), null);
+    const daten = await json(antwort);
+    assert.equal(daten.fehler, 'origin');
+    assert.deepEqual(Object.keys(daten).sort(), ['fehler', 'meldung']);
+    // Die Absage ist lesbar (App kann den Grund zeigen), sonst gibt es keine CORS-Freigaben
+    assert.equal(antwort.headers.get('Access-Control-Allow-Origin'), '*');
+    assert.equal(antwort.headers.get('Access-Control-Allow-Methods'), null);
+    assert.equal(antwort.headers.get('Access-Control-Allow-Credentials'), null);
   }
   assert.equal(aufrufe.length, 0);
 
@@ -206,6 +211,8 @@ test('Origin-Prüfung: fremde oder fehlende Origin → 403, Zusatz per env', asy
   assert.equal(lokal.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
   const ohneEnv = await worker.fetch(anfrage('?ping=1', { origin: 'http://localhost:8080' }));
   assert.equal(ohneEnv.status, 403);
+  assert.equal((await json(ohneEnv)).fehler, 'origin');
+  assert.equal(ohneEnv.headers.get('Access-Control-Allow-Origin'), '*');
 });
 
 test('ping antwortet ohne Abruf', async () => {

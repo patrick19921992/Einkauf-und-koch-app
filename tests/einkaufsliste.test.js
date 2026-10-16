@@ -4,7 +4,7 @@ import { parseZeile, parseZeilen, zutatSchluessel } from '../js/zutaten.js';
 import {
   ABTEILUNGEN, sortierteAbteilungen, abteilungVon, kanonischerSchluessel, standardZeitraum,
   planEintraegeFuerRunde, berechneListe, abhakZustand, listeAlsText, postenSchluessel, abteilungEintrag,
-  vorratEintraegeFuer,
+  vorratEintraegeFuer, geplantePortionen, offeneRundenVereinen,
 } from '../js/einkaufsliste.js';
 
 // Abteilung direkt aus einem Zutatennamen (wie in der App: erst Schlüssel, dann Abteilung)
@@ -388,12 +388,13 @@ const stand = (z, tripId = 't2') => ({ id: `${tripId}|${z.mergeKey}`, kind: 'sta
 
 test('abhakZustand: aktuelle Mengen in Basis-Einheiten', () => {
   const l = liste();
-  assert.deepEqual(abhakZustand(zeile(l, 'tomatenmark')), { abgehakt: { TL: 9 }, erledigt: true });
-  assert.deepEqual(abhakZustand(zeile(l, 'knoblauchzehe')), { abgehakt: { Stück: 4.5 }, erledigt: true });
-  assert.deepEqual(abhakZustand(zeile(l, 'petersilie')), { abgehakt: {}, erledigt: true });
+  // eintraege: für welche Gerichte eingekauft wurde
+  assert.deepEqual(abhakZustand(zeile(l, 'tomatenmark')), { abgehakt: { TL: 9 }, erledigt: true, eintraege: ['e1', 'e2'] });
+  assert.deepEqual(abhakZustand(zeile(l, 'knoblauchzehe')), { abgehakt: { Stück: 4.5 }, erledigt: true, eintraege: ['e1', 'e2'] });
+  assert.deepEqual(abhakZustand(zeile(l, 'petersilie')), { abgehakt: {}, erledigt: true, eintraege: ['e1'] });
   assert.deepEqual(abhakZustand({ teile: [{ qty: 1.5, qty2: null, unit: 'kg' }, { qty: 2, unit: 'EL' }] }),
-    { abgehakt: { g: 1500, TL: 6 }, erledigt: true });
-  assert.deepEqual(abhakZustand(null), { abgehakt: {}, erledigt: true });
+    { abgehakt: { g: 1500, TL: 6 }, erledigt: true, eintraege: null });
+  assert.deepEqual(abhakZustand(null), { abgehakt: {}, erledigt: true, eintraege: null });
 });
 
 test('berechneListe: Abhaken, nachträglich mehr → Rest', () => {
@@ -480,6 +481,112 @@ test('berechneListe: Runde filtert Einträge, leere Eingaben', () => {
   const nurManuell = berechneListe({ manuelle: [{ id: 'm', kind: 'manual', name: 'Brot', qty: null, checked: false }] });
   assert.equal(nurManuell.anzahlOffen, 1);
   assert.equal(nurManuell.abteilungen[0].id, 'brot');
+});
+
+test('berechneListe: Haken gelten nur für die Gerichte von damals (Zeitraum gewechselt)', () => {
+  // Gulasch diese Woche abgehakt, Runde nicht abgeschlossen, dann auf nächste Woche (Bolognese) gewechselt
+  const gulasch = { id: 'r-g', title: 'Gulasch', servings: 4, ingredients: parseZeilen('500 g Rinderhack\n3 Zwiebeln\n200 ml Sahne\netwas Petersilie') };
+  const bolo = { id: 'r-b', title: 'Bolognese', servings: 4, ingredients: parseZeilen('500 g Rinderhack\n2 Zwiebeln\n1 Dose Tomaten\nPetersilie') };
+  const plan = [
+    { id: 'g1', date: '2026-10-14', slot: 'abend', recipeId: 'r-g', servings: 4, tripId: null },
+    { id: 'b1', date: '2026-10-21', slot: 'abend', recipeId: 'r-b', servings: 4, tripId: null },
+  ];
+  const woche1 = { id: 't9', from: '2026-10-12', to: '2026-10-18', closedAt: null };
+  const basis = { planEintraege: plan, rezepte: [gulasch, bolo] };
+  const vorher = berechneListe({ ...basis, runde: woche1 });
+  const zustaende = alleZeilen(vorher).map((z) => stand(z, 't9'));
+  assert.equal(berechneListe({ ...basis, runde: woche1, zustaende }).anzahlOffen, 0);
+  // gleiche Runde, anderer Zeitraum: nichts für Bolognese gekauft → alles offen
+  const woche2 = { ...woche1, from: '2026-10-19', to: '2026-10-25' };
+  const l = berechneListe({ ...basis, runde: woche2, zustaende });
+  assert.deepEqual(l.erledigt, []);
+  assert.equal(l.anzahlOffen, 4);
+  assert.equal(zeile(l, 'rinderhack').restText, '500 g');
+  assert.equal(zeile(l, 'zwiebel').restText, '2');
+  assert.equal(zeile(l, 'petersilie').erledigt, false); // vage, aber anderes Gericht
+  // zurück auf Woche 1: die Haken sind wieder da
+  assert.equal(berechneListe({ ...basis, runde: woche1, zustaende }).anzahlOffen, 0);
+  // beide Wochen im Zeitraum: Gulasch-Mengen sind gekauft, Bolognese fehlt noch
+  const beide = berechneListe({ ...basis, runde: { ...woche1, to: '2026-10-25' }, zustaende });
+  assert.equal(zeile(beide, 'zwiebel').text, '5');
+  assert.equal(zeile(beide, 'zwiebel').restText, '2');
+  assert.equal(zeile(beide, 'zwiebel').erledigt, false);
+  assert.equal(zeile(beide, 'rinderhack').restText, '500 g');
+  assert.equal(zeile(beide, 'sahne').erledigt, true);
+  // Gulasch-Portionen danach erhöht: nur der Zuwachs fehlt
+  const mehr = plan.map((e) => (e.id === 'g1' ? { ...e, servings: 8 } : e));
+  assert.equal(zeile(berechneListe({ ...basis, planEintraege: mehr, runde: woche1, zustaende }), 'zwiebel').restText, '3');
+  // in Woche 2 dieselbe Zutat abgehakt: der Haken für Woche 1 bleibt gültig
+  const zw2 = zeile(l, 'zwiebel');
+  const st2 = { ...stand(zw2, 't9'), ...abhakZustand(zw2, zustaende.find((x) => x.mergeKey === 'zwiebel')) };
+  assert.deepEqual([st2.abgehakt, st2.eintraege], [{ Stück: 5 }, ['b1', 'g1']]);
+  const mit2 = zustaende.map((x) => (x.mergeKey === 'zwiebel' ? st2 : x));
+  assert.equal(zeile(berechneListe({ ...basis, runde: woche1, zustaende: mit2 }), 'zwiebel').erledigt, true);
+  assert.equal(zeile(berechneListe({ ...basis, runde: woche2, zustaende: mit2 }), 'zwiebel').erledigt, true);
+  // gleiche Gerichte (z. B. mehr Portionen): der neue Stand ersetzt den alten
+  assert.deepEqual(abhakZustand(zeile(vorher, 'zwiebel'), zustaende.find((x) => x.mergeKey === 'zwiebel')).abgehakt, { Stück: 3 });
+  // alter Stand ohne eintraege: bisherige Regel (nur Mengen)
+  const alt = zustaende.map((z) => ({ ...z, eintraege: undefined }));
+  assert.equal(zeile(berechneListe({ ...basis, runde: woche2, zustaende: alt }), 'zwiebel').erledigt, true);
+});
+
+test('berechneListe: nach dem Einkauf mehr Portionen geplant → nur die Differenz', () => {
+  const r = { id: 'r-g', title: 'Gulasch', servings: 2, ingredients: parseZeilen('500 g Rindfleisch\n2 Zwiebeln') };
+  const e = { id: 'g', date: '2026-10-20', slot: 'abend', recipeId: 'r-g', servings: 6, tripId: 't1', eingekauftPortionen: 2 };
+  assert.deepEqual(planEintraegeFuerRunde([e], RUNDE).map((x) => x.id), ['g']);
+  const l = berechneListe({ planEintraege: [e], rezepte: [r], runde: RUNDE });
+  assert.equal(zeile(l, 'rindfleisch').text, '1 kg');
+  assert.equal(zeile(l, 'zwiebel').text, '4');
+  // in der eigenen Runde zählt alles
+  assert.equal(zeile(berechneListe({ planEintraege: [e], rezepte: [r], runde: { ...RUNDE, id: 't1' } }), 'zwiebel').text, '6');
+  // gleich viele oder weniger Portionen, oder alter Eintrag ohne eingekauftPortionen: nichts
+  for (const x of [{ ...e, servings: 2 }, { ...e, servings: 1 }, { ...e, eingekauftPortionen: undefined }, { ...e, servings: null }]) {
+    assert.deepEqual(planEintraegeFuerRunde([x], RUNDE), []);
+  }
+  assert.equal(geplantePortionen({ servings: 3 }, r), 3);
+  assert.equal(geplantePortionen({ servings: null }, r), 2);
+  assert.equal(geplantePortionen({}, { servings: null }), 1);
+});
+
+test('offeneRundenVereinen: älteste Runde bleibt, Haken wandern mit (je Posten der neuere)', () => {
+  const a = { id: 'ta', from: '2026-09-28', to: '2026-10-04', closedAt: null, createdAt: 100 };
+  const b = { id: 'tb', from: '2026-10-12', to: '2026-10-18', closedAt: null, createdAt: 200 };
+  const st = (trip, key, updatedAt, extra = {}) => ({ id: `${trip}|${key}`, kind: 'state', tripId: trip, mergeKey: key,
+    erledigt: true, abgehakt: {}, eintraege: ['x'], versteckt: false, updatedAt, ...extra });
+  const zustaende = [st('ta', 'zwiebel', 5), st('tb', 'zwiebel', 9, { abgehakt: { Stück: 2 } }), st('tb', 'mehl', 9),
+    st('ta', 'salz', 50), st('tb', 'salz', 10), st('tx', 'milch', 1)];
+  // Reihenfolge der Eingabe egal: auf jedem Gerät dasselbe Ergebnis
+  for (const offene of [[a, b], [b, a]]) {
+    const v = offeneRundenVereinen(offene, zustaende);
+    assert.equal(v.runde, a);
+    assert.deepEqual(v.entfernen, [{ ...b, deleted: true }]);
+    const kopien = v.zustaende.filter((x) => !x.deleted);
+    assert.deepEqual(kopien.map((x) => [x.id, x.tripId, x.abgehakt]).sort(), [
+      ['ta|mehl', 'ta', {}], ['ta|zwiebel', 'ta', { Stück: 2 }]]);
+    assert.deepEqual(v.zustaende.filter((x) => x.deleted).map((x) => x.id).sort(), ['tb|mehl', 'tb|salz', 'tb|zwiebel']);
+  }
+  // gleiche createdAt: kleinste id
+  assert.equal(offeneRundenVereinen([{ ...b, createdAt: 1 }, { ...a, createdAt: 1 }]).runde.id, 'ta');
+  assert.deepEqual(offeneRundenVereinen([]), { runde: null, entfernen: [], zustaende: [] });
+});
+
+test('postenSchluessel: Gewürz in Löffeln ist nicht das frische Gemüse', () => {
+  const a = { id: 'r-a', title: 'A', servings: 1, ingredients: parseZeilen('2 Paprika\n2 Zweige Thymian\n1 Chilischote\n1 TL Ingwer, gerieben') };
+  const b = { id: 'r-b', title: 'B', servings: 1,
+    ingredients: parseZeilen('1 TL Paprika, edelsüß\n1 TL Thymian\n1 TL Chili\n1 EL Paprika\n1 Prise Ingwer\n2 EL Petersilie, gehackt') };
+  const plan = ['r-a', 'r-b'].map((id, i) => ({ id: `p${i}`, date: '2026-10-19', slot: 'abend', recipeId: id, servings: 1, tripId: null }));
+  const l = berechneListe({ planEintraege: plan, rezepte: [a, b], runde: RUNDE });
+  const text = (id) => l.abteilungen.find((x) => x.id === id).zeilen.map((z) => `${z.text} ${z.name}`.trim());
+  assert.deepEqual(text('obst-gemuese'), ['1 Chilischote', '1 TL Ingwer', '2 Paprika', '2 EL Petersilie', '2 Zweige Thymian']);
+  assert.deepEqual(text('gewuerze'), ['1 TL Chili', 'Ingwer', '4 TL Paprika', '1 TL Thymian']); // Prise: ohne Menge
+  const k = (t) => postenSchluessel(parseZeile(t));
+  assert.equal(k('1 TL Paprika, edelsüß'), 'paprika, gemahlen');
+  assert.equal(k('1 TL Rosmarin'), 'rosmarin, getrocknet');
+  assert.equal(k('1 EL Thymian'), 'thymian'); // EL frischer Blättchen bleibt frisch
+  assert.equal(k('1 TL Knoblauch'), 'knoblauch');
+  assert.equal(k('1 TL Chili, fein gehackt'), 'chili');
+  assert.equal(k('2 TL Rosmarin, frisch oder TK'), 'rosmarin');
+  assert.equal(k('1 TL Paprikapulver'), 'paprikapulver');
 });
 
 test('listeAlsText: Titel, Abteilungen, Rest statt Gesamt, ohne Erledigtes und Vorrat', () => {

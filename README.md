@@ -67,7 +67,9 @@ nimmt nur Anfragen von der App-Adresse an und ruft nur bekannte Rezeptseiten ab
 - **Daten liegen nur auf diesem Gerät.** Wer in Chrome die Website-Daten löscht, löscht auch die
   Rezepte. Deshalb regelmäßig unter **Mehr → Sicherung** sichern (die App erinnert daran).
 - Noch **kein Abgleich zwischen Handys**: Jedes Gerät hat eigene Daten. Die Einkaufsliste lässt
-  sich als Text teilen, ganze Daten per Sicherungsdatei übertragen.
+  sich als Text teilen, ganze Daten per Sicherungsdatei übertragen. Beim Einlesen gewinnt pro
+  Eintrag (und pro Einstellung) der neuere Stand – auch Löschungen werden übernommen, wenn sie
+  neuer sind. Fehlerhafte Einträge in einer Datei werden repariert oder übersprungen.
 - Sprachausgabe braucht eine installierte deutsche Stimme. Änderungen an App-Name, Symbol oder
   Teilen-Menü erreichen die installierte App erst nach bis zu einem Tag (Chrome prüft selten).
 

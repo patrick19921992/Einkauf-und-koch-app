@@ -10,7 +10,7 @@ import { heute, istSchluessel, formatDatum, formatZeitraum } from './datum.js';
 import { parseZeile, formatZutat } from './zutaten.js';
 import {
   ABTEILUNGEN, sortierteAbteilungen, abteilungEintrag, standardZeitraum, berechneListe, abhakZustand, listeAlsText,
-  vorratEintraegeFuer,
+  vorratEintraegeFuer, geplantePortionen, offeneRundenVereinen,
 } from './einkaufsliste.js';
 
 const ZEITRAEUME = [{ art: 'diese-woche', text: 'Diese Woche' }, { art: 'naechste-woche', text: 'Nächste Woche' },
@@ -33,6 +33,9 @@ function bereichAusQuery(query) {
   return von <= bis ? { von, bis } : { von: bis, bis: von };
 }
 
+// Zeitraumwechsel, nach dem Abgehaktes nicht mehr zu sehen wäre: erst fragen, ob abgeschlossen werden soll
+const erstFragen = (liste, z, runde) => liste.erledigt.some((x) => !x.manuell) && (z.von > runde.to || z.bis < runde.from);
+
 /** Manueller Eintrag aus einer Textzeile ('2 l Milch') oder null. */
 function ausText(text) {
   const z = parseZeile(text);
@@ -49,13 +52,15 @@ function stelleFokusHer(box, schluessel) {
 
 export async function zeige(container, route) {
   setzeTitel('Einkauf');
-  const s = {}; // aktueller Stand: einst, runde, offeneRunden, liste, plan, aliase, zustaende, manuelle
+  const s = {}; // aktueller Stand: einst, runde, offeneRunden, liste, plan, rezepte, aliase, zustaende, manuelle
   const offen = { erledigt: false, vorrat: false }; // aufgeklappte Bereiche
   // ?von=…&bis=… gilt einmal; danach ohne Zeitraum im Verlauf, sonst setzte „Zurück“ eine spätere Wahl zurück
   let wunsch = bereichAusQuery(route.query);
   if ((route.query.has('von') || route.query.has('bis')) && location.hash === route.hash) {
     history.replaceState(history.state, '', '#/einkauf');
   }
+  let erstesLaden = true;
+  let nachfrage = null; // Zeitraumwechsel, über den erst gefragt wird (schon etwas abgehakt)
   let timer = null;
   let ruheBis = 0;
   let laeuft = false;
@@ -80,25 +85,39 @@ export async function zeige(container, route) {
   async function laden() {
     const [einst, rezepte, plan, trips, items, aliasListe] = await Promise.all([db.holeEinstellungen(),
       ...['recipes', 'planEntries', 'trips', 'shoppingItems', 'aliases'].map((store) => db.alle(store))]);
-    // offene Runde: die neueste ohne closedAt; sonst neu anlegen
-    const offene = trips.filter((t) => t.closedAt == null).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    let runde = offene[0];
-    if (!runde) {
-      const z = wunsch || standardZeitraum('diese-woche', heute(), einst.wochenstart);
-      runde = await db.speichere('trips', { from: z.von, to: z.bis, closedAt: null });
-    } else if (wunsch && (wunsch.von !== runde.from || wunsch.bis !== runde.to)) {
-      runde = await db.speichere('trips', { ...runde, from: wunsch.von, to: wunsch.bis });
-    }
-    wunsch = null;
     const manuelle = items.filter((i) => i.kind === 'manual');
     const zustaende = items.filter((i) => i.kind === 'state');
+    const offene = trips.filter((t) => t.closedAt == null);
+    if (offene.length > 1) {
+      // mehrere offene Runden (Sicherung eines anderen Geräts eingelesen): überall dieselbe behalten
+      const v = offeneRundenVereinen(offene, zustaende);
+      await db.speichereViele('shoppingItems', v.zustaende);
+      await db.speichereViele('trips', v.entfernen);
+      return laden();
+    }
     const aliase = Object.fromEntries(aliasListe.map((a) => [a.id, a]));
     const vorrat = Array.isArray(einst.vorrat) ? einst.vorrat : [];
-    const liste = berechneListe({
-      planEintraege: plan, rezepte, manuelle, zustaende, aliase, vorrat, runde, reihenfolge: einst.abteilungsReihenfolge,
+    const berechne = (r) => berechneListe({
+      planEintraege: plan, rezepte, manuelle, zustaende, aliase, vorrat, runde: r, reihenfolge: einst.abteilungsReihenfolge,
     });
+    let runde = offene[0];
+    const h = heute();
+    if (!runde) {
+      const z = wunsch || standardZeitraum('diese-woche', h, einst.wochenstart);
+      runde = await db.speichere('trips', { from: z.von, to: z.bis, closedAt: null });
+    }
+    let liste = berechne(runde);
+    // gewünschter Zeitraum (?von/bis) – oder beim Öffnen diese Woche statt einer vergangenen
+    const ziel = wunsch || (erstesLaden && runde.to < h ? standardZeitraum('diese-woche', h, einst.wochenstart) : null);
+    if (ziel && (ziel.von !== runde.from || ziel.bis !== runde.to)) {
+      if (erstFragen(liste, ziel, runde)) nachfrage = { ziel, vergangen: !wunsch }; // nach dem Zeichnen
+      else liste = berechne(runde = await db.speichere('trips', { ...runde, from: ziel.von, to: ziel.bis }));
+    }
+    wunsch = null;
+    erstesLaden = false;
     Object.assign(s, {
       einst: { ...einst, vorrat }, runde, liste, plan, aliase,
+      rezepte: new Map(rezepte.map((r) => [r.id, r])),
       offeneRunden: new Set([runde.id, ...offene.map((t) => t.id)]),
       zustaende: new Map(zustaende.map((z) => [z.id, z])),
       manuelle: new Map(manuelle.map((m) => [m.id, m])),
@@ -264,7 +283,8 @@ export async function zeige(container, route) {
     ruheBis = Date.now() + 700;
     await sicher(() => (z.manuell
       ? db.speichere('shoppingItems', { ...(s.manuelle.get(z.manuell.id) || z.manuell), checked: an })
-      : zustandSpeichern(z, an ? { ...abhakZustand(z), versteckt: false } : { erledigt: false, abgehakt: null })));
+      : zustandSpeichern(z, an ? { ...abhakZustand(z, s.zustaende.get(`${s.runde.id}|${z.mergeKey}`)), versteckt: false }
+        : { erledigt: false, abgehakt: null })));
   }
 
   /** Speichert eine Korrektur (Alias) und liefert die Funktion zum Zurücknehmen. */
@@ -360,8 +380,32 @@ export async function zeige(container, route) {
       () => db.speichereEinstellungen({ vorrat: vorher }));
   }
 
-  async function setzeZeitraum(z) {
-    if (!z || (z.von === s.runde.from && z.bis === s.runde.to)) return;
+  // Neuer Zeitraum für die offene Runde. Ist schon etwas abgehakt und liegt der neue Zeitraum ganz woanders,
+  // erst fragen: bisherigen Einkauf abschließen (neue Liste) oder nur den Zeitraum ändern.
+  async function setzeZeitraum(z, { vergangen = false } = {}) {
+    const runde = s.runde;
+    if (!z || (z.von === runde.from && z.bis === runde.to)) return;
+    if (erstFragen(s.liste, z, runde)) {
+      const alt = formatZeitraum(runde.from, runde.to);
+      const w = await dialog({
+        titel: vergangen ? 'Alten Einkauf abschließen?' : 'Bisherigen Einkauf abschließen?',
+        inhalt: [
+          el('p', null, vergangen ? `Der Einkauf für ${alt} ist noch offen und schon teilweise abgehakt.`
+            : `Für ${alt} ist schon etwas abgehakt.`,
+          ` Schließt du ihn ab, beginnt für ${formatZeitraum(z.von, z.bis)} eine neue Liste.`),
+          el('p', { class: 'nebentext' }, 'Ohne Abschließen bleiben die Haken bei den Gerichten, für die du eingekauft hast.'),
+        ],
+        knoepfe: [{ text: 'Nur Zeitraum ändern', wert: 'verschieben', art: 'flach' },
+          { text: 'Abschließen', wert: 'abschliessen', art: 'primaer' }],
+      });
+      // inzwischen woanders hin oder die Runde gewechselt (anderes Gerät, Abschluss)
+      if (!w || beendet || s.runde.id !== runde.id) return;
+      if (w === 'abschliessen') {
+        const zurueck = await sicher(() => rundeSchliessen(s.runde, s.liste.eintraege, z));
+        if (zurueck) meldeMitZurueck(`Einkauf ${alt} abgeschlossen.`, zurueck);
+        return;
+      }
+    }
     await sicher(() => db.speichere('trips', { ...s.runde, from: z.von, to: z.bis }));
   }
 
@@ -422,34 +466,54 @@ export async function zeige(container, route) {
         + 'von der Liste, offene eigene Einträge bleiben.'
       : 'Die geplanten Gerichte werden als eingekauft markiert, abgehakte eigene Einträge werden entfernt.';
     if (!(await bestaetige(text, { titel: 'Einkauf abschließen?', ja: 'Abschließen' }))) return;
-    const eintragIds = new Set(liste.eintraege.map((e) => e.id));
+    const zurueck = await sicher(() => rundeSchliessen(runde, liste.eintraege));
+    if (zurueck) meldeMitZurueck('Einkauf abgeschlossen.', zurueck);
+  }
+
+  /**
+   * Schließt die Runde: Gerichte bekommen tripId und die eingekauften Portionen (werden es später mehr, kommt
+   * die Differenz auf die nächste Liste), abgehakte eigene Einträge und alte Abhak-Stände fallen weg.
+   * `neu` ({ von, bis }): zugleich die nächste Runde anlegen. Liefert die Funktion zum Zurücknehmen.
+   */
+  async function rundeSchliessen(runde, eintraege, neu = null) {
+    const vorher = new Map(eintraege.map((e) => [e.id, { tripId: e.tripId ?? null, eingekauftPortionen: e.eingekauftPortionen ?? null }]));
     const erledigte = [...s.manuelle.values()].filter((m) => m.checked);
     // Abhak-Zustände längst abgeschlossener Runden braucht niemand mehr
     const alteZustaende = [...s.zustaende.values()].filter((z) => !s.offeneRunden.has(z.tripId));
+    const naechste = neu ? { id: db.neueId(), from: neu.von, to: neu.bis, closedAt: null } : null;
+    // Haken für Gerichte, die hier nicht abgeschlossen werden (anderer Zeitraum), wandern in die neue Runde
+    const mit = naechste ? [...s.zustaende.values()].filter((z) => z.tripId === runde.id && z.erledigt
+      && Array.isArray(z.eintraege) && z.eintraege.some((id) => !vorher.has(id)))
+      .map((z) => ({ ...z, id: `${naechste.id}|${z.mergeKey}`, tripId: naechste.id })) : [];
     ruheBis = Date.now() + 300;
-    const ok = await sicher(async () => {
-      // erst Gerichte und Einträge, zuletzt die Runde – so springt die Liste nicht zwischendurch
-      await db.speichereViele('planEntries', s.plan.filter((e) => eintragIds.has(e.id)).map((e) => ({ ...e, tripId: runde.id })));
-      await db.speichereViele('shoppingItems', [...erledigte, ...alteZustaende].map((m) => ({ ...m, deleted: true })));
-      await db.speichere('trips', { ...runde, closedAt: Date.now() });
-      return true;
-    });
-    if (ok) meldeMitZurueck('Einkauf abgeschlossen.', () => abschlussZuruecknehmen(runde, eintragIds, erledigte));
+    // erst Gerichte und Einträge, zuletzt die Runde – so springt die Liste nicht zwischendurch
+    await db.speichereViele('planEntries', eintraege.map((e) => ({
+      ...e, tripId: runde.id, eingekauftPortionen: geplantePortionen(e, s.rezepte.get(e.recipeId)),
+    })));
+    await db.speichereViele('shoppingItems', [...mit, ...[...erledigte, ...alteZustaende].map((m) => ({ ...m, deleted: true }))]);
+    // alte schließen und neue anlegen in einem Schritt: nie zwei oder keine offene Runde
+    await db.speichereViele('trips', [{ ...runde, closedAt: Date.now() }, ...(naechste ? [naechste] : [])]);
+    return () => abschlussZuruecknehmen(runde, vorher, erledigte);
   }
 
-  async function abschlussZuruecknehmen(runde, eintragIds, erledigte) {
+  async function abschlussZuruecknehmen(runde, vorher, erledigte) {
     ruheBis = Date.now() + 300;
     // zuerst wieder öffnen, damit beim Zeichnen keine weitere Runde angelegt wird
     await db.speichere('trips', { ...runde, closedAt: null });
     const [trips, plan] = await Promise.all([db.alle('trips'), db.alle('planEntries')]);
-    await db.speichereViele('planEntries', plan.filter((e) => eintragIds.has(e.id) && e.tripId === runde.id)
-      .map((e) => ({ ...e, tripId: null })));
+    await db.speichereViele('planEntries', plan.filter((e) => vorher.has(e.id) && e.tripId === runde.id)
+      .map((e) => ({ ...e, ...vorher.get(e.id) })));
     for (const m of erledigte) await db.wiederherstellen('shoppingItems', m.id);
     for (const t of trips) if (t.closedAt == null && t.id !== runde.id) await db.loesche('trips', t.id);
   }
 
   // ------------------------------------------------------------ Start
   await zeichne();
+  if (nachfrage && !beendet && s.runde) {
+    const { ziel, vergangen } = nachfrage;
+    nachfrage = null;
+    sicher(() => setzeZeitraum(ziel, { vergangen }));
+  }
   const abmelden = db.beobachte(({ store } = {}) => {
     if (BEOBACHTETE.has(store)) plane(100);
   });

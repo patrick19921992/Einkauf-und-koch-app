@@ -11,6 +11,7 @@ const RAND_PX = 32;                 // Wischen am Rand gehört der System-Zurüc
 const WISCH_PX = 60;
 const ALTE_TIMER_MS = 3 * 3600000;  // so lange abgelaufene Timer werden beim Öffnen verworfen
 const TIMER_HINWEIS = 'Timer klingeln nur, solange die App offen und der Bildschirm an ist.';
+const TITEL_KURZ = 14;              // Rezeptname in der Timer-Pille eines anderen Rezepts
 const VIBRATION = [400, 200, 400, 200, 400];
 // Abkürzung samt Punkt ersetzen; war der Punkt zugleich Satzende, bleibt er (Pause beim Vorlesen)
 const abk = (wort) => (treffer, ...rest) => {
@@ -165,8 +166,10 @@ export async function zeige(container, route) {
   }
 
   setzeTitel(`Kochen: ${rezept.title || 'Rezept'}`);
+  // Rezept ohne Portionsangabe zählt als 1 Portion (wie Rezeptseite und Einkaufsliste)
+  const basis = Number(rezept.servings) > 0 ? Number(rezept.servings) : 1;
   const p = Number.parseInt(route.query.get('p'), 10);
-  const portionen = p > 0 && p < 100 ? p : (rezept.servings || einstellungen.standardPortionen || 4);
+  const portionen = p > 0 && p < 100 ? p : Math.min(99, Math.max(1, Math.round(basis)));
   const portionenText = `${portionen} ${portionen === 1 ? 'Portion' : 'Portionen'}`;
   const schritte = (rezept.steps || []).filter((s) => String(s?.text ?? '').trim());
   const sprache = globalThis.speechSynthesis || null;
@@ -180,7 +183,8 @@ export async function zeige(container, route) {
   let index = Math.min(leseSchritt(id), Math.max(0, schritte.length - 1));
   let aktiv = true;
   let vorleseNr = 0;
-  let timer = [];                    // Timer dieses Rezepts aus dem Speicher 'timers'
+  let timer = [];                    // alle Timer aus dem Speicher 'timers' (auch anderer Rezepte)
+  const fremdTitel = new Map();      // recipeId → Titel, für Timer anderer Rezepte
   const timerKnoten = new Map();     // id → { pille, rest }
   const quittiert = new Set();       // ids, deren Alarm schon ausgeschaltet wurde
   const abgehakt = new Set();        // bereitgestellte Zutaten (solange die Seite offen ist)
@@ -215,7 +219,7 @@ export async function zeige(container, route) {
   function zutatenListe() {
     const zutaten = (rezept.ingredients || []).filter(Boolean);
     if (!zutaten.length) return [el('p', { class: 'nebentext' }, 'Keine Zutaten eingetragen.')];
-    const faktor = rezept.servings ? portionen / rezept.servings : 1;
+    const faktor = portionen / basis;
     const knoten = [];
     let aktGruppe = null;
     let liste = null;
@@ -329,7 +333,7 @@ export async function zeige(container, route) {
   async function verlassen() {
     if (phase !== 'start') {
       const ok = await bestaetige(timer.some((t) => !quittiert.has(t.id))
-        ? 'Laufende Timer klingeln erst wieder, wenn du den Kochmodus erneut öffnest.'
+        ? 'Laufende Timer klingeln erst wieder, wenn du einen Kochmodus öffnest – egal für welches Rezept.'
         : 'Dein Schritt bleibt gemerkt, du kannst später weitermachen.',
       { titel: 'Kochmodus verlassen?', ja: 'Verlassen', nein: 'Weiterkochen' });
       if (!ok) return;
@@ -349,12 +353,20 @@ export async function zeige(container, route) {
   }
 
   // ---------------------------------------------------------------- Timer
+  // Timer eines anderen Rezepts tragen dessen Namen; in der Pille kurz: 'Schweinebrate… · 20 Min.'
+  function timerName(t, kurz = false) {
+    if (t.recipeId === id) return t.label;
+    const titel = fremdTitel.get(t.recipeId) || 'Anderes Rezept';
+    if (!kurz) return `${titel} · ${t.label}`;
+    const name = titel.length > TITEL_KURZ ? `${titel.slice(0, TITEL_KURZ - 1).trimEnd()}…` : titel;
+    return `${name} · ${String(t.label).replace(/^Schritt \d+ · /, '')}`;
+  }
   function zeichneTimer() {
     timerKnoten.clear();
     fuelle(timerLeiste, timer.filter((t) => !quittiert.has(t.id)).map((t) => {
       const rest = el('span', { class: 'fett' });
-      const pille = el('div', { class: 'timer', role: 'timer' }, el('span', null, t.label), rest,
-        el('button', { type: 'button', class: 'icon-knopf', 'aria-label': `Timer ${t.label} stoppen`, onclick: () => stoppeTimer(t) },
+      const pille = el('div', { class: 'timer', role: 'timer' }, el('span', null, timerName(t, true)), rest,
+        el('button', { type: 'button', class: 'icon-knopf', 'aria-label': `Timer ${timerName(t)} stoppen`, onclick: () => stoppeTimer(t) },
           symbol(SYMBOLE.schliessen)));
       timerKnoten.set(t.id, { pille, rest });
       return pille;
@@ -374,7 +386,7 @@ export async function zeige(container, route) {
     }
     const klingeln = timer.filter((t) => !quittiert.has(t.id) && t.endsAt <= jetzt);
     if (klingeln.length) {
-      alarmText.textContent = klingeln.map((t) => t.label).join(' · ');
+      alarmText.textContent = klingeln.map((t) => timerName(t)).join(' + ');
       if (!alarmOffen()) { alarm.classList.remove('versteckt'); stoppeVorlesen(); ausKnopf.focus(); }
       ton.an();
     } else if (alarmOffen() || ton.laeuft()) {
@@ -383,11 +395,17 @@ export async function zeige(container, route) {
     }
   }
 
+  // Alle Timer laden: auch die eines anderen Rezepts klingeln hier (z. B. Braten, während die Beilage dran ist)
   async function ladeTimer(erstesMal = false) {
-    let liste = (await db.alle('timers')).filter((t) => t.recipeId === id && Number.isFinite(t.endsAt));
+    let liste = (await db.alle('timers')).filter((t) => Number.isFinite(t.endsAt));
     const alt = erstesMal ? liste.filter((t) => t.endsAt < Date.now() - ALTE_TIMER_MS) : []; // uralte still verwerfen
     alt.forEach((t) => db.entferne('timers', t.id).catch(() => {}));
     liste = liste.filter((t) => !alt.includes(t));
+    const fehlen = [...new Set(liste.map((t) => t.recipeId))].filter((r) => r !== id && !fremdTitel.has(r));
+    await Promise.all(fehlen.map(async (r) => { // auch gelöschte Rezepte: ihr Timer läuft trotzdem
+      const fremd = await db.hole('recipes', r, { mitGeloeschten: true }).catch(() => null);
+      fremdTitel.set(r, String(fremd?.title ?? '').trim());
+    }));
     if (!aktiv) return;
     timer = liste.sort((a, b) => a.endsAt - b.endsAt);
     zeichneTimer();
@@ -395,7 +413,7 @@ export async function zeige(container, route) {
   async function starteTimer(label, sekunden) {
     ton.freischalten(); // Tippen auf den Timer schaltet den Ton frei
     const name = `Schritt ${index + 1} · ${label}`;
-    if (timer.some((t) => t.label === name && !quittiert.has(t.id) && t.endsAt > Date.now())) return void toast('Dieser Timer läuft schon.');
+    if (timer.some((t) => t.recipeId === id && t.label === name && !quittiert.has(t.id) && t.endsAt > Date.now())) return void toast('Dieser Timer läuft schon.');
     const neu = await db.speichere('timers', { recipeId: id, schritt: index, label: name, endsAt: Date.now() + sekunden * 1000 })
       .catch((e) => void toast(`Timer konnte nicht gestartet werden: ${e.message || e}`));
     if (!neu || !aktiv) return;

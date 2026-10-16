@@ -138,6 +138,13 @@ test('zutatenAlsText ist die Umkehrung von parseZeilen', () => {
   // ohne raw wird formatZutat benutzt
   assert.equal(zutatenAlsText([{ group: 'Deko', qty: 2, unit: 'EL', name: 'Puderzucker' }]), 'Deko:\n2 EL Puderzucker');
   assert.equal(zutatenAlsText([]), '');
+  // nach einer Gruppe wieder ohne Gruppe (z. B. aus einer Sicherung): 'Zutaten:' beendet die Gruppe
+  const gemischt = [
+    { group: 'Teig', raw: '200 g Mehl' }, { group: null, raw: '1 Prise Salz' }, { group: 'Deko', raw: 'Puderzucker' },
+  ];
+  const text2 = zutatenAlsText(gemischt);
+  assert.equal(text2, 'Teig:\n200 g Mehl\n\nZutaten:\n1 Prise Salz\n\nDeko:\nPuderzucker');
+  assert.deepEqual(parseZeilen(text2).map((x) => [x.group, x.raw]), gemischt.map((x) => [x.group, x.raw]));
 });
 
 test('zutatSchluessel: Einzahl, Adjektive, Marken und Ausnahmen', () => {
@@ -293,7 +300,10 @@ test('formatZahl: ganze Zahlen, Brüche und Dezimalkomma', () => {
   assert.equal(formatZahl(1.5, 'kg'), '1,5');
   assert.equal(formatZahl(0.5, 'l'), '0,5');
   assert.equal(formatZahl(12.5), '12,5');
-  assert.equal(formatZahl(1.234, 'g'), '1,23');
+  assert.equal(formatZahl(1.234, 'g'), '1,2');
+  assert.equal(formatZahl(100 / 3, 'g'), '33');
+  assert.equal(formatZahl(200 / 3, 'ml'), '67');
+  assert.equal(formatZahl(1.25, 'kg'), '1,25');
   assert.equal(formatZahl(0.1), '0,1');
   assert.equal(formatZahl(null), '');
   assert.equal(formatZahl(NaN), '');

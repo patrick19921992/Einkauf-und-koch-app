@@ -30,6 +30,9 @@ function portionenZahl(wert, ersatz) {
 
 // Portionen eines Eintrags; fehlt die Angabe, gilt die des Rezepts
 const portionenVon = (eintrag, rezept) => portionenZahl(eintrag.servings, portionenZahl(rezept?.servings, 1));
+const portionenText = (n) => `${n} ${n === 1 ? 'Portion' : 'Portionen'}`;
+// Schon eingekaufte Portionen (beim Abschließen gemerkt); null bei älteren Einträgen
+const eingekauftFuer = (eintrag) => (eintrag.tripId && Number(eintrag.eingekauftPortionen) > 0 ? Number(eintrag.eingekauftPortionen) : null);
 
 /** Stepper − / Zahl / +. `aendern(n)` wird bei jedem Klick aufgerufen. */
 function portionenStepper(wert, aendern, { fokus = null, name = 'Portionen' } = {}) {
@@ -70,10 +73,11 @@ export async function zeige(container, route) {
 
   async function speichereEintrag(eintrag) {
     try {
-      await db.speichere('planEntries', eintrag);
+      return await db.speichere('planEntries', eintrag);
     } catch (e) {
       console.error(e);
       toast('Speichern hat nicht geklappt.');
+      return null;
     }
   }
 
@@ -82,6 +86,7 @@ export async function zeige(container, route) {
     const liste = (await db.alle('recipes')).sort((a, b) =>
       (b.favorite === true) - (a.favorite === true) || SORTIERUNG.compare(a.title || '', b.title || ''));
     let portionen = portionenZahl(einst.standardPortionen, 4);
+    let beruehrt = false; // Stepper benutzt?
     let gewaehlt;
     let uebernehmen = null;
     const waehle = (wert) => {
@@ -89,8 +94,10 @@ export async function zeige(container, route) {
       uebernehmen?.click();
     };
     const eintraege = liste.map((r) => {
-      const meta = [r.favorite ? '★ Favorit' : '', r.totalMin ? `${r.totalMin} Min.` : '', ...(r.tags || []).slice(0, 3)]
-        .filter(Boolean).join(' · ');
+      // eigene Portionen des Rezepts zeigen (Kuchen für 12 ≠ 4 Portionen Gulasch)
+      const basis = portionenZahl(r.servings, null);
+      const meta = [r.favorite ? '★ Favorit' : '', basis ? `für ${portionenText(basis)}` : '',
+        r.totalMin ? `${r.totalMin} Min.` : '', ...(r.tags || []).slice(0, 3)].filter(Boolean).join(' · ');
       return {
         text: suchText([r.title, ...(r.tags || [])].join(' ')),
         li: el('li', null, el('button', { type: 'button', class: 'listen-eintrag', onclick: () => waehle({ rezept: r }) },
@@ -125,7 +132,10 @@ export async function zeige(container, route) {
       fokus: false,
       titel: `${wochentagLang(datum)}, ${formatDatum(datum)} · ${SLOT_NAMEN[slot]}`,
       inhalt: [
-        el('div', { class: 'feld-zeile' }, el('span', null, 'Portionen'), portionenStepper(portionen, (n) => { portionen = n; })),
+        el('div', { class: 'feld-zeile' }, el('span', null, 'Portionen'), portionenStepper(portionen, (n) => {
+          portionen = n;
+          beruehrt = true;
+        })),
         liste.length
           ? el('label', { class: 'suche' }, symbol(SYMBOLE.suche), suche)
           : el('p', { class: 'hinweis' }, 'Noch keine Rezepte gespeichert. Du kannst trotzdem eine Notiz planen, z. B. „Reste“.'),
@@ -134,7 +144,7 @@ export async function zeige(container, route) {
       ],
       knoepfe: [
         { text: 'Abbrechen', wert: null, art: 'flach' },
-        { text: 'Ohne Rezept (Notiz)', wert: () => ({ notiz: true }), art: 'flach' },
+        { text: 'Ohne Rezept', wert: () => ({ notiz: true }), art: 'flach' },
         { text: 'Übernehmen', wert: () => gewaehlt, art: 'primaer' },
       ],
     });
@@ -144,8 +154,11 @@ export async function zeige(container, route) {
     const w = await ergebnis;
     if (!w) return;
     let neu = { date: datum, slot, servings: portionen, note: '', cooked: false, tripId: null };
+    const ohnePortionen = !!w.rezept && !portionenZahl(w.rezept.servings, null);
     if (w.rezept) {
       neu = { ...neu, recipeId: w.rezept.id, title: w.rezept.title || '' };
+      // Rezept ohne Portionsangabe gilt als 1 Portion (= einmal das ganze Rezept), sonst würde es vervielfacht
+      if (ohnePortionen && !beruehrt) neu.servings = 1;
     } else {
       const text = await eingabe('Notiz planen', {
         platzhalter: 'z. B. Reste, Essen gehen', beschriftung: `${wochentagLang(datum)} · ${SLOT_NAMEN[slot]}`, pflicht: true, ok: 'Planen',
@@ -153,7 +166,22 @@ export async function zeige(container, route) {
       if (!text) return;
       neu = { ...neu, recipeId: null, title: text };
     }
-    await speichereEintrag(neu);
+    const gespeichert = await speichereEintrag(neu);
+    // Standard-Portionen passen kaum zum Rezept (Kuchen für 12, „1 Blech“): Hinweis mit Umstellen
+    const basis = w.rezept ? portionenZahl(w.rezept.servings, null) : null;
+    if (gespeichert && ohnePortionen && !beruehrt) {
+      toast('Rezept ohne Portionsangabe: einmal das ganze Rezept eingeplant.');
+    } else if (gespeichert && basis && !beruehrt && (portionen / basis < 0.5 || portionen / basis > 2)) {
+      toast(`Geplant für ${portionenText(portionen)} (Rezept: ${basis}).`, {
+        aktion: {
+          text: `Auf ${basis} ändern`,
+          onclick: async () => {
+            const aktuell = await db.hole('planEntries', gespeichert.id);
+            if (aktuell) await speichereEintrag({ ...aktuell, servings: basis });
+          },
+        },
+      });
+    }
   }
 
   // ------------------------------------------------------------ Menü eines Eintrags
@@ -217,6 +245,7 @@ export async function zeige(container, route) {
     const rezept = eintrag.recipeId ? rezepte.get(eintrag.recipeId) : null;
     const titel = rezept?.title || eintrag.title || (eintrag.recipeId ? 'Gelöschtes Rezept' : 'Ohne Titel');
     const fokus = `e:${eintrag.id}`;
+    const gekauft = eingekauftFuer(eintrag);
     return el('div', { class: ['plan-eintrag', eintrag.cooked && 'gekocht', eintrag.tripId && 'eingekauft'] },
       rezept
         ? el('a', { href: `#/rezept/${encodeURIComponent(rezept.id)}` }, titel)
@@ -225,8 +254,14 @@ export async function zeige(container, route) {
       eintrag.recipeId && !rezept ? el('span', { class: 'badge grau' }, 'Rezept gelöscht') : null,
       eintrag.recipeId
         ? portionenStepper(portionenVon(eintrag, rezept), (n) => {
+          const vorher = portionenVon(eintrag, rezept);
           eintrag.servings = n;
           speichereEintrag(eintrag);
+          // schon eingekauft: mehr Portionen → die Differenz kommt auf die Einkaufsliste
+          if (gekauft && n > gekauft && vorher <= gekauft) {
+            toast(`Eingekauft für ${portionenText(gekauft)} – der Rest kommt auf die Einkaufsliste.`,
+              { aktion: { text: 'Zur Liste', onclick: () => navigiere('#/einkauf') } });
+          }
         }, { fokus })
         : null,
       eintrag.recipeId ? el('span', { class: 'nebentext' }, 'Portionen') : null,
@@ -234,6 +269,7 @@ export async function zeige(container, route) {
         el('input', {
           type: 'checkbox',
           checked: eintrag.cooked === true,
+          'aria-label': `${eintrag.title || 'Eintrag'} gekocht`,
           dataset: { fokus: `${fokus}:gekocht` },
           onchange: (ev) => {
             eintrag.cooked = ev.target.checked;
@@ -242,7 +278,8 @@ export async function zeige(container, route) {
           },
         }),
         el('span', null, 'gekocht')),
-      eintrag.tripId ? el('span', { class: 'badge gruen' }, 'eingekauft') : null,
+      eintrag.tripId ? el('span', { class: 'badge gruen' },
+        gekauft && portionenVon(eintrag, rezept) > gekauft ? `eingekauft für ${gekauft}` : 'eingekauft') : null,
       el('button', {
         type: 'button',
         class: 'icon-knopf',

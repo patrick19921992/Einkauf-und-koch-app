@@ -5,7 +5,7 @@
 // Gelöscht wird nur durch Markieren. So funktionieren Sicherungs-Import und eine
 // spätere Familien-Synchronisierung nach derselben Regel: pro id gewinnt das neuere updatedAt.
 
-import { alsSchluessel } from './datum.js';
+import { alsSchluessel, istSchluessel } from './datum.js';
 
 const DB_NAME = 'einkauf-und-koch-app';
 const DB_VERSION = 1;
@@ -369,19 +369,71 @@ async function schreibeEinstellungen(teil) {
   const [haushalt, geraet] = await Promise.all([hole('settings', 'haushalt'), hole('settings', 'geraet')]);
   const h = { ...(haushalt || {}), id: 'haushalt' };
   const g = { ...(geraet || {}), id: 'geraet' };
+  // Zeitstempel pro Haushalts-Einstellung: beim Einlesen gewinnt so jede Einstellung für sich
+  const zeiten = einstellungsZeiten(haushalt);
+  const jetzt = Date.now();
   let hGeaendert = false;
   let gGeaendert = false;
   for (const [k, v] of Object.entries(teil || {})) {
     if (HAUSHALT_SCHLUESSEL.includes(k)) {
       h[k] = v;
+      zeiten[k] = jetzt;
       hGeaendert = true;
     } else if (GERAET_SCHLUESSEL.includes(k) && k !== 'geraetId') {
       g[k] = v;
       gGeaendert = true;
     }
   }
-  if (hGeaendert) await speichere('settings', h);
+  if (hGeaendert) await speichere('settings', { ...h, geaendert: zeiten });
   if (gGeaendert) await speichere('settings', g);
+}
+
+/**
+ * Änderungszeit je Haushalts-Einstellung { vorrat: ms, … }. Ältere Datensätze ohne `geaendert`:
+ * jede gespeicherte Einstellung zählt mit dem updatedAt des Datensatzes.
+ */
+function einstellungsZeiten(h) {
+  const zeiten = {};
+  if (!istObjekt(h)) return zeiten;
+  const g = istObjekt(h.geaendert) ? h.geaendert : null;
+  for (const k of HAUSHALT_SCHLUESSEL) {
+    const t = g ? g[k] : h[k] !== undefined ? h.updatedAt : undefined;
+    if (Number.isFinite(t) && t >= 0) zeiten[k] = t;
+  }
+  return zeiten;
+}
+
+const gleicherWert = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/**
+ * Führt Haushalts-Einstellungen aus einer Sicherung Einstellung für Einstellung zusammen:
+ * pro Einstellung gewinnt der neuere Stand, ungültige Werte zählen nicht. Rein.
+ * Ergebnis: { datensatz (neuer Haushalts-Datensatz oder null = nichts zu tun), uebernommen: [Schlüssel] }
+ */
+export function fuehreEinstellungenZusammen(vorhanden, eingehend, grenze = Date.now()) {
+  const ergebnis = { datensatz: null, uebernommen: [] };
+  if (!istObjekt(eingehend)) return ergebnis;
+  const lokal = istObjekt(vorhanden) ? vorhanden : null;
+  const zeitenLokal = einstellungsZeiten(lokal);
+  const zeitenNeu = einstellungsZeiten(eingehend);
+  const h = { ...(lokal || {}), id: 'haushalt' };
+  const zeiten = { ...zeitenLokal };
+  let neuer = false;
+  for (const k of HAUSHALT_SCHLUESSEL) {
+    const wert = gueltig(k, eingehend[k]);
+    const zeit = Math.min(zeitenNeu[k] ?? 0, grenze);
+    if (wert === undefined || !(zeit > (zeitenLokal[k] ?? 0))) continue;
+    neuer = true;
+    zeiten[k] = zeit;
+    if (!gleicherWert(wert, gueltig(k, h[k]) ?? STANDARD_EINSTELLUNGEN[k])) ergebnis.uebernommen.push(k);
+    h[k] = wert;
+  }
+  if (!neuer) return ergebnis;
+  h.geaendert = zeiten;
+  h.createdAt = lokal?.createdAt || zeitstempel(eingehend.createdAt, grenze) || grenze;
+  h.updatedAt = Math.max(zeitstempel(lokal?.updatedAt, Infinity), ...Object.values(zeiten));
+  ergebnis.datensatz = h;
+  return ergebnis;
 }
 
 // ---------------------------------------------------------------- Sicherung
@@ -405,21 +457,159 @@ export async function exportiere() {
   };
 }
 
+// ---------------------------------------------------------------- Sicherung prüfen (rein)
+
+const VERBOTEN = new Set(['__proto__', 'constructor', 'prototype']);
+const BASIS_FELDER = new Set(['id', 'createdAt', 'updatedAt', 'deleted']);
+
+function istObjekt(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+const istId = (v) => typeof v === 'string' && v.length > 0 && v.length <= 1000 && !VERBOTEN.has(v);
+const istTag = (v) => typeof v === 'string' && istSchluessel(v);
+const liste = (v) => (Array.isArray(v) ? v : []);
+
+function alsText(v, ersatz = '') {
+  if (typeof v === 'string') return v;
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : ersatz;
+}
+
+function textOderNull(v) {
+  const t = alsText(v, null);
+  return t && t.trim() ? t : null;
+}
+
+function zahlOderNull(v) {
+  const n = typeof v === 'string' && v.trim() ? Number(v.trim().replace(',', '.')) : v;
+  return typeof n === 'number' && Number.isFinite(n) ? n : null;
+}
+
+function positivOderNull(v) {
+  const n = zahlOderNull(v);
+  return n > 0 ? n : null;
+}
+
+/** Zeitstempel ≥ 0, höchstens `grenze` (ungültig → 0). */
+function zeitstempel(v, grenze) {
+  const n = zahlOderNull(v);
+  return n > 0 ? Math.min(n, grenze) : 0;
+}
+
+// Unbekannte Felder (z. B. aus einer neueren Version) bleiben nur als einfache Werte erhalten
+function zusatzFelder(d, bekannt) {
+  const z = {};
+  for (const [k, v] of Object.entries(d)) {
+    if (k in bekannt || BASIS_FELDER.has(k) || VERBOTEN.has(k)) continue;
+    if (v === null || typeof v === 'boolean' || typeof v === 'string' || Number.isFinite(v)) z[k] = v;
+  }
+  return z;
+}
+
+function bereinigeZutat(z) {
+  if (!istObjekt(z)) return null;
+  const name = alsText(z.name).trim() ? alsText(z.name) : alsText(z.raw);
+  if (!name.trim()) return null;
+  const felder = {
+    id: istId(z.id) ? z.id : neueId(), group: textOderNull(z.group), raw: alsText(z.raw).trim() ? alsText(z.raw) : name,
+    qty: zahlOderNull(z.qty), qty2: zahlOderNull(z.qty2), unit: textOderNull(z.unit), size: textOderNull(z.size),
+    name, note: textOderNull(z.note), vague: z.vague === true,
+  };
+  return { ...zusatzFelder(z, felder), ...felder };
+}
+
+function bereinigeSchritt(s) {
+  const o = typeof s === 'string' ? { text: s } : s;
+  if (!istObjekt(o) || !alsText(o.text).trim()) return null;
+  const felder = { id: istId(o.id) ? o.id : neueId(), group: textOderNull(o.group), text: alsText(o.text) };
+  return { ...zusatzFelder(o, felder), ...felder };
+}
+
+// Abgehakte Mengen { Einheit: Zahl }
+function mengenOderNull(v) {
+  if (!istObjekt(v)) return null;
+  const m = {};
+  for (const [k, n] of Object.entries(v)) if (!VERBOTEN.has(k) && Number.isFinite(n)) m[k] = n;
+  return m;
+}
+
+function tagListe(v) {
+  const roh = typeof v === 'string' ? v.split(',') : liste(v);
+  return [...new Set(roh.map((t) => alsText(t).trim()).filter(Boolean))];
+}
+
+// Pro Speicher: gültige Felder oder null (Datensatz nicht zu retten)
+const BEREINIGUNG = {
+  recipes: (d) => ({
+    title: alsText(d.title).trim() ? alsText(d.title) : 'Ohne Titel',
+    sourceUrl: alsText(d.sourceUrl), sourceSite: alsText(d.sourceSite), imageUrl: alsText(d.imageUrl), notes: alsText(d.notes),
+    servings: positivOderNull(d.servings), prepMin: positivOderNull(d.prepMin), cookMin: positivOderNull(d.cookMin),
+    totalMin: positivOderNull(d.totalMin), tags: tagListe(d.tags), favorite: d.favorite === true,
+    ingredients: liste(d.ingredients).map(bereinigeZutat).filter(Boolean),
+    steps: (typeof d.steps === 'string' ? d.steps.split(/\r?\n/) : liste(d.steps)).map(bereinigeSchritt).filter(Boolean),
+  }),
+  planEntries: (d) => (istTag(d.date) ? {
+    date: d.date, slot: MAHLZEITEN.includes(d.slot) ? d.slot : 'abend', recipeId: istId(d.recipeId) ? d.recipeId : null,
+    title: alsText(d.title), servings: positivOderNull(d.servings), note: alsText(d.note), cooked: d.cooked === true,
+    tripId: istId(d.tripId) ? d.tripId : null,
+  } : null),
+  trips: (d) => {
+    if (!istTag(d.from) || !istTag(d.to)) return null;
+    const [from, to] = d.from <= d.to ? [d.from, d.to] : [d.to, d.from];
+    return { from, to, closedAt: zahlOderNull(d.closedAt) };
+  },
+  shoppingItems: (d) => {
+    if (d.kind === 'state') {
+      return istId(d.tripId) && istId(d.mergeKey) ? {
+        kind: 'state', tripId: d.tripId, mergeKey: d.mergeKey, abgehakt: mengenOderNull(d.abgehakt),
+        erledigt: d.erledigt === true, versteckt: d.versteckt === true,
+      } : null;
+    }
+    if (d.kind !== 'manual' || !alsText(d.name).trim()) return null;
+    return {
+      kind: 'manual', name: alsText(d.name), qty: zahlOderNull(d.qty), qty2: zahlOderNull(d.qty2), unit: textOderNull(d.unit),
+      note: textOderNull(d.note), section: textOderNull(d.section), checked: d.checked === true,
+    };
+  },
+  aliases: (d) => ({ kanonisch: textOderNull(d.kanonisch), section: textOderNull(d.section) }),
+};
+
 /**
- * Entscheidet für einen eingehenden Datensatz, ob er übernommen wird.
- * Reine Funktion: 'neu' | 'aktualisiert' | 'uebersprungen'.
+ * Prüft und repariert einen Datensatz aus einer Sicherung, bevor er gespeichert wird. Rein.
+ * Falsche Feld-Typen werden ersetzt (z. B. tags 'Pasta' → ['Pasta'], kaputte Zutaten fallen weg),
+ * Zeitstempel nach `grenze` werden auf `grenze` gekürzt. Nicht zu retten (z. B. Runde ohne Datum) → null.
  */
-export function importEntscheidung(vorhanden, eingehend) {
-  if (!vorhanden) return 'neu';
-  return (eingehend.updatedAt || 0) > (vorhanden.updatedAt || 0) ? 'aktualisiert' : 'uebersprungen';
+export function bereinigeDatensatz(store, d, grenze = Date.now()) {
+  const regel = Object.hasOwn(BEREINIGUNG, store) ? BEREINIGUNG[store] : null;
+  if (!regel || !istObjekt(d) || !istId(d.id)) return null;
+  const felder = regel(d);
+  if (!felder) return null;
+  const updatedAt = zeitstempel(d.updatedAt, grenze);
+  return {
+    id: d.id, ...zusatzFelder(d, felder), ...felder,
+    createdAt: zeitstempel(d.createdAt, grenze) || updatedAt, updatedAt, deleted: d.deleted === true,
+  };
 }
 
 /**
- * Liest eine Sicherung ein. Pro id gewinnt das neuere updatedAt.
- * `sicherung` darf ein Objekt oder JSON-Text sein.
- * Ergebnis: { neu, aktualisiert, uebersprungen }
+ * Entscheidet für einen eingehenden Datensatz, was das Einlesen bewirkt. Rein. Pro id gewinnt das neuere updatedAt:
+ * 'neu' (auch: lokal gelöschter Eintrag kommt zurück) | 'aktualisiert' | 'geloescht' (neuere Lösch-Markierung
+ * entfernt einen vorhandenen Eintrag) | 'markierung' (nur eine Lösch-Markierung, sichtbar ändert sich nichts)
+ * | 'uebersprungen' (lokal gleich alt oder neuer).
  */
-export async function importiere(sicherung) {
+export function importEntscheidung(vorhanden, eingehend) {
+  const loeschung = eingehend.deleted === true;
+  if (!vorhanden) return loeschung ? 'markierung' : 'neu';
+  if ((eingehend.updatedAt || 0) <= (vorhanden.updatedAt || 0)) return 'uebersprungen';
+  if (vorhanden.deleted) return loeschung ? 'markierung' : 'neu';
+  return loeschung ? 'geloescht' : 'aktualisiert';
+}
+
+// ---------------------------------------------------------------- Sicherung einlesen
+
+const ZAEHLER_NAME = { neu: 'neu', aktualisiert: 'aktualisiert', geloescht: 'geloescht', markierung: 'markierungen', uebersprungen: 'uebersprungen' };
+const neueZaehler = () => ({ neu: 0, aktualisiert: 0, geloescht: 0, uebersprungen: 0, markierungen: 0, ungueltig: 0 });
+
+function leseSicherung(sicherung) {
   let s = sicherung;
   if (typeof s === 'string') {
     try {
@@ -428,51 +618,102 @@ export async function importiere(sicherung) {
       throw new Error('Die Datei ist keine gültige Sicherung (kein JSON).');
     }
   }
-  if (!s || s.app !== APP_KENNUNG || !s.daten) {
+  if (!istObjekt(s) || s.app !== APP_KENNUNG || !istObjekt(s.daten)) {
     throw new Error('Die Datei ist keine Sicherung dieser App.');
   }
   if ((s.schemaVersion || 0) > SCHEMA_VERSION) {
     throw new Error('Die Sicherung stammt aus einer neueren App-Version. Bitte zuerst die App aktualisieren.');
   }
-  const zaehler = { neu: 0, aktualisiert: 0, uebersprungen: 0 };
+  return s;
+}
+
+// Berechnet (nur lesend), was das Einlesen ändern würde
+async function planeImport(sicherung, { loeschen = false } = {}) {
+  const s = leseSicherung(sicherung);
+  const jetzt = Date.now();
+  const exportiert = Date.parse(s.exportedAt);
+  // Kein Eintrag ist neuer als die Sicherung selbst: Zeitstempel aus der Zukunft gewinnen sonst für immer
+  const grenze = Number.isFinite(exportiert) ? Math.min(exportiert, jetzt) : jetzt;
+  const ergebnis = {
+    ...neueZaehler(), einstellungen: 0, rezepte: neueZaehler(), geloeschteRezepte: [],
+    exportiertAm: Number.isFinite(exportiert) ? exportiert : null,
+  };
+  const schreiben = [];
   for (const store of SYNC_STORES) {
-    // nur Datensätze mit gültiger id (sonst bricht IndexedDB die ganze Übernahme ab)
-    const eingehend = Array.isArray(s.daten[store])
-      ? s.daten[store].filter((d) => d && typeof d === 'object' && !Array.isArray(d) && typeof d.id === 'string' && d.id)
-      : [];
-    if (!eingehend.length) continue;
+    const roh = liste(s.daten[store]);
+    if (!roh.length) continue;
+    // pro id zählt nur der neueste Stand aus der Datei
+    const eingehend = new Map();
+    for (const r of roh) {
+      const d = bereinigeDatensatz(store, r, grenze);
+      if (!d) {
+        ergebnis.ungueltig += 1;
+        if (store === 'recipes') ergebnis.rezepte.ungueltig += 1;
+        continue;
+      }
+      const bisher = eingehend.get(d.id);
+      if (!bisher || d.updatedAt > bisher.updatedAt) eingehend.set(d.id, d);
+    }
     const vorhanden = new Map((await alle(store, { mitGeloeschten: true })).map((d) => [d.id, d]));
     const uebernehmen = [];
-    for (const d of eingehend) {
-      const entscheidung = importEntscheidung(vorhanden.get(d.id), d);
-      zaehler[entscheidung] += 1;
-      if (entscheidung !== 'uebersprungen') uebernehmen.push(d);
-    }
-    if (uebernehmen.length) {
-      // Zeitstempel der Sicherung bleiben erhalten (kein vorbereiten()).
-      await transaktion([store], 'readwrite', async (tx) => {
-        const os = tx.objectStore(store);
-        await Promise.all(uebernehmen.map((d) => anfrage(os.put({ ...d, deleted: d.deleted === true }))));
-      });
-      meldeAenderung(store, uebernehmen.map((d) => d.id));
-    }
-  }
-  const e = s.daten.einstellungen;
-  if (e && typeof e === 'object') {
-    await nacheinander(async () => {
-      const vorhanden = await hole('settings', 'haushalt');
-      if (importEntscheidung(vorhanden, e) === 'uebersprungen') return;
-      const h = { id: 'haushalt', createdAt: e.createdAt, updatedAt: e.updatedAt || Date.now() };
-      // nur gültige Werte übernehmen, sonst bleibt der bisherige Stand
-      for (const k of HAUSHALT_SCHLUESSEL) {
-        const v = gueltig(k, e[k]) ?? vorhanden?.[k];
-        if (v !== undefined) h[k] = v;
+    for (const d of eingehend.values()) {
+      const alt = vorhanden.get(d.id);
+      let e = importEntscheidung(alt, d);
+      if (e === 'geloescht' && !loeschen) e = 'uebersprungen';
+      ergebnis[ZAEHLER_NAME[e]] += 1;
+      if (store === 'recipes') {
+        ergebnis.rezepte[ZAEHLER_NAME[e]] += 1;
+        if (e === 'geloescht') ergebnis.geloeschteRezepte.push(alsText(alt.title).trim() || 'Ohne Titel');
       }
-      await transaktion(['settings'], 'readwrite', (tx) => anfrage(tx.objectStore('settings').put(h)));
+      if (e !== 'uebersprungen') uebernehmen.push(d);
+    }
+    if (uebernehmen.length) schreiben.push({ store, uebernehmen });
+  }
+  return { s, grenze, ergebnis, schreiben };
+}
+
+/**
+ * Was würde das Einlesen ändern? Liest nur. Ergebnis wie bei importiere(); `geloescht` und
+ * geloeschteRezepte (Titel) nennen, was die Lösch-Markierungen der Sicherung hier entfernen würden
+ * – das passiert nur mit importiere(…, { loeschen: true }).
+ */
+export async function importVorschau(sicherung) {
+  const { s, grenze, ergebnis } = await planeImport(sicherung, { loeschen: true });
+  const haushalt = await hole('settings', 'haushalt');
+  ergebnis.einstellungen = fuehreEinstellungenZusammen(haushalt, s.daten.einstellungen, grenze).uebernommen.length;
+  return ergebnis;
+}
+
+/**
+ * Liest eine Sicherung ein. Pro id gewinnt das neuere updatedAt. Vorhandenes wird dabei nur gelöscht,
+ * wenn ausdrücklich { loeschen: true } (vorher mit importVorschau() zeigen, was verschwindet);
+ * sonst zählen solche Lösch-Markierungen als übersprungen. Jeder Datensatz wird vorher geprüft und
+ * repariert, Unbrauchbares übersprungen (ungueltig). Haushalts-Einstellungen: pro Einstellung gewinnt
+ * der neuere Stand. `sicherung` darf ein Objekt oder JSON-Text sein.
+ * Ergebnis: { neu, aktualisiert, geloescht, uebersprungen, markierungen, ungueltig,
+ *             einstellungen (Anzahl übernommener Einstellungen), rezepte: { neu, … } (nur Rezepte),
+ *             geloeschteRezepte: [Titel], exportiertAm: ms|null }
+ */
+export async function importiere(sicherung, optionen = {}) {
+  const { s, grenze, ergebnis, schreiben } = await planeImport(sicherung, optionen);
+  for (const { store, uebernehmen } of schreiben) {
+    // Zeitstempel der Sicherung bleiben erhalten (kein vorbereiten()).
+    await transaktion([store], 'readwrite', async (tx) => {
+      const os = tx.objectStore(store);
+      await Promise.all(uebernehmen.map((d) => anfrage(os.put(d))));
+    });
+    meldeAenderung(store, uebernehmen.map((d) => d.id));
+  }
+  if (istObjekt(s.daten.einstellungen)) {
+    await nacheinander(async () => {
+      const { datensatz, uebernommen } = fuehreEinstellungenZusammen(await hole('settings', 'haushalt'), s.daten.einstellungen, grenze);
+      ergebnis.einstellungen = uebernommen.length;
+      if (!datensatz) return;
+      await transaktion(['settings'], 'readwrite', (tx) => anfrage(tx.objectStore('settings').put(datensatz)));
       meldeAenderung('settings', ['haushalt']);
     });
   }
-  return zaehler;
+  return ergebnis;
 }
 
 // ---------------------------------------------------------------- Speicherstatus

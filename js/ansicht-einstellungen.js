@@ -1,7 +1,7 @@
 // „Mehr“ (#/mehr): Sicherung speichern/teilen/einlesen, Speicherplatz, Import-Dienst,
 // Planung, Vorrat, Vorlesen, App-Version und Hilfe.
 
-import { el, symbol, SYMBOLE, VERSION, setzeTitel, toast, bestaetige, fehlerAnzeige, navigiere, pruefeUpdate, ladeNeu } from './app.js';
+import { el, symbol, SYMBOLE, VERSION, setzeTitel, toast, dialog, fehlerAnzeige, navigiere, pruefeUpdate, ladeNeu } from './app.js';
 import * as db from './db.js';
 import { alsSchluessel, heute, tageZwischen, formatDatum } from './datum.js';
 import { zutatSchluessel } from './zutaten.js';
@@ -13,6 +13,7 @@ const PROBE_TEXT = 'Schritt 1: Die Zwiebeln fein würfeln und in 2 Esslöffeln B
 const PROXY_BEISPIEL = 'https://rezepte.dein-name.workers.dev';
 const STANDARD_ORIGIN = 'https://patrick19921992.github.io'; // wie ERLAUBTE_ORIGINS in proxy/worker.js
 const MAX_DATEI_BYTES = 50 * 1024 * 1024; // größere Dateien sind sicher keine Sicherung
+const MAX_TITEL = 8;                       // so viele Rezepte nennt die Lösch-Frage beim Einlesen
 
 // Ersetzt den Inhalt; null/false werden ausgelassen
 const fuelle = (ziel, ...kinder) => ziel.replaceChildren(...kinder.flat(Infinity).filter((k) => k != null && typeof k !== 'boolean'));
@@ -46,6 +47,38 @@ function sicherungsText(ms) {
   const tage = tageZwischen(alsSchluessel(d), heute());
   if (tage <= 0) return `heute, ${d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })} Uhr`;
   return tage === 1 ? 'gestern' : `vor ${tage} Tagen (${formatDatum(alsSchluessel(d), { jahr: true })})`;
+}
+
+const anzahlText = (n, eins, mehr) => `${n} ${n === 1 ? eins : mehr}`;
+
+/** Ergebnis von db.importiere() als kurze Meldung. */
+function einleseText(erg) {
+  const teile = [`${erg.neu} neu`, `${erg.aktualisiert} aktualisiert`];
+  if (erg.geloescht) teile.push(`${erg.geloescht} gelöscht`);
+  if (erg.uebersprungen) teile.push(`${erg.uebersprungen} unverändert`);
+  if (erg.ungueltig) teile.push(`${erg.ungueltig} fehlerhaft und übersprungen`);
+  if (erg.einstellungen) teile.push(anzahlText(erg.einstellungen, 'Einstellung übernommen', 'Einstellungen übernommen'));
+  return `Eingelesen: ${teile.join(', ')}`;
+}
+
+/**
+ * Vorrat-Eingabe → Schlüssel. Komma, Semikolon und Zeilenumbruch trennen – außer das Komma
+ * gehört zum Produkt: 'Öl, Zucker' → ['öl', 'zucker'], 'Tomaten, passiert' → ['tomate, passiert'].
+ */
+function vorratSchluessel(text) {
+  const schluessel = [];
+  for (const zeile of String(text ?? '').split(/[;\n]/)) {
+    let teil = '';
+    for (const stueck of zeile.split(',')) {
+      // ändert das Stück den Schlüssel nicht (kein Produkt-Zusatz), ist es eine eigene Zutat
+      if (teil.trim() && zutatSchluessel(`${teil},${stueck}`) === zutatSchluessel(teil)) {
+        schluessel.push(zutatSchluessel(teil));
+        teil = stueck;
+      } else teil = teil.trim() ? `${teil},${stueck}` : stueck;
+    }
+    schluessel.push(zutatSchluessel(teil));
+  }
+  return schluessel.filter(Boolean);
 }
 
 /** Bietet Text als Datei zum Herunterladen an. */
@@ -184,18 +217,55 @@ export async function zeige(container) {
       fehler('Die Datei ist keine Sicherung dieser App.');
       return;
     }
-    const rezepte = Array.isArray(daten?.daten?.recipes) ? daten.daten.recipes.filter((r) => r && !r.deleted).length : 0;
-    const vom = Date.parse(daten?.exportedAt);
-    const datum = Number.isFinite(vom) ? ` vom ${formatDatum(alsSchluessel(new Date(vom)), { jahr: true })}` : '';
-    if (!(await bestaetige(`Sicherung${datum} mit ${rezepte} ${rezepte === 1 ? 'Rezept' : 'Rezepten'} einlesen? ` +
-      'Pro Eintrag gewinnt der neuere Stand, gelöscht wird nichts.', { titel: 'Sicherung einlesen', ja: 'Einlesen' }))) return;
+    let vorschau;
     try {
-      const erg = await db.importiere(daten);
-      toast(`Eingelesen: ${erg.neu} neu, ${erg.aktualisiert} aktualisiert${erg.uebersprungen ? `, ${erg.uebersprungen} unverändert` : ''}`, { dauer: 5000 });
+      vorschau = await db.importVorschau(daten);
+    } catch (f) {
+      fehler(f?.message || 'Die Sicherung konnte nicht gelesen werden.');
+      return;
+    }
+    const wahl = await frageEinlesen(daten, vorschau);
+    if (!wahl) return;
+    try {
+      const erg = await db.importiere(daten, { loeschen: wahl.loeschen });
+      toast(einleseText(erg), { dauer: 6000 });
       navigiere('#/mehr', { ersetzen: true }); // neu zeichnen: Haushalts-Einstellungen können sich geändert haben
     } catch (f) {
       fehler(f?.message || 'Die Sicherung konnte nicht eingelesen werden.');
     }
+  }
+
+  // Zeigt, was das Einlesen ändert. Was in der Sicherung gelöscht ist, wird hier nur auf Wunsch gelöscht
+  // (Wiederherstellen gibt es nicht). Ergebnis: { loeschen } oder null (abgebrochen).
+  async function frageEinlesen(daten, v) {
+    const rezepte = Array.isArray(daten.daten.recipes) ? daten.daten.recipes.filter((r) => r && !r.deleted).length : 0;
+    const datum = v.exportiertAm ? ` vom ${formatDatum(alsSchluessel(new Date(v.exportiertAm)), { jahr: true })}` : '';
+    const aenderungen = [v.neu && `${v.neu} neu`, v.aktualisiert && `${v.aktualisiert} aktualisiert`,
+      v.einstellungen && anzahlText(v.einstellungen, 'Einstellung', 'Einstellungen')].filter(Boolean);
+    const loeschBox = el('input', { type: 'checkbox' });
+    let loeschHinweis = null;
+    if (v.geloescht) {
+      const titel = v.geloeschteRezepte;
+      const weitere = v.geloescht - titel.length;
+      loeschHinweis = el('div', { class: 'hinweis warnung' },
+        el('p', { class: 'fett' }, 'In der Sicherung gelöscht, hier noch vorhanden:'),
+        titel.length ? el('p', null, titel.slice(0, MAX_TITEL).join(', '),
+          titel.length > MAX_TITEL ? ` und ${anzahlText(titel.length - MAX_TITEL, 'weiteres Rezept', 'weitere Rezepte')}` : '') : null,
+        weitere ? el('p', null, `${titel.length ? 'Dazu ' : ''}${anzahlText(weitere, 'Eintrag', 'Einträge')} aus Wochenplan oder Einkaufsliste.`) : null,
+        el('label', { class: 'checkbox' }, loeschBox, el('span', null, 'Auch hier löschen')),
+        el('p', { class: 'nebentext' }, 'Ohne Haken bleibt alles hier erhalten.'));
+    }
+    const wahl = await dialog({
+      titel: 'Sicherung einlesen',
+      inhalt: [
+        el('p', null, `Sicherung${datum} mit ${anzahlText(rezepte, 'Rezept', 'Rezepten')} einlesen? Pro Eintrag gewinnt der neuere Stand.`),
+        el('p', { class: 'nebentext' }, aenderungen.length ? `Hier ändert sich: ${aenderungen.join(', ')}.`
+          : v.geloescht ? 'Sonst ist hier schon alles auf diesem Stand.' : 'Hier ist schon alles auf diesem Stand.'),
+        loeschHinweis],
+      knoepfe: [{ text: 'Abbrechen', wert: null, art: 'flach' }, { text: 'Einlesen', wert: () => ({ loeschen: loeschBox.checked }), art: 'primaer' }],
+      fokus: false,
+    });
+    return wahl && typeof wahl === 'object' ? wahl : null;
   }
 
   // ---------------------------------------------------------------- Speicher
@@ -306,7 +376,7 @@ export async function zeige(container) {
     zeigeVorrat();
   }
   function vorratHinzufuegen() {
-    const neu = vorratFeld.value.split(/[,;\n]/).map((t) => zutatSchluessel(t)).filter(Boolean);
+    const neu = vorratSchluessel(vorratFeld.value);
     vorratFeld.value = '';
     if (neu.length) vorratSetzen([...(e.vorrat || []), ...neu]);
   }
@@ -362,7 +432,7 @@ export async function zeige(container) {
   // ---------------------------------------------------------------- Aufbau
   fuelle(container,
     abschnitt('Sicherung',
-      el('p', { class: 'nebentext' }, 'Alle Rezepte, der Wochenplan und die Einkaufsliste in einer Datei. Teile sie z. B. nach Google Drive oder per E-Mail an dich selbst. Beim Einlesen gewinnt pro Eintrag der neuere Stand – gelöscht wird nichts.'),
+      el('p', { class: 'nebentext' }, 'Alle Rezepte, der Wochenplan und die Einkaufsliste in einer Datei. Teile sie z. B. nach Google Drive oder per E-Mail an dich selbst. Beim Einlesen gewinnt pro Eintrag der neuere Stand. Was in der Sicherung gelöscht ist, löscht die App hier nur, wenn du es beim Einlesen ankreuzt.'),
       sicherungStatus,
       el('div', { class: 'leiste' },
         knopf('Sicherung speichern', sicherungSpeichern, 'primaer'),

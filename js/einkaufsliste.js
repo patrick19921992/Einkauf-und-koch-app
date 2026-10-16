@@ -33,7 +33,7 @@ export function sortierteAbteilungen(reihenfolge) {
 // wenn nichts Genaueres passt), '^' = mitten im Wort nur am Wortanfang, '*' = kurzes Wort auch
 // als Wortende ('olivenöl'). Wörter bis 3 Buchstaben zählen sonst nur als ganzes Wort ('ei' ≠ 'reis').
 const STICHWOERTER = {
-  'obst-gemuese': `apfel äpfel banane birne zitrone zitronensaft limette limettensaft orange mandarine clementine
+  'obst-gemuese': `suppengrün suppengemüse apfel äpfel banane birne zitrone zitronensaft limette limettensaft orange mandarine clementine
     grapefruit pomelo beere erdbeere himbeere heidelbeere blaubeere johannisbeere brombeere traube weintraube kiwi
     mango ananas melone pfirsich nektarine aprikose pflaume zwetschge zwetschke mirabelle kirsche sauerkirsche feige
     granatapfel granatapfelkern physalis maracuja passionsfrucht papaya litschi kaki rhabarber quitte avocado tomate
@@ -77,7 +77,7 @@ const STICHWOERTER = {
     lebensmittelfarb marzipan fondant oblate orangeat zitronat paniermehl semmelbrösel kokosraspel kokosflocken
     mandelblättchen mandelstift bittermandel gemahlene_mandel gehobelte_mandel gemahlene_haselnuss mohn rosenwasser
     blütenwasser tonkabohne backmischung zuckerguss glasur farine sucre`,
-  gewuerze: `salz meersalz fleur_de_sel pfeffer pfefferkorn gewürz pulver paprikapulver edelsüß rosenscharf cayenne
+  gewuerze: `salz meersalz fleur_de_sel pfeffer pfefferkorn rauchpaprika rosa_beere pfefferbeere gewürz pulver paprikapulver edelsüß rosenscharf cayenne
     chiliflocken chilipulver curry kurkuma kreuzkümmel cumin kümmel kümmelsamen zimt muskat muskatnuss muskatblüte
     nelke lorbeer piment kardamom anis anissamen sternanis fenchelsamen koriandersamen senfkorn senfsaat senfsamen
     majoran oregano bohnenkraut kräuter_der_provence italienische_kräuter herbes masala hanout safran sumach zaatar
@@ -219,13 +219,33 @@ const DOSE_NOTIZ_RE = /(?:^|[^\p{L}])(?:dosen?|konserven?)(?!\p{L})/iu;
 const GLAS_NOTIZ_RE = /(?:^|[^\p{L}])glas(?!\p{L})/iu;
 const BEHAELTER_NAME_RE = / (?:aus der dose|aus der konserve|in der dose|aus dem glas|im glas)(?=,|$)/;
 
+// In Löffeln oder Prisen gemessen ist manches Gemüse/Kraut das Gewürz: '1 TL Paprika' → 'paprika, gemahlen',
+// '1 TL Thymian' → 'thymian, getrocknet'. Frisch Zerkleinertes ('1 TL Ingwer, gerieben') bleibt Frischware.
+const PRISE = new Set(['Prise', 'Msp']);
+const GEMAHLEN_LOEFFEL = new Set(['paprika', 'chili', 'peperoncino']);
+const GEMAHLEN_PRISE = new Set(['ingwer', 'knoblauch']);
+const HOLZIGE_KRAEUTER = new Set(['thymian', 'rosmarin', 'salbei', 'estragon', 'liebstöckel']);
+const KEIN_KRAUT = new Set(['zwiebel', 'knoblauch', 'ingwer', 'chili', 'chilischote', 'peperoncino']);
+const FRISCH_RE = /frisch|gehackt|gerieben|gepresst|geschnitten|gewürfelt|fein(?!gemahlen)|zerdrückt|blättchen|gezupft/;
+
+function gewuerzForm(k, zutat) {
+  const u = zutat?.unit;
+  if (!['TL', 'EL', 'Prise', 'Msp'].includes(u) || FRISCH_RE.test(`${zutat.name ?? ''} ${zutat.note ?? ''}`.toLowerCase())) return null;
+  if (GEMAHLEN_LOEFFEL.has(k) || (PRISE.has(u) && GEMAHLEN_PRISE.has(k))) return 'gemahlen';
+  if (KRAEUTER.has(k) && !KEIN_KRAUT.has(k) && (PRISE.has(u) || (u === 'TL' && HOLZIGE_KRAEUTER.has(k)))) return 'getrocknet';
+  return null;
+}
+
 /**
  * Schlüssel einer Zutat für die Einkaufsliste: zutatSchluessel samt Produkt-Zusatz aus der Notiz.
  * Frisches aus Dose oder Glas ist ein anderes Produkt: '1 Dose Tomaten' → 'tomate, dose' (Konserven),
  * '3 Tomaten' → 'tomate'. Was ohnehin Konserve ist ('1 Dose Kichererbsen'), behält seinen Schlüssel.
+ * Gewürz statt Frischware: '1 TL Paprika' → 'paprika, gemahlen' (Gewürze, nicht bei '2 Paprika').
  */
 export function postenSchluessel(zutat) {
   let k = zutatSchluessel(produktName(zutat));
+  const form = k && !k.includes(', ') ? gewuerzForm(k, zutat) : null;
+  if (form) return `${k}, ${form}`;
   const note = String(zutat?.note ?? '');
   let dose = zutat?.unit === 'Dose' || DOSE_NOTIZ_RE.test(note);
   let glas = !dose && (zutat?.unit === 'Glas' || GLAS_NOTIZ_RE.test(note));
@@ -287,14 +307,52 @@ export function standardZeitraum(art, heuteKey = heute(), wochenstartTag = 1) {
 const SLOT_REIHE = { frueh: 0, mittag: 1, abend: 2, snack: 3 };
 const TAG_MUSTER = /^\d{4}-\d{2}-\d{2}$/;
 
-/** Plan-Einträge der Runde: Datum in [from, to], nicht gelöscht, noch keiner anderen Runde zugeordnet. */
+// Portionen, die eine andere (abgeschlossene) Runde schon eingekauft hat; 0 = gehört zu dieser Runde
+function schonEingekauft(eintrag, runde) {
+  return eintrag.tripId == null || eintrag.tripId === runde?.id ? 0 : Number(eintrag.eingekauftPortionen) || 0;
+}
+
+/**
+ * Plan-Einträge der Runde: Datum in [from, to], nicht gelöscht, noch keiner anderen Runde zugeordnet –
+ * oder dort für weniger Portionen eingekauft, als jetzt geplant sind (eingekauftPortionen < servings).
+ */
 export function planEintraegeFuerRunde(planEintraege, runde) {
   if (!runde || !TAG_MUSTER.test(runde.from ?? '') || !TAG_MUSTER.test(runde.to ?? '')) return [];
   const [von, bis] = runde.from <= runde.to ? [runde.from, runde.to] : [runde.to, runde.from];
   return (planEintraege || [])
     .filter((e) => e && !e.deleted && TAG_MUSTER.test(e.date ?? '') && e.date >= von && e.date <= bis &&
-      (e.tripId == null || e.tripId === runde.id))
+      (e.tripId == null || e.tripId === runde.id || (schonEingekauft(e, runde) > 0 && Number(e.servings) > schonEingekauft(e, runde))))
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (SLOT_REIHE[a.slot] ?? 9) - (SLOT_REIHE[b.slot] ?? 9)));
+}
+
+/** Portionen, für die ein Eintrag geplant ist (ohne Angabe die des Rezepts, sonst 1). */
+export function geplantePortionen(eintrag, rezept) {
+  if (Number(eintrag?.servings) > 0) return Number(eintrag.servings);
+  return Number(rezept?.servings) > 0 ? Number(rezept.servings) : 1;
+}
+
+/**
+ * Mehrere offene Runden (z. B. nach dem Einlesen einer Sicherung) → eine. Jedes Gerät wählt dieselbe:
+ * die älteste (createdAt, dann id). Abhak-Stände der übrigen wandern zu ihr (je Posten der neuere).
+ * → { runde, entfernen: [Runden, gelöscht markiert], zustaende: [Kopien und gelöscht markierte Originale] }
+ */
+export function offeneRundenVereinen(offene, zustaende = []) {
+  const [runde, ...andere] = [...(offene || [])].filter(Boolean)
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  if (!runde) return { runde: null, entfernen: [], zustaende: [] };
+  const andereIds = new Set(andere.map((t) => t.id));
+  const gueltig = (zustaende || []).filter((st) => st && !st.deleted && st.mergeKey != null);
+  const bisher = new Map(gueltig.filter((st) => st.tripId === runde.id).map((st) => [st.mergeKey, st]));
+  const kopien = new Map();
+  const weg = [];
+  for (const st of gueltig) {
+    if (!andereIds.has(st.tripId)) continue;
+    weg.push({ ...st, deleted: true });
+    const da = kopien.get(st.mergeKey) ?? bisher.get(st.mergeKey);
+    if (da && (da.updatedAt || 0) >= (st.updatedAt || 0)) continue;
+    kopien.set(st.mergeKey, { ...st, id: `${runde.id}|${st.mergeKey}`, tripId: runde.id });
+  }
+  return { runde, entfernen: andere.map((t) => ({ ...t, deleted: true })), zustaende: [...kopien.values(), ...weg] };
 }
 
 // ---------------------------------------------------------------- Liste berechnen
@@ -310,11 +368,22 @@ function istZutat(z) {
   return !(z.qty == null && /:\s*$/.test(String(z.raw ?? z.name)));
 }
 
-// Faktor Plan-Portionen / Rezept-Portionen (Rezept ohne Angabe = 1, Eintrag ohne Angabe = Rezept)
-function portionsFaktor(eintrag, rezept) {
+// Faktor Plan-Portionen / Rezept-Portionen (Rezept ohne Angabe = 1, Eintrag ohne Angabe = Rezept);
+// schon in einer früheren Runde eingekaufte Portionen zählen nicht mehr
+function portionsFaktor(eintrag, rezept, runde) {
   const basis = Number(rezept.servings) > 0 ? Number(rezept.servings) : 1;
-  const soll = Number(eintrag.servings) > 0 ? Number(eintrag.servings) : basis;
-  return soll / basis;
+  return (geplantePortionen(eintrag, rezept) - schonEingekauft(eintrag, runde)) / basis;
+}
+
+// [{ qty, qty2, unit }] → { Basis-Einheit: Menge } (Obergrenze bei Spannen)
+function mengenNachBasis(liste) {
+  const summe = {};
+  for (const t of liste || []) {
+    if (!t || t.vague) continue;
+    const { menge, basis } = inBasis(t.qty2 ?? t.qty, t.unit);
+    if (menge != null && basis != null) summe[basis] = rund((summe[basis] || 0) + menge);
+  }
+  return summe;
 }
 
 // Schon abgehakte Menge in der Einheit eines Teils (Löffel ↔ ml: 1 TL = 5 ml)
@@ -326,21 +395,24 @@ function abgehaktIn(abgehakt, unit) {
   return menge;
 }
 
-// Abhak-Stand auswerten: erledigt, wenn nichts mehr fehlt; sonst Rest ('noch 2')
-function nachAbhaken(teile, zustand) {
+// Abhak-Stand auswerten: erledigt, wenn nichts mehr fehlt; sonst Rest ('noch 2').
+// `gedeckt` (Stände mit `eintraege`): Mengen der Gerichte, die beim Abhaken auf der Liste standen – nur für
+// sie zählt das Abgehakte. `neu`: die Zeile hat auch andere Gerichte (anderer Zeitraum) → nicht erledigt.
+function nachAbhaken(teile, zustand, gedeckt = null, neu = false) {
   if (!zustand?.erledigt) return { erledigt: false, rest: teile };
-  const abgehakt = zustand.abgehakt;
-  if (!abgehakt || typeof abgehakt !== 'object') return { erledigt: true, rest: [] };
+  const abgehakt = zustand.abgehakt && typeof zustand.abgehakt === 'object' ? zustand.abgehakt : null;
+  if (!abgehakt && !gedeckt) return { erledigt: true, rest: [] };
   const rest = [];
   for (const t of teile) {
-    const schon = abgehaktIn(abgehakt, t.unit);
+    let schon = abgehakt ? abgehaktIn(abgehakt, t.unit) : Infinity;
+    if (gedeckt) schon = Math.min(schon, abgehaktIn(gedeckt, t.unit));
     if ((t.qty2 ?? t.qty) <= schon + EPS) continue;
     let qty = rund(t.qty - schon);
     let qty2 = t.qty2 == null ? null : rund(t.qty2 - schon);
     if (qty <= EPS) [qty, qty2] = [qty2, null];
     rest.push({ qty, qty2, unit: t.unit });
   }
-  return { erledigt: rest.length === 0, rest };
+  return { erledigt: rest.length === 0 && !neu, rest };
 }
 
 // 'salz und pfeffer' → ['salz', 'pfeffer'] (ein Komma trennt dagegen den Produkt-Zusatz ab)
@@ -378,7 +450,7 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
   for (const e of eintraege) {
     const r = e.recipeId != null ? rezeptMap.get(e.recipeId) : null;
     if (!r || r.deleted) continue;
-    const faktor = portionsFaktor(e, r);
+    const faktor = portionsFaktor(e, r, runde);
     const quelle = { planEntryId: e.id, recipeId: r.id, titel: r.title || e.title || '', datum: e.date };
     for (const z of r.ingredients || []) {
       if (!istZutat(z)) continue;
@@ -386,6 +458,11 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
       const key = kanonischerSchluessel(postenSchluessel(z), aliase);
       posten.push({ key, name: produktName(z), qty: s.qty, qty2: s.qty2, unit: z.unit, vague: Boolean(z.vague), quelle });
     }
+  }
+  const postenNach = new Map(); // Schlüssel → Posten (für die beim Abhaken gedeckten Mengen)
+  for (const p of posten) {
+    if (!postenNach.has(p.key)) postenNach.set(p.key, []);
+    postenNach.get(p.key).push(p);
   }
 
   // Abhak-Stände dieser Runde
@@ -400,7 +477,15 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
   const ausgeblendet = [];
   for (const g of zusammenfassen(posten)) {
     const zustand = zustandNach.get(g.key);
-    const { erledigt, rest } = nachAbhaken(g.teile, zustand);
+    // Abgehakt gilt nur für die Gerichte, die damals auf der Liste standen (Stände ohne `eintraege`: alle)
+    let gedeckt = null;
+    let neu = false;
+    if (zustand?.erledigt && Array.isArray(zustand.eintraege)) {
+      const ids = new Set(zustand.eintraege);
+      gedeckt = mengenNachBasis((postenNach.get(g.key) || []).filter((p) => ids.has(p.quelle.planEntryId)));
+      neu = g.quellen.some((q) => !ids.has(q.planEntryId));
+    }
+    const { erledigt, rest } = nachAbhaken(g.teile, zustand, gedeckt, neu);
     const zeile = {
       mergeKey: g.key, name: g.name, teile: g.teile, vage: g.vage, text: teileAlsText(g.teile),
       rest, restText: teileAlsText(rest), erledigt, versteckt: Boolean(zustand?.versteckt),
@@ -440,15 +525,22 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
   };
 }
 
-/** Stand zum Speichern beim Abhaken einer Rezept-Zeile: aktuelle Mengen in Basis-Einheiten. */
-export function abhakZustand(zeile) {
-  const abgehakt = {};
-  for (const t of zeile?.teile || []) {
-    if (!t) continue;
-    const { menge, basis } = inBasis(t.qty2 ?? t.qty, t.unit);
-    if (menge != null && basis != null) abgehakt[basis] = rund((abgehakt[basis] || 0) + menge);
+/**
+ * Stand zum Speichern beim Abhaken einer Rezept-Zeile: aktuelle Mengen in Basis-Einheiten und die Plan-Einträge,
+ * für die eingekauft wurde (wechselt der Zeitraum, gilt der Haken nicht für Gerichte einer anderen Woche).
+ * `alt`: bisheriger Stand; galt er ganz anderen Gerichten (anderer Zeitraum derselben Runde), bleibt er mit drin.
+ */
+export function abhakZustand(zeile, alt = null) {
+  const eintraege = [...new Set((zeile?.quellen || []).map((q) => q?.planEntryId).filter((id) => id != null))];
+  const stand = { abgehakt: mengenNachBasis(zeile?.teile), erledigt: true, eintraege: eintraege.length ? eintraege : null };
+  if (eintraege.length && alt?.erledigt && Array.isArray(alt.eintraege) && alt.eintraege.length
+    && alt.eintraege.every((id) => !eintraege.includes(id))) {
+    for (const [u, m] of Object.entries(alt.abgehakt || {})) {
+      if (Number.isFinite(Number(m))) stand.abgehakt[u] = rund((stand.abgehakt[u] || 0) + Number(m));
+    }
+    stand.eintraege = [...eintraege, ...alt.eintraege];
   }
-  return { abgehakt, erledigt: true };
+  return stand;
 }
 
 /** Liste als Text zum Teilen: Titel, je Abteilung '— Name —' und '• 500 g Kartoffeln'. */

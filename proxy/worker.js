@@ -308,10 +308,12 @@ export default {
       return antwortJson({ fehler: 'methode' }, 405, erlaubt, { Allow: 'GET, OPTIONS' });
     }
     if (!erlaubt) {
+      // Die Absage selbst darf jede Seite lesen (sie verrät nichts): so kann die App den Grund anzeigen
+      // (z. B. „ERLAUBTE_ORIGINS ergänzen“) statt nur „nicht erreichbar“. Rezeptdaten gibt es nur für erlaubte Origins.
       return antwortJson({
         fehler: 'origin',
         meldung: 'Der Import-Dienst läuft, antwortet aber nur der App „Einkauf & Koch“.',
-      }, 403);
+      }, 403, null, { 'Access-Control-Allow-Origin': '*' });
     }
     const parameter = new URL(request.url).searchParams;
     if (parameter.get('ping') === '1') return antwortJson({ ok: true, version: VERSION }, 200, erlaubt);

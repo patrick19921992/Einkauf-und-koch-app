@@ -262,9 +262,13 @@ export function dialog({ titel = '', inhalt = null, knoepfe = [{ text: 'OK', wer
           schliesseDialog(w);
         },
       }, k.text)));
+    const inhaltBox = el('div', { class: 'dlg-inhalt' }, inhalt);
+    // Name für Bildschirmleser: der Titel des Dialogs
+    if (titel) d.setAttribute('aria-labelledby', 'dlg-titel');
+    else d.removeAttribute('aria-labelledby');
     d.replaceChildren(
-      titel ? el('h2', { class: 'dlg-titel' }, titel) : null,
-      el('div', { class: 'dlg-inhalt' }, inhalt),
+      titel ? el('h2', { class: 'dlg-titel', id: 'dlg-titel' }, titel) : null,
+      inhaltBox,
       knoepfe.length ? knopfLeiste : null,
     );
     d.oncancel = (ev) => {
@@ -279,7 +283,16 @@ export function dialog({ titel = '', inhalt = null, knoepfe = [{ text: 'OK', wer
       // Vom Browser erzwungenes Schließen (z. B. zweimal Zurück trotz schliessbar: false)
       if (dialogAufloesen === resolve && !d.open) schliesseDialog(null);
     };
+    // showModal() fokussiert selbst das erste Feld (Tastatur geht auf). Bei fokus: false den Inhalt
+    // dabei kurz sperren und stattdessen den Dialog selbst fokussieren.
+    if (fokus) d.removeAttribute('tabindex');
+    else d.tabIndex = -1;
+    inhaltBox.inert = !fokus;
     d.showModal();
+    if (!fokus) {
+      inhaltBox.inert = false;
+      d.focus({ preventScroll: true });
+    }
     // Eigener Verlaufseintrag, damit die Zurück-Geste nur den Dialog schließt.
     // Läuft noch das Zurückspulen eines vorherigen Dialogs, erst danach eintragen.
     const eintragen = () => {
@@ -379,9 +392,10 @@ export function aktuelleRoute() {
   return leseRoute();
 }
 
-/** Wechselt die Ansicht, z. B. navigiere('#/rezept/123'). */
+/** Wechselt die Ansicht, z. B. navigiere('#/rezept/123'). Fragt vorher einen Verlassen-Schutz. */
 export async function navigiere(hash, { ersetzen = false } = {}) {
   if (verlaufWartet) await verlaufWartet;
+  if (!(await darfVerlassen())) return;
   const ziel = hash.startsWith('#') ? hash : `#${hash}`;
   if (ziel === location.hash) {
     zeigeRoute();
@@ -394,8 +408,97 @@ export async function navigiere(hash, { ersetzen = false } = {}) {
 /** Eine Ansicht zurück (oder zur Rezeptliste, wenn es kein Zurück gibt). */
 export async function zurueck() {
   if (verlaufWartet) await verlaufWartet;
-  if (innerhalbNavigiert && history.length > 1) history.back();
+  if (!(await darfVerlassen())) return;
+  if (kannZurueck()) history.back();
   else navigiere(STANDARD_ROUTE, { ersetzen: true });
+}
+
+// Position im Verlauf (Navigation API) oder null, wenn der Browser sie nicht kennt
+function verlaufsIndex() {
+  try {
+    const i = globalThis.navigation?.currentEntry?.index;
+    return Number.isInteger(i) && i >= 0 ? i : null;
+  } catch {
+    return null;
+  }
+}
+
+// Liegt davor ein Eintrag dieser App? Die Navigation API weiß das auch nach einem Neuladen.
+function kannZurueck() {
+  const i = verlaufsIndex();
+  if (i === null) return innerhalbNavigiert && history.length > 1;
+  return i > 0 && globalThis.navigation.entries()[i - 1]?.sameDocument === true;
+}
+
+// ---------------------------------------------------------------- Verlassen-Schutz
+
+let verlassenSchutz = null;
+let angezeigt = { hash: null, index: null }; // Hash und Verlaufsposition der gezeigten Ansicht
+let rueckkehr = null;
+let schutzLaeuft = false;
+
+/**
+ * Schützt die aktuelle Ansicht vor dem Verlassen, z. B. bei ungespeicherten Änderungen –
+ * auch bei Zurück-Geste und Links. fn() → false (auch als Promise) = bleiben, sonst verlassen.
+ * Gilt bis zum nächsten Seitenwechsel. Gibt eine Funktion zum Aufheben zurück.
+ */
+export function setzeVerlassenSchutz(fn) {
+  const eigen = typeof fn === 'function' ? fn : null;
+  verlassenSchutz = eigen;
+  return () => {
+    if (verlassenSchutz === eigen) verlassenSchutz = null;
+  };
+}
+
+// Fragt den Schutz. true = darf verlassen werden (der Schutz ist dann aufgehoben).
+async function darfVerlassen() {
+  const schutz = verlassenSchutz;
+  if (!schutz) return true;
+  let ok = true;
+  try {
+    ok = (await schutz()) !== false;
+  } catch (e) {
+    console.error(e);
+  }
+  if (verlaufWartet) await verlaufWartet; // Verlaufseintrag des Dialogs zuerst abbauen
+  if (ok && verlassenSchutz === schutz) verlassenSchutz = null;
+  return ok;
+}
+
+// Springt im Verlauf zur geschützten Ansicht zurück, ohne sie neu zu zeichnen
+function springe(schritte) {
+  return new Promise((resolve) => {
+    const fertig = () => {
+      clearTimeout(uhr);
+      rueckkehr = null;
+      resolve();
+    };
+    const uhr = setTimeout(fertig, 1000);
+    rueckkehr = fertig;
+    history.go(schritte);
+  });
+}
+
+// Zurück-Geste oder Link hat eine geschützte Ansicht verlassen: erst zurückholen, dann fragen.
+// false = geht hier nicht (ohne Navigation API), dann wird normal gewechselt.
+function schuetzeVerlassen() {
+  const jetzt = verlaufsIndex();
+  if (jetzt === null || angezeigt.index === null) return false;
+  const ziel = location.hash;
+  const schritte = angezeigt.index - jetzt; // > 0: Zurück, < 0: Link oder Vor, 0: ersetzt
+  schutzLaeuft = true;
+  (async () => {
+    try {
+      if (schritte === 0) history.replaceState(history.state, '', angezeigt.hash);
+      else await springe(schritte);
+      if (!(await darfVerlassen())) return;
+      if (schritte > 0) history.go(-schritte);
+      else navigiere(ziel, { ersetzen: schritte === 0 });
+    } finally {
+      schutzLaeuft = false;
+    }
+  })();
+  return true;
 }
 
 function setzeTab(tab) {
@@ -421,6 +524,8 @@ async function zeigeRoute() {
     neuLaden();
     return;
   }
+  verlassenSchutz = null;
+  angezeigt = { hash: location.hash, index: verlaufsIndex() };
   if (aufraeumen) {
     try {
       aufraeumen();
@@ -642,6 +747,11 @@ function start() {
   document.getElementById('update-knopf').addEventListener('click', ladeNeu);
   window.addEventListener('hashchange', () => {
     innerhalbNavigiert = true;
+    if (rueckkehr && location.hash === angezeigt.hash) {
+      rueckkehr(); // eigener Rücksprung des Verlassen-Schutzes: die Ansicht steht noch
+      return;
+    }
+    if (schutzLaeuft || (verlassenSchutz && location.hash !== angezeigt.hash && schuetzeVerlassen())) return;
     zeigeRoute();
   });
   zeigeRoute();

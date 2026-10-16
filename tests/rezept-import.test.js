@@ -285,6 +285,16 @@ test('rezeptAusText: kopierte Rezeptseite (Tabelle, Koch-/Backzeit, Grußformel)
   assert.equal(rezeptAusText('Zutaten\n500 g Mehl\nPortionen\nZubereitung\nKneten.').servings, null);
 });
 
+test('Ohne Portionsangabe: servings null (Formular fragt nach, statt still 1 Portion anzunehmen)', () => {
+  // Mengen ohne Zahl im Text oder recipeYield dürfen nicht geraten werden; die Import-Ansicht
+  // erkennt null, schlägt die Standard-Portionen vor und markiert das Feld
+  const t = rezeptAusText('Omas Kartoffelsalat\n1 kg festkochende Kartoffeln\n1 Zwiebel\n250 ml Brühe\n\nKartoffeln kochen und pellen.');
+  assert.deepEqual([t.title, t.servings, t.ingredients.length], ['Omas Kartoffelsalat', null, 3]);
+  assert.equal(rezeptAusJsonLd(rezept()).servings, null);
+  assert.equal(rezeptAusJsonLd(rezept({ recipeYield: '' })).servings, null);
+  assert.equal(rezeptAusJsonLd(rezept({ recipeYield: '1 Blech' })).servings, 1);
+});
+
 test('findeTimer: Zeitangaben', () => {
   const t = (text) => findeTimer(text).map((x) => [x.label, x.sekunden]);
   assert.deepEqual(t('10 Minuten kochen'), [['10 Min.', 600]]);

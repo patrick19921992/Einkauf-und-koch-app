@@ -311,9 +311,10 @@ export function zutatenAlsText(zutaten) {
   for (const z of zutaten || []) {
     if (!z) continue;
     const g = z.group || null;
-    if (g !== gruppe && g) {
+    // zurück zu „ohne Gruppe“: 'Zutaten:' beendet die vorige Gruppe (parseZeilen liest das als null)
+    if (g !== gruppe) {
       if (zeilen.length) zeilen.push('');
-      zeilen.push(`${g}:`);
+      zeilen.push(`${g || 'Zutaten'}:`);
     }
     gruppe = g;
     const text = (typeof z.raw === 'string' && z.raw.trim()) || formatZutat(z);
@@ -508,6 +509,10 @@ export function formatZahl(n, einheit) {
   if (!zahlOk(n)) return '';
   const x = Number(n);
   if (Math.abs(x - Math.round(x)) < 1e-6) return String(Math.round(x));
+  // Gramm/Milliliter nach dem Umrechnen nicht krumm anzeigen: ab 10 ganz, darunter eine Stelle
+  if (einheit === 'g' || einheit === 'ml' || einheit === 'mg') {
+    return DEZIMAL.format(Math.abs(x) >= 10 ? Math.round(x) : Math.round(x * 10) / 10);
+  }
   const familie = familieVon(einheit);
   if (familie !== 'masse' && familie !== 'volumen' && x > 0 && x < 10) {
     const ganz = Math.floor(x);

@@ -150,7 +150,11 @@ main#inhalt:focus { outline: none; }
 body.kochmodus { padding-bottom: 0; }
 body.kochmodus :is(.kopf, .navi, .banner, .fab) { display: none; }
 body.kochmodus main#inhalt { max-width: none; padding: 0; }
-body.kochmodus .toasts { bottom: calc(env(safe-area-inset-bottom) + 108px); }
+/* Meldungen im Kochmodus oben: unten liegen Timer, Zutaten-Klappe und die großen Schritt-Knöpfe */
+body.kochmodus .toasts { top: calc(env(safe-area-inset-top) + 4px); bottom: auto; }
+body.kochmodus .toast { animation-name: toast-oben; }
+body.kochmodus .toast.weg { transform: translateY(-8px); }
+@keyframes toast-oben { from { opacity: 0; transform: translateY(-12px); } }
 
 /* ------------------------------------------------------------------ Allgemeine Helfer */
 .versteckt { display: none !important; }
@@ -323,6 +327,7 @@ dialog.dlg {
   border-radius: 20px; overflow: hidden; background: var(--flaeche); color: var(--text); box-shadow: var(--schatten-hoch);
 }
 dialog.dlg[open] { display: flex; flex-direction: column; animation: dlg-ein .18s ease-out; }
+dialog.dlg:focus { outline: none; } /* nur bei fokus: false: der Dialog selbst hält den Fokus */
 dialog.dlg::backdrop { background: var(--abdunkeln); animation: einblenden .18s ease-out; }
 .dlg-titel { padding: 20px 20px 4px; font-size: 1.25rem; }
 .dlg-inhalt { flex: 1 1 auto; min-height: 0; max-height: 70vh; overflow-y: auto; overscroll-behavior: contain; padding: 12px 20px; }
