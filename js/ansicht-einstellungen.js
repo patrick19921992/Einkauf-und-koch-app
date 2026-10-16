@@ -1,10 +1,13 @@
-// „Mehr“ (#/mehr): Sicherung speichern/teilen/einlesen, Speicherplatz, Import-Dienst,
-// Planung, Vorrat, Vorlesen, App-Version und Hilfe.
+// „Mehr“ (#/mehr): Sicherung speichern/teilen/einlesen, Speicherplatz, Import-Dienst (mit KI-Status),
+// Planung, Läden & eigene Preise, Vorrat, Vorlesen, App-Version und Hilfe.
 
 import { el, symbol, SYMBOLE, VERSION, setzeTitel, toast, dialog, fehlerAnzeige, navigiere, pruefeUpdate, ladeNeu } from './app.js';
 import * as db from './db.js';
 import { alsSchluessel, heute, tageZwischen, formatDatum } from './datum.js';
 import { zutatSchluessel } from './zutaten.js';
+import { LAEDEN } from './preise.js';
+import { KI_ANLEITUNG } from './ki.js';
+import { preisDialog, gewaehlteLaeden, eigenerPreisText, PREIS_STAND_TEXT } from './ansicht-einkauf.js';
 
 const SICHERUNG_NACH_TAGEN = 14;
 const MAHLZEITEN = [['frueh', 'Frühstück'], ['mittag', 'Mittag'], ['abend', 'Abend'], ['snack', 'Snack']];
@@ -50,6 +53,7 @@ function sicherungsText(ms) {
 }
 
 const anzahlText = (n, eins, mehr) => `${n} ${n === 1 ? eins : mehr}`;
+const anzeigeName = (k) => k.charAt(0).toUpperCase() + k.slice(1);
 
 /** Ergebnis von db.importiere() als kurze Meldung. */
 function einleseText(erg) {
@@ -292,12 +296,14 @@ export async function zeige(container) {
   // ---------------------------------------------------------------- Import-Dienst
   const proxyFeld = el('input', { type: 'url', inputmode: 'url', placeholder: PROXY_BEISPIEL, value: e.proxyUrl || '', autocomplete: 'off', spellcheck: 'false' });
   const proxyMeldung = el('div');
+  const kiStatus = el('div'); // KI-Rezeptideen laut letztem Ping
   async function proxySpeichern() {
     const url = proxyNormal(proxyFeld.value);
     if (url === null) return fuelle(proxyMeldung, fehlerAnzeige(`Bitte eine vollständige https-Adresse eingeben, z. B. ${PROXY_BEISPIEL}`));
     proxyFeld.value = url;
     await speichern({ proxyUrl: url });
     fuelle(proxyMeldung);
+    if (!url) fuelle(kiStatus);
     return toast(url ? 'Adresse gespeichert.' : 'Import-Dienst entfernt.');
   }
   // Ping an `${proxy}?ping=1`; klappt es, wird die Adresse gleich gespeichert
@@ -305,6 +311,7 @@ export async function zeige(container) {
     const url = proxyNormal(proxyFeld.value);
     if (!url) return fuelle(proxyMeldung, fehlerAnzeige(url === null ? `Die Adresse ist ungültig. Bitte eine vollständige https-Adresse eingeben, z. B. ${PROXY_BEISPIEL}` : 'Bitte zuerst die Adresse eingeben.'));
     k.disabled = true;
+    fuelle(kiStatus);
     fuelle(proxyMeldung, el('p', { class: 'nebentext' }, 'Teste Verbindung…'));
     const ziel = new URL(url);
     ziel.searchParams.set('ping', '1');
@@ -316,6 +323,7 @@ export async function zeige(container) {
         const neu = url !== e.proxyUrl;
         if (neu) { proxyFeld.value = url; await speichern({ proxyUrl: url }); }
         meldung = el('p', { class: 'hinweis erfolg' }, `Verbindung klappt${json.version ? ` (Version ${json.version})` : ''}.${neu ? ' Adresse gespeichert.' : ''}`);
+        zeigeKiStatus(json);
       } else {
         meldung = fehlerAnzeige(json?.fehler === 'origin' ? originHinweis()
           : `Unerwartete Antwort (Status ${antwort.status}). Ist das die Adresse des Import-Dienstes?`);
@@ -327,6 +335,32 @@ export async function zeige(container) {
     k.disabled = false;
     return fuelle(proxyMeldung, meldung);
   }
+  // KI-Rezeptideen laut Ping: ki true/false; fehlt das Feld, ist der Worker noch die alte Version ohne KI
+  function zeigeKiStatus(json) {
+    if (!json) return fuelle(kiStatus);
+    const text = json.ki === true ? 'verfügbar' : 'nicht eingerichtet';
+    const tipp = json.ki === true ? null : typeof json.ki !== 'boolean'
+      ? `Dein Worker ist noch die alte Version${json.version ? ` ${json.version}` : ''} ohne KI: Ersetze seinen Code durch die aktuelle proxy/worker.js → „Deploy“. Danach: ${KI_ANLEITUNG}.`
+      : `Einrichten (einmalig, kostenlos): ${KI_ANLEITUNG}.`;
+    return fuelle(kiStatus, el('div', { class: ['hinweis', json.ki === true ? 'erfolg' : null] },
+      el('p', null, el('span', { class: 'fett' }, 'KI-Rezeptideen: '), text),
+      tipp ? el('p', { class: 'nebentext' }, tipp) : null));
+  }
+  // Beim Öffnen leise nachsehen (nur mit Adresse und Netz); Fehler zeigt erst „Testen“
+  async function kiStatusLeise() {
+    const url = proxyNormal(e.proxyUrl);
+    if (!url || navigator.onLine === false) return;
+    const ziel = new URL(url);
+    ziel.searchParams.set('ping', '1');
+    try {
+      const antwort = await fetch(ziel.href, { cache: 'no-store', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(8000) });
+      const json = antwort.ok ? await antwort.json() : null;
+      if (json?.ok === true && !kiStatus.firstChild) zeigeKiStatus(json);
+    } catch (f) {
+      console.warn('KI-Status nicht abrufbar:', f);
+    }
+  }
+
   // Warum der Ping scheiterte: Zeit, offline, Server antwortet ohne Freigabe für die App, gar nicht erreichbar
   async function pingFehler(f, adresse) {
     if (f?.name === 'TimeoutError') return 'Keine Antwort nach 10 Sekunden. Bitte Adresse und Internet prüfen.';
@@ -361,10 +395,63 @@ export async function zeige(container) {
     }
   }
 
+  // ---------------------------------------------------------------- Läden & eigene Preise
+  const ladenChips = el('div', { class: 'chips', role: 'group', 'aria-label': 'Supermärkte' });
+  function zeigeLaeden() {
+    const gewaehlt = gewaehlteLaeden(e.planerProfil);
+    fuelle(ladenChips, LAEDEN.map((l) => {
+      const an = gewaehlt.includes(l.id);
+      return el('button', {
+        type: 'button', class: ['chip', an && 'aktiv'], 'aria-pressed': String(an),
+        onclick: () => {
+          if (an && gewaehlt.length <= 1) return toast('Mindestens ein Laden');
+          if (!an && gewaehlt.length >= 3) return toast('Höchstens 3 Läden');
+          // nur die Läden im Planer-Profil ändern, die übrigen Vorlieben bleiben
+          speichern({ planerProfil: { ...(e.planerProfil || {}), laeden: an ? gewaehlt.filter((id) => id !== l.id) : [...gewaehlt, l.id] } });
+          zeigeLaeden();
+          return zeigePreise();
+        },
+      }, l.name);
+    }));
+  }
+  const preisListe = el('div');
+  const ladenName = (id) => (id === 'alle' ? 'Alle Läden' : LAEDEN.find((l) => l.id === id)?.name ?? id);
+  function zeigePreise() {
+    const eintraege = Object.entries(e.eigenePreise || {}).sort(([a], [b]) => a.localeCompare(b, 'de'))
+      .flatMap(([k, laeden]) => Object.entries(laeden).map(([laden, p]) => ({ k, laden, p })));
+    const bearbeiten = async (k, laden) => {
+      if (await preisDialog({ schluessel: k, name: anzeigeName(k), laeden: gewaehlteLaeden(e.planerProfil), laden })) {
+        e.eigenePreise = (await db.holeEinstellungen()).eigenePreise;
+        zeigePreise();
+      }
+    };
+    const entfernen = async (k, laden) => {
+      const vorher = e.eigenePreise[k];
+      const rest = { ...vorher };
+      delete rest[laden];
+      const alle = { ...e.eigenePreise };
+      if (Object.keys(rest).length) alle[k] = rest;
+      else delete alle[k];
+      await speichern({ eigenePreise: alle });
+      zeigePreise();
+      toast(`Eigener Preis für „${anzeigeName(k)}“ entfernt.`, { aktion: { text: 'Rückgängig', onclick: async () => {
+        await speichern({ eigenePreise: { ...e.eigenePreise, [k]: { ...(e.eigenePreise[k] || {}), ...vorher } } });
+        zeigePreise();
+      } } });
+    };
+    fuelle(preisListe, eintraege.length
+      ? el('ul', { class: 'liste eigene-preise' }, eintraege.map(({ k, laden, p }) => el('li', { class: 'listen-eintrag' },
+        el('button', { type: 'button', class: 'haupt', onclick: () => bearbeiten(k, laden) },
+          el('span', { class: 'titel' }, anzeigeName(k)),
+          el('span', { class: 'nebentext' }, [ladenName(laden), eigenerPreisText(p), p.stand ? `seit ${formatDatum(p.stand)}` : ''].filter(Boolean).join(' · '))),
+        el('button', { type: 'button', class: 'icon-knopf', 'aria-label': `Preis für ${anzeigeName(k)} (${ladenName(laden)}) löschen`, onclick: () => entfernen(k, laden) },
+          symbol(SYMBOLE.loeschen)))))
+      : el('p', { class: 'nebentext' }, 'Noch keine eigenen Preise. In der Einkaufsliste: Zeile → ⋮ → „Preis eintragen“.'));
+  }
+
   // ---------------------------------------------------------------- Vorrat (als Zusammenführ-Schlüssel gespeichert)
   const vorratChips = el('div', { class: 'chips' });
   const vorratFeld = el('input', { type: 'text', placeholder: 'z. B. Öl, Zucker', enterkeyhint: 'done', autocomplete: 'off' });
-  const anzeigeName = (k) => k.charAt(0).toUpperCase() + k.slice(1);
   function zeigeVorrat() {
     const liste = [...(e.vorrat || [])].sort((a, b) => a.localeCompare(b, 'de'));
     fuelle(vorratChips, liste.length ? liste.map((k) => el('span', { class: 'chip' }, anzeigeName(k),
@@ -445,6 +532,7 @@ export async function zeige(container) {
       el('label', { class: 'feld' }, el('span', null, 'Adresse des Dienstes'), proxyFeld),
       el('div', { class: 'leiste' }, knopf('Speichern', proxySpeichern, 'primaer'), knopf('Testen', proxyTesten)),
       proxyMeldung,
+      kiStatus,
       // Gleiche Schritte wie im Kopf von proxy/worker.js
       hilfe('So richtest du den Dienst ein (kostenlos)', el('ol', null,
         el('li', null, 'Auf dash.cloudflare.com kostenlos registrieren und anmelden (keine Zahlungsdaten nötig).'),
@@ -452,7 +540,18 @@ export async function zeige(container) {
         el('li', null, '„Edit code“ (Code bearbeiten) öffnen und den vorhandenen Code komplett durch den gesamten Inhalt der Datei proxy/worker.js aus dem App-Repository ersetzen → „Deploy“.'),
         el('li', null, 'Die angezeigte Adresse https://<name>.<konto>.workers.dev kopieren, oben einfügen, „Speichern“ und „Testen“ tippen. Die Adresse gehört nur hier in die App, nicht ins öffentliche Repository.')),
       location.origin === STANDARD_ORIGIN ? null : el('p', { class: 'nebentext' },
-        `Diese App läuft unter ${location.origin}. Damit der Dienst ihr antwortet: im Worker unter „Settings“ → „Variables and Secrets“ eine Text-Variable ERLAUBTE_ORIGINS mit dieser Adresse anlegen (mehrere mit Komma getrennt).`))),
+        `Diese App läuft unter ${location.origin}. Damit der Dienst ihr antwortet: im Worker unter „Settings“ → „Variables and Secrets“ eine Text-Variable ERLAUBTE_ORIGINS mit dieser Adresse anlegen (mehrere mit Komma getrennt).`)),
+      hilfe('KI-Rezeptideen einrichten (optional, kostenlos)', el('ol', null,
+        el('li', null, 'Worker auf Version 2 bringen: im Cloudflare Dashboard „Edit code“, den Code komplett durch die aktuelle proxy/worker.js ersetzen → „Deploy“.'),
+        el('li', null, `KI verbinden: ${KI_ANLEITUNG}.`),
+        el('li', null, 'Hier „Testen“ tippen – dann steht „KI-Rezeptideen: verfügbar“ da.')),
+      el('p', { class: 'nebentext' }, 'Der kostenlose Plan enthält 10.000 Neurons pro Tag (etwa 40 Anfragen). Ist das aufgebraucht, geht es am nächsten Tag weiter – Kosten entstehen keine. KI-Ideen sind Vorschläge: bitte vor dem Kochen prüfen.'))),
+    abschnitt('Läden & Preise',
+      el('p', { class: 'nebentext' }, 'Hier kaufst du ein (höchstens 3). Planer und Einkaufsliste rechnen je Zutat mit dem günstigsten dieser Läden.'),
+      ladenChips,
+      el('h3', null, 'Eigene Preise'),
+      preisListe,
+      el('p', { class: 'nebentext' }, `Preise sind Schätzwerte (Stand ${PREIS_STAND_TEXT}) – keine Live-Preise. Eigene Preise gehen immer vor.`)),
     abschnitt('Planung', el('div', { class: 'karte' },
       zeile('Standard-Portionen', 'Für neue Einträge im Wochenplan', el('span', { class: 'stepper' }, weniger, portionenAusgabe, mehr)),
       el('label', { class: 'einstellung' }, el('span', { class: 'fett' }, 'Woche beginnt am'),
@@ -494,7 +593,10 @@ export async function zeige(container) {
 
   zeigeSicherungStatus();
   zeigeSpeicher();
+  zeigeLaeden();
+  zeigePreise();
   zeigeVorrat();
+  kiStatusLeise();
 
   // Sicherung in einem anderen Tab gemacht oder Rezepte geändert → Status nachziehen
   let verzoegerung = null;
@@ -502,8 +604,14 @@ export async function zeige(container) {
     if (store !== 'settings' && store !== 'recipes') return;
     clearTimeout(verzoegerung);
     verzoegerung = setTimeout(async () => {
-      e.letzteSicherung = (await db.holeEinstellungen()).letzteSicherung;
+      const neu = await db.holeEinstellungen();
+      e.letzteSicherung = neu.letzteSicherung;
       zeigeSicherungStatus();
+      // eigene Preise ändern sich auch über „Rückgängig“ im Preis-Dialog
+      if (JSON.stringify(neu.eigenePreise) !== JSON.stringify(e.eigenePreise)) {
+        e.eigenePreise = neu.eigenePreise;
+        zeigePreise();
+      }
     }, 100);
   });
 

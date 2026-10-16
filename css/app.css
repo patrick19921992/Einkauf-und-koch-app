@@ -461,6 +461,73 @@ details.hilfe > :not(summary) { margin: 0 16px 12px; }
 .aktionen-leiste { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
 .aktionen-leiste > * { flex: 1 1 auto; }
 
+/* Preise (geschätzt) und Läden – Einkaufsliste und Planer */
+.preis {
+  flex-shrink: 0; margin-left: auto; padding-left: 8px; font-size: .8125rem; color: var(--gedimmt);
+  text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.laden {
+  display: inline-flex; align-items: center; padding: 0 7px; border: 1px solid var(--linie-stark); border-radius: 6px;
+  background: var(--flaeche-2); color: var(--text); font-size: .6875rem; font-weight: 700; line-height: 1.55;
+  letter-spacing: .02em; white-space: nowrap; vertical-align: 1px;
+}
+.badge.budget-ok { background: var(--primaer-hell); border-color: transparent; color: var(--primaer-stark); }
+.badge.budget-drueber { background: var(--warn-badge); border-color: transparent; color: var(--warn-text); }
+/* Einkaufsliste: Preis rechts in der Zeile, darunter der günstigste Laden; Summen unter dem Zeitraum */
+.posten > .preis { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; padding-left: 4px; }
+.einkauf-kosten { flex: 1 1 100%; }
+.einkauf-kosten > * + * { margin-top: 4px; }
+.einkauf-kosten .betrag { font-weight: 800; font-variant-numeric: tabular-nums; }
+.laden-summen { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.laden-summen > span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.abteilung > h2 { display: flex; align-items: baseline; gap: 8px; }
+.abteilung > h2 > .summe { margin-left: auto; color: var(--gedimmt); font-weight: 600; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
+.preis-menge { display: flex; gap: 8px; }
+.preis-menge > input { flex: 1 1 auto; min-width: 0; }
+.preis-menge > select { flex: 0 0 7rem; width: auto; }
+/* Mehr: eigene Preise */
+.eigene-preise .listen-eintrag .haupt { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.eigene-preise .listen-eintrag .titel { white-space: normal; }
+/* Woche: Weg zu „Automatisch planen“ */
+.woche-planer { justify-content: center; }
+.woche-leer { text-align: center; }
+.woche-leer > .knopf { margin-inline: auto; }
+
+/* ------------------------------------------------------------------ Automatisch planen */
+.planer-form { display: flex; flex-direction: column; gap: 16px; }
+.planer-form .karte > h2 { font-size: 1.0625rem; }
+.planer-form .feld-zeile + .feld-zeile { margin-top: 4px; }
+.planer-zusammenfassung > .leiste.verteilt { flex-wrap: nowrap; align-items: flex-start; }
+.planer-zusammenfassung h2 { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; font-size: 1rem; font-weight: 600; }
+.planer-zusammenfassung .betrag {
+  font-size: 2rem; font-weight: 800; line-height: 1.15; color: var(--primaer-stark); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.planer-zusammenfassung .badge { padding: 2px 10px; font-size: .8125rem; }
+.planer-zusammenfassung > .knopf, .planer-zusammenfassung .leiste > .knopf { flex-shrink: 0; }
+.planer-laeden { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.planer-laeden > span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.tag.planer-tag { padding-bottom: 4px; }
+.planer-tag .tag-kopf { margin-bottom: 2px; }
+.planer-eintrag { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 8px 0; }
+.planer-eintrag + .planer-eintrag { border-top: 1px solid var(--linie); }
+/* Zeile 1: Mahlzeit + Titel (+ KI-Hinweis), Zeile 2: Zeit · Preis links, Knöpfe rechts */
+.planer-eintrag > .haupt { flex: 1 1 100%; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.planer-eintrag .titel { font-weight: 600; }
+.planer-eintrag .mahlzeit-titel { margin: 0; }
+.planer-eintrag > .nebentext { flex: 1 1 auto; min-width: 0; font-variant-numeric: tabular-nums; }
+.planer-eintrag > .leiste { flex: 0 0 auto; gap: 2px; margin-left: auto; }
+.planer-eintrag .knopf.klein { padding-inline: 10px; }
+.planer-eintrag .knopf.klein .symbol { width: 18px; height: 18px; }
+.ki-hinweis { display: inline-flex; align-items: center; gap: 4px; font-size: .8125rem; font-style: italic; color: var(--gedimmt); }
+.ki-hinweis .symbol { width: 16px; height: 16px; color: var(--primaer-text); }
+/* Neu planen / Übernehmen bleiben über der Navigation sichtbar */
+.aktionen-leiste.planer-aktionen {
+  position: sticky; z-index: 5; bottom: calc(var(--unten) + var(--banner-hoehe)); margin-inline: calc(-1 * var(--rand));
+  padding: 8px var(--rand); background: var(--hintergrund); box-shadow: 0 -1px 0 var(--linie);
+}
+.planer-aktionen > .knopf { flex: 1 1 8rem; }
+body:has(.planer-aktionen) .toasts { bottom: calc(var(--unten) + var(--banner-hoehe) + 72px); }
+
 /* ------------------------------------------------------------------ Kochmodus */
 .koch {
   display: flex; flex-direction: column; height: 100vh; height: 100dvh; max-width: 960px; margin: 0 auto;
