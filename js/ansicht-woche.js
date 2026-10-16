@@ -1,5 +1,6 @@
 // Wochenplan: 7 Tage mit den eingestellten Mahlzeiten. Gerichte (Rezept oder Notiz) planen,
-// Portionen ändern, „gekocht“ abhaken, verschieben, entfernen. Unten der Weg zur Einkaufsliste.
+// Portionen ändern, „gekocht“ abhaken, verschieben, entfernen. Oben der Weg zu „Automatisch planen“,
+// unten der zur Einkaufsliste.
 
 import { el, symbol, SYMBOLE, setzeTitel, toast, dialog, eingabe, auswahl, navigiere, fehlerAnzeige } from './app.js';
 import * as db from './db.js';
@@ -354,6 +355,21 @@ export async function zeige(container, route) {
         },
       }, 'Heute'));
 
+    // Automatisch planen ab dem gezeigten Wochenanfang (der Planer beginnt frühestens heute); leere Woche: großer Hinweis
+    const planerKnopf = (art) => el('button', {
+      type: 'button', class: ['knopf', art], dataset: { fokus: 'planer' },
+      onclick: () => navigiere(`#/planer?start=${start < heuteKey ? heuteKey : start}`),
+    }, symbol(SYMBOLE.automatisch), 'Automatisch planen');
+    let planer = null;
+    if (ende >= heuteKey) {
+      planer = inWoche.length
+        ? el('div', { class: 'leiste woche-planer' }, planerKnopf('klein'))
+        : el('div', { class: 'karte woche-leer' },
+          el('p', { class: 'fett' }, 'Noch nichts geplant.'),
+          el('p', { class: 'nebentext' }, 'Lass dir die Woche vorschlagen – passend zu euren Vorlieben, mit Einkaufsliste und geschätzten Kosten. Oder tippe unten bei einem Tag auf „Gericht planen“.'),
+          planerKnopf('primaer'));
+    }
+
     const geplant = inWoche.filter((p) => p.recipeId).length;
     const fuss = el('div', { class: 'stapel' },
       el('button', {
@@ -368,6 +384,7 @@ export async function zeige(container, route) {
     const fokus = merkeFokus(container);
     container.replaceChildren(
       kopf,
+      ...(planer ? [planer] : []),
       ...tage.map((d) => tagKarte(d, inWoche.filter((p) => p.date === d), slotsAnzeige, mitTitel, heuteKey)),
       fuss,
     );
@@ -384,6 +401,10 @@ export async function zeige(container, route) {
   }
 
   await zeichne();
+  // Angefragter Tag mitten in der Woche (z. B. Start eines übernommenen Plans): gleich dorthin scrollen
+  if (angefragt && einst && angefragt !== wochenstart(angefragt, einst.wochenstart)) {
+    container.querySelector(`[data-tag="${angefragt}"]`)?.scrollIntoView({ block: 'start' });
+  }
   const abmelden = db.beobachte(({ store } = {}) => {
     if (!BEOBACHTETE.has(store)) return;
     clearTimeout(timer);

@@ -29,7 +29,7 @@ jobs:
       - name: Syntax aller JavaScript-Dateien prüfen
         run: |
           set -e
-          for f in sw.js js/*.js tools/*.mjs proxy/*.js tests/*.js; do
+          for f in sw.js js/*.js js/daten/*.js tools/*.mjs proxy/*.js tests/*.js; do
             [ -f "$f" ] || continue
             node --check "$f"
           done

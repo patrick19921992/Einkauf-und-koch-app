@@ -18,6 +18,7 @@ const ROUTEN = [
   { muster: /^\/(neu|import)$/, modul: './ansicht-rezept-bearbeiten.js', tab: 'rezepte', zurueck: true },
   { muster: /^\/rezept\/[^/]+\/bearbeiten$/, modul: './ansicht-rezept-bearbeiten.js', tab: 'rezepte', zurueck: true },
   { muster: /^\/woche(\/\d{4}-\d{2}-\d{2})?$/, modul: './ansicht-woche.js', tab: 'woche' },
+  { muster: /^\/planer$/, modul: './ansicht-planer.js', tab: 'woche', zurueck: true },
   { muster: /^\/einkauf$/, modul: './ansicht-einkauf.js', tab: 'einkauf' },
   { muster: /^\/kochen\/[^/]+$/, modul: './ansicht-kochen.js', tab: null, vollbild: true },
   { muster: /^\/mehr$/, modul: './ansicht-einstellungen.js', tab: 'mehr' },
@@ -119,6 +120,9 @@ export const SYMBOLE = {
   suche: 'M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 14 15.5l.3.3v.8l5 5 1.5-1.5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z',
   link: 'M3.9 12A3.1 3.1 0 0 1 7 8.9h4V7H7a5 5 0 0 0 0 10h4v-1.9H7A3.1 3.1 0 0 1 3.9 12zM8 13h8v-2H8zm9-6h-4v1.9h4a3.1 3.1 0 0 1 0 6.2h-4V17h4a5 5 0 0 0 0-10z',
   text: 'M14 17H4v2h10zm6-8H4v2h16zM4 15h16v-2H4zM4 5v2h16V5z',
+  automatisch: 'm19 9 1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12zM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25z',
+  tauschen: 'M7 11 3 15l4 4v-3h7v-2H7zm14-2-4-4v3h-7v2h7v3z',
+  ansehen: 'M12 4.5C7 4.5 2.7 7.6 1 12c1.7 4.4 6 7.5 11 7.5s9.3-3.1 11-7.5c-1.7-4.4-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z',
 };
 
 /** Leert ein Element. */
@@ -158,34 +162,42 @@ export function kopfAktionen(...knoepfe) {
 const toastEntfernen = new WeakMap();
 
 /**
- * Kurze Meldung unten. Optional mit Aktion, z. B. { text: 'Rückgängig', onclick }.
- * Gibt eine Funktion zum vorzeitigen Schließen zurück.
+ * Kurze Meldung unten. Optional mit Aktion, z. B. { text: 'Rückgängig', onclick }, oder mehreren (`aktionen`).
+ * Antippen der Meldung schließt sie. Gibt eine Funktion zum vorzeitigen Schließen zurück.
  */
-export function toast(text, { aktion = null, dauer = 3500 } = {}) {
+export function toast(text, { aktion = null, aktionen = [], dauer = 3500 } = {}) {
   const box = document.getElementById('toasts');
-  const t = el('div', { class: 'toast', role: 'status' }, el('span', null, text));
+  const knoepfe = [aktion, ...(Array.isArray(aktionen) ? aktionen : [])].filter((a) => a?.text);
+  const t = el('div', { class: ['toast', knoepfe.length > 1 && 'mehrere'], role: 'status' }, el('span', null, text));
   let timer = null;
+  let offen = true;
   const entfernen = () => {
+    if (!offen) return;
+    offen = false;
     clearTimeout(timer);
     t.classList.add('weg');
     setTimeout(() => t.remove(), 250);
   };
-  if (aktion) {
+  for (const a of knoepfe) {
     t.append(el('button', {
       type: 'button',
       class: 'toast-aktion',
       onclick: () => {
         entfernen();
-        aktion.onclick?.();
+        a.onclick?.();
       },
-    }, aktion.text));
+    }, a.text));
   }
+  // Antippen neben den Knöpfen schließt die Meldung (sie liegt sonst über Knöpfen der Seite)
+  t.addEventListener('click', (ev) => {
+    if (!ev.target.closest('button')) entfernen();
+  });
   toastEntfernen.set(t, entfernen);
   box.append(t);
   // höchstens drei Meldungen gleichzeitig, die älteste geht zuerst
-  const offen = [...box.querySelectorAll('.toast:not(.weg)')];
-  for (const alt of offen.slice(0, -3)) toastEntfernen.get(alt)?.();
-  timer = setTimeout(entfernen, aktion ? Math.max(dauer, 6000) : dauer);
+  const sichtbar = [...box.querySelectorAll('.toast:not(.weg)')];
+  for (const alt of sichtbar.slice(0, -3)) toastEntfernen.get(alt)?.();
+  timer = setTimeout(entfernen, knoepfe.length ? Math.max(dauer, 6000) : dauer);
   return entfernen;
 }
 

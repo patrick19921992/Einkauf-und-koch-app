@@ -29,6 +29,8 @@ const HAUSHALT_STANDARD = {
   mahlzeiten: ['abend'],          // Auswahl aus 'frueh', 'mittag', 'abend', 'snack'
   abteilungsReihenfolge: null,    // null = Standard-Reihenfolge aus einkaufsliste.js
   vorrat: ['salz', 'pfeffer', 'wasser'],
+  planerProfil: null,             // Vorlieben aus „Automatisch planen“ (siehe planer.normalisiereProfil)
+  eigenePreise: {},               // mergeKey → { ladenId | 'alle': { preis, menge, einheit, stand } }
 };
 
 const GERAET_STANDARD = {
@@ -40,8 +42,9 @@ const GERAET_STANDARD = {
   letzteSicherung: null,          // Millisekunden oder null
 };
 
-/** Standardwerte aller Einstellungen (Haushalt + Gerät). */
-export const STANDARD_EINSTELLUNGEN = Object.freeze({ ...HAUSHALT_STANDARD, ...GERAET_STANDARD });
+/** Standardwerte aller Einstellungen (Haushalt + Gerät), auch innen unveränderlich. */
+export const STANDARD_EINSTELLUNGEN = Object.freeze(Object.fromEntries(Object.entries({ ...HAUSHALT_STANDARD, ...GERAET_STANDARD })
+  .map(([k, v]) => [k, v && typeof v === 'object' ? Object.freeze(Array.isArray(v) ? [...v] : { ...v }) : v])));
 
 const HAUSHALT_SCHLUESSEL = Object.keys(HAUSHALT_STANDARD);
 const GERAET_SCHLUESSEL = Object.keys(GERAET_STANDARD);
@@ -284,12 +287,21 @@ export async function entferne(store, id) {
   meldeAenderung(store, [id]);
 }
 
+/**
+ * Lösch-Markierungen, die bleiben: gelöschte Grundrezepte und KI-Ideen (ids 'grund-…', 'ki-…') merken sich,
+ * dass „Automatisch planen“ sie nicht mehr vorschlagen soll. Rein.
+ */
+export function bleibendeMarkierung(store, d) {
+  return store === 'recipes' && d?.deleted === true && /^(grund|ki)-/.test(String(d.id ?? ''));
+}
+
 /** Entfernt Lösch-Markierungen, die älter als `tage` sind. Gibt die Anzahl zurück. */
 export async function bereinige(tage = 90) {
   const grenze = Date.now() - tage * TAG_MS;
   let anzahlEntfernt = 0;
   for (const store of SYNC_STORES) {
-    const alt = (await alle(store, { mitGeloeschten: true })).filter((d) => d.deleted && d.updatedAt < grenze);
+    const alt = (await alle(store, { mitGeloeschten: true }))
+      .filter((d) => d.deleted && d.updatedAt < grenze && !bleibendeMarkierung(store, d));
     if (!alt.length) continue;
     await transaktion([store], 'readwrite', async (tx) => {
       const os = tx.objectStore(store);
@@ -312,6 +324,8 @@ const PRUEFUNG = {
   mahlzeiten: (v) => istTextListe(v) && v.length > 0 && v.every((m) => MAHLZEITEN.includes(m)),
   abteilungsReihenfolge: (v) => v === null || istTextListe(v),
   vorrat: istTextListe,
+  planerProfil: (v) => v === null || istObjekt(v),
+  eigenePreise: istObjekt,
   geraetId: (v) => v === null || typeof v === 'string',
   proxyUrl: (v) => typeof v === 'string',
   ttsStimme: (v) => typeof v === 'string',
@@ -328,17 +342,67 @@ function nacheinander(arbeit) {
   return r;
 }
 
+// Planer-Profil: nur einfache Werte und kurze Listen (die genaue Prüfung macht planer.normalisiereProfil)
+function bereinigeProfil(v) {
+  if (v === null) return null;
+  const p = {};
+  for (const [k, w] of Object.entries(v)) {
+    if (VERBOTEN.has(k) || k.length > 40) continue;
+    if (w === null || typeof w === 'boolean' || Number.isFinite(w)) p[k] = w;
+    else if (typeof w === 'string') p[k] = w.slice(0, 200);
+    else if (Array.isArray(w)) p[k] = w.filter((x) => typeof x === 'string' || Number.isFinite(x)).slice(0, 50).map((x) => (typeof x === 'string' ? x.slice(0, 80) : x));
+  }
+  return p;
+}
+
+const MAX_EIGENE_PREISE = 2000;
+
+// Eigene Preise: { mergeKey: { ladenId|'alle': { preis ≥ 0, menge > 0, einheit, stand|null } } }, Kaputtes fällt weg
+function bereinigePreise(v) {
+  const ergebnis = {};
+  let anzahlSchluessel = 0;
+  for (const [key, laeden] of Object.entries(v)) {
+    if (anzahlSchluessel >= MAX_EIGENE_PREISE) break;
+    if (!istId(key) || key.length > 200 || !istObjekt(laeden)) continue;
+    const eintraege = {};
+    for (const [laden, p] of Object.entries(laeden)) {
+      if (!istId(laden) || laden.length > 40 || !istObjekt(p)) continue;
+      const preis = zahlOderNull(p.preis);
+      // ohne Menge/Einheit gilt der Preis für 1 Stück (wie in preise.js)
+      const menge = zahlOderNull(p.menge) ?? 1;
+      const einheit = alsText(p.einheit).trim() || 'Stück';
+      if (preis == null || preis < 0 || preis > 10000 || !(menge > 0) || !einheit || einheit.length > 20) continue;
+      eintraege[laden] = { preis, menge, einheit, stand: istTag(p.stand) ? p.stand : null };
+    }
+    if (Object.keys(eintraege).length) {
+      ergebnis[key] = eintraege;
+      anzahlSchluessel += 1;
+    }
+  }
+  return ergebnis;
+}
+
+// Einstellungen mit verschachtelten Werten werden beim Lesen und Einlesen tief bereinigt (und kopiert)
+const BEREINIGE_EINSTELLUNG = { planerProfil: bereinigeProfil, eigenePreise: bereinigePreise };
+
 /** Gültiger Wert einer Einstellung oder undefined. Zahlen aus Formularfeldern kommen manchmal als Text. */
 function gueltig(k, v) {
   if (typeof v === 'string' && typeof STANDARD_EINSTELLUNGEN[k] === 'number' && v.trim()) v = Number(v);
   if (v === undefined || !PRUEFUNG[k](v)) return undefined;
+  if (Object.hasOwn(BEREINIGE_EINSTELLUNG, k)) return BEREINIGE_EINSTELLUNG[k](v);
   return Array.isArray(v) ? [...v] : v;
 }
 
+// Standardwert als eigene Kopie (Listen und Objekte darf der Aufrufer verändern)
+const standardWert = (k) => {
+  const v = STANDARD_EINSTELLUNGEN[k];
+  return Array.isArray(v) ? [...v] : istObjekt(v) ? { ...v } : v;
+};
+
 function zusammenfuehren(haushalt, geraet) {
-  const e = { ...STANDARD_EINSTELLUNGEN };
-  for (const k of HAUSHALT_SCHLUESSEL) e[k] = gueltig(k, haushalt?.[k]) ?? e[k];
-  for (const k of GERAET_SCHLUESSEL) e[k] = gueltig(k, geraet?.[k]) ?? e[k];
+  const e = {};
+  for (const k of HAUSHALT_SCHLUESSEL) e[k] = gueltig(k, haushalt?.[k]) ?? standardWert(k);
+  for (const k of GERAET_SCHLUESSEL) e[k] = gueltig(k, geraet?.[k]) ?? standardWert(k);
   return e;
 }
 
@@ -546,6 +610,8 @@ const BEREINIGUNG = {
     totalMin: positivOderNull(d.totalMin), tags: tagListe(d.tags), favorite: d.favorite === true,
     ingredients: liste(d.ingredients).map(bereinigeZutat).filter(Boolean),
     steps: (typeof d.steps === 'string' ? d.steps.split(/\r?\n/) : liste(d.steps)).map(bereinigeSchritt).filter(Boolean),
+    // Hauptzutaten aus der Grundsammlung bzw. von der KI ('gefluegel', 'vegan', …), sonst erkennt der Planer sie selbst
+    ...(istTextListe(d.protein) && d.protein.length ? { protein: [...new Set(d.protein)].filter((p) => /^[a-z]{2,20}$/.test(p)).slice(0, 6) } : {}),
   }),
   planEntries: (d) => (istTag(d.date) ? {
     date: d.date, slot: MAHLZEITEN.includes(d.slot) ? d.slot : 'abend', recipeId: istId(d.recipeId) ? d.recipeId : null,

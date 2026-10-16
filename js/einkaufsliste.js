@@ -1,7 +1,7 @@
 // Einkaufslisten-Logik ohne DOM: Abteilungen erkennen, Zutaten der geplanten Gerichte
 // zusammenfassen, Abhak-Stand auswerten und die Liste als Text ausgeben. Läuft auch in Node.
 
-import { zutatSchluessel, produktName, zusammenfassen, teileAlsText, inBasis, skaliere } from './zutaten.js';
+import { zutatSchluessel, produktName, zusammenfassen, teileAlsText, inBasis, skaliere, familieVon } from './zutaten.js';
 import { wochenstart, plusTage, heute } from './datum.js';
 
 // ---------------------------------------------------------------- Abteilungen
@@ -368,6 +368,20 @@ function istZutat(z) {
   return !(z.qty == null && /:\s*$/.test(String(z.raw ?? z.name)));
 }
 
+// Zum Einkaufen ganze Stücke und Packungen anzeigen (0,38 Eisbergsalat → 1, 1,88 Zitronen → 2);
+// Gramm, Milliliter und Löffel bleiben genau. Nur für die Anzeige, gerechnet wird mit den echten Mengen.
+const KAUF_GENAU = new Set(['masse', 'volumen', 'loeffel']);
+function aufrunden(x) {
+  return x == null ? x : Math.max(1, Math.ceil(Number(x) - 1e-6));
+}
+export function zumEinkaufen(teile) {
+  return (teile || []).map((t) => {
+    const familie = familieVon(t.unit);
+    if (familie == null || KAUF_GENAU.has(familie)) return t;
+    return { ...t, qty: aufrunden(t.qty), qty2: aufrunden(t.qty2) };
+  });
+}
+
 // Faktor Plan-Portionen / Rezept-Portionen (Rezept ohne Angabe = 1, Eintrag ohne Angabe = Rezept);
 // schon in einer früheren Runde eingekaufte Portionen zählen nicht mehr
 function portionsFaktor(eintrag, rezept, runde) {
@@ -487,8 +501,8 @@ export function berechneListe({ planEintraege = [], rezepte = [], manuelle = [],
     }
     const { erledigt, rest } = nachAbhaken(g.teile, zustand, gedeckt, neu);
     const zeile = {
-      mergeKey: g.key, name: g.name, teile: g.teile, vage: g.vage, text: teileAlsText(g.teile),
-      rest, restText: teileAlsText(rest), erledigt, versteckt: Boolean(zustand?.versteckt),
+      mergeKey: g.key, name: g.name, teile: g.teile, vage: g.vage, text: teileAlsText(zumEinkaufen(g.teile)),
+      rest, restText: teileAlsText(zumEinkaufen(rest)), erledigt, versteckt: Boolean(zustand?.versteckt),
       abteilung: abteilungIntern(g.key, aliase, g.teile.map((t) => t.unit)),
       quellen: g.quellen, manuell: null, imVorrat: imVorrat(g.key),
     };

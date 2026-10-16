@@ -1,17 +1,20 @@
 // Einkaufsliste der offenen Einkaufsrunde: Zutaten der geplanten Gerichte zusammengefasst und
-// nach Abteilungen sortiert, dazu eigene Einträge. Abhaken, Korrekturen (Abteilung, Zusammenführen,
-// Vorrat, Ausblenden), Teilen und Abschließen. Alles lokal – funktioniert auch offline.
+// nach Abteilungen (oder Läden) sortiert, dazu eigene Einträge. Abhaken, Korrekturen (Abteilung,
+// Zusammenführen, Vorrat, Ausblenden), geschätzte Kosten und eigene Preise, Teilen und Abschließen.
+// Alles lokal – funktioniert auch offline.
 
 import {
   el, symbol, SYMBOLE, setzeTitel, toast, dialog, bestaetige, eingabe, auswahl, navigiere, teileText, fehlerAnzeige,
 } from './app.js';
 import * as db from './db.js';
 import { heute, istSchluessel, formatDatum, formatZeitraum } from './datum.js';
-import { parseZeile, formatZutat } from './zutaten.js';
+import { parseZeile, formatZutat, parseZahl, zutatSchluessel } from './zutaten.js';
 import {
   ABTEILUNGEN, sortierteAbteilungen, abteilungEintrag, standardZeitraum, berechneListe, abhakZustand, listeAlsText,
-  vorratEintraegeFuer, geplantePortionen, offeneRundenVereinen,
+  vorratEintraegeFuer, geplantePortionen, offeneRundenVereinen, postenSchluessel,
 } from './einkaufsliste.js';
+import { LAEDEN, PREIS_STAND, kostenFuerZeilen, findePreis, formatEuro, formatEuroGerundet } from './preise.js';
+import { LADEN_FAKTOR } from './daten/preise-tabelle.js';
 
 const ZEITRAEUME = [{ art: 'diese-woche', text: 'Diese Woche' }, { art: 'naechste-woche', text: 'Nächste Woche' },
   { art: 'sieben-tage', text: '7 Tage' }];
@@ -19,6 +22,11 @@ const PFEIL_HOCH = 'M7.4 15.4 12 10.8l4.6 4.6L18 14l-6-6-6 6z';
 const PFEIL_RUNTER = 'M16.6 8.6 12 13.2 7.4 8.6 6 10l6 6 6-6z';
 const BEOBACHTETE = new Set(['recipes', 'planEntries', 'trips', 'shoppingItems', 'aliases', 'settings']);
 const SORTIERUNG = new Intl.Collator('de', { sensitivity: 'base', numeric: true });
+const GRUPPIERUNG = 'ekapp-einkauf-nach-laden'; // gemerkte Ansicht „Nach Laden“ (nur dieses Gerät)
+const PREIS_EINHEITEN = ['g', 'ml', 'Stück'];
+const LADEN_NAME = Object.fromEntries(LAEDEN.map((l) => [l.id, l.name]));
+/** Stand der geschätzten Preise als Text: '10/2026'. */
+export const PREIS_STAND_TEXT = PREIS_STAND.replace(/^(\d{4})-(\d{2})$/, '$2/$1');
 
 const abteilungsName = (id) => ABTEILUNGEN.find((a) => a.id === id)?.name ?? 'Sonstiges';
 const anzahlText = (n, eins, mehr) => `${n} ${n === 1 ? eins : mehr}`;
@@ -43,6 +51,122 @@ function ausText(text) {
   return { name: z.name, qty: z.qty, qty2: z.qty2, unit: z.unit, note: [z.size, z.note].filter(Boolean).join(', ') || null };
 }
 
+/** Gewählte Läden aus dem Planer-Profil (1–3 gültige ids), sonst Lidl. */
+export function gewaehlteLaeden(profil) {
+  const ids = Array.isArray(profil?.laeden) ? profil.laeden : [];
+  const laeden = [...new Set(ids)].filter((id) => LADEN_NAME[id]).slice(0, 3);
+  return laeden.length ? laeden : ['lidl'];
+}
+
+/** Schlüssel für eigene Preise: Zusammenführ-Schlüssel, bei eigenen Einträgen der des Produkts (wie preise.js). */
+export function preisSchluessel(z) {
+  const k = z.manuell ? postenSchluessel(z.manuell) || zutatSchluessel(z.name) : z.mergeKey;
+  return String(k ?? '').normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+const zahlText = (x) => (x == null ? '' : String(Math.round(x * 1000) / 1000).replace('.', ','));
+/** '1,29 € / 500 g' für einen eigenen Preis. */
+export const eigenerPreisText = (p) => `${formatEuro(p.preis)} / ${zahlText(p.menge)} ${p.einheit}`;
+
+/** Setzt die eigenen Preise einer Zutat (null = alle weg) und liefert die Funktion zum Zurücknehmen. */
+async function setzeEigenePreise(schluessel, eintrag) {
+  const alle = { ...((await db.holeEinstellungen()).eigenePreise || {}) };
+  const vorher = alle[schluessel] ?? null;
+  if (eintrag && Object.keys(eintrag).length) alle[schluessel] = eintrag;
+  else delete alle[schluessel];
+  await db.speichereEinstellungen({ eigenePreise: alle });
+  return () => setzeEigenePreise(schluessel, vorher);
+}
+
+/**
+ * Dialog „Preis eintragen“ (auch unter Mehr → Läden & Preise): Preis in €, Menge + Einheit, Laden oder „Alle Läden“.
+ * Speichert eigenePreise[schluessel][laden|'alle'] = { preis, menge, einheit, stand }. Ergebnis: Meldungstext oder null.
+ */
+export async function preisDialog({ schluessel, name, laeden, laden = null, einheitVorschlag = null }) {
+  const eigene = { ...((await db.holeEinstellungen()).eigenePreise?.[schluessel] || {}) };
+  const tabelle = findePreis(schluessel);
+  const optionen = [...laeden.map((id) => [id, LADEN_NAME[id] || id]), ['alle', 'Alle Läden']];
+  for (const id of Object.keys(eigene)) if (!optionen.some(([o]) => o === id)) optionen.push([id, LADEN_NAME[id] || id]);
+  const preisFeld = el('input', { type: 'text', inputmode: 'decimal', placeholder: 'z. B. 1,29', autocomplete: 'off', enterkeyhint: 'done' });
+  const mengeFeld = el('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', enterkeyhint: 'done', 'aria-label': 'Menge' });
+  const einheitFeld = el('select', { 'aria-label': 'Einheit' }, PREIS_EINHEITEN.map((u) => el('option', { value: u }, u)));
+  const ladenFeld = el('select', null, optionen.map(([id, text]) => el('option', { value: id }, text)));
+  const meldung = el('p', { class: 'nebentext', role: 'alert' });
+  // Packung laut Schätz-Tabelle als Vorschlag ('500 g'), Preis im ersten gewählten Laden
+  const packung = tabelle && !tabelle.vorrat && PREIS_EINHEITEN.includes(tabelle.einheit) ? tabelle : null;
+  const schaetzung = tabelle && !tabelle.vorrat ? tabelle.packPreis * (LADEN_FAKTOR[laeden[0]] ?? 1) : null;
+  const fuelle = () => {
+    const p = eigene[ladenFeld.value];
+    preisFeld.value = p ? zahlText(p.preis) : '';
+    mengeFeld.value = zahlText(p ? p.menge : packung ? packung.packMenge : 1);
+    einheitFeld.value = p && PREIS_EINHEITEN.includes(p.einheit) ? p.einheit
+      : packung ? packung.einheit : PREIS_EINHEITEN.includes(einheitVorschlag) ? einheitVorschlag : 'Stück';
+    meldung.textContent = '';
+  };
+  ladenFeld.value = laden && optionen.some(([o]) => o === laden) ? laden : Object.keys(eigene)[0] ?? 'alle';
+  ladenFeld.addEventListener('change', fuelle);
+  fuelle();
+  const fehlerBei = (feld, text) => {
+    meldung.textContent = text;
+    feld.focus();
+    return undefined;
+  };
+  const lesen = () => {
+    const preis = parseZahl(preisFeld.value.trim());
+    const menge = parseZahl(mengeFeld.value.trim());
+    if (preis == null || preis < 0 || preis > 10000) return fehlerBei(preisFeld, 'Bitte den Preis in Euro eingeben, z. B. 1,29.');
+    if (!(menge > 0)) return fehlerBei(mengeFeld, 'Bitte die Menge eingeben, für die der Preis gilt, z. B. 500.');
+    return { laden: ladenFeld.value, preis: Math.round(preis * 100) / 100, menge, einheit: einheitFeld.value };
+  };
+  const w = await dialog({
+    titel: `Preis für „${name}“`,
+    fokus: false,
+    inhalt: [
+      el('label', { class: 'feld' }, el('span', null, 'Preis in €'), preisFeld),
+      el('div', { class: 'feld' }, el('span', null, 'für'), el('div', { class: 'preis-menge' }, mengeFeld, einheitFeld)),
+      el('label', { class: 'feld' }, el('span', null, 'Laden'), ladenFeld),
+      meldung,
+      el('p', { class: 'nebentext' }, schaetzung != null
+        ? `Schätzung der App: ${formatEuroGerundet(schaetzung)} für ${zahlText(tabelle.packMenge)} ${tabelle.einheit} (Stand ${PREIS_STAND_TEXT}). Dein Preis geht immer vor.`
+        : `Für diese Zutat hat die App keine Schätzung. Dein Preis gilt künftig in Planer und Einkaufsliste.`),
+    ],
+    knoepfe: [
+      { text: 'Abbrechen', wert: null, art: 'flach' },
+      ...(Object.keys(eigene).length ? [{
+        text: 'Entfernen', art: 'flach',
+        wert: () => (eigene[ladenFeld.value] ? { laden: ladenFeld.value, weg: true }
+          : fehlerBei(ladenFeld, 'Für diese Auswahl ist kein eigener Preis gespeichert.')),
+      }] : []),
+      { text: 'Speichern', wert: lesen, art: 'primaer' },
+    ],
+  });
+  if (!w) return null;
+  const neu = { ...eigene };
+  if (w.weg) delete neu[w.laden];
+  else neu[w.laden] = { preis: w.preis, menge: w.menge, einheit: w.einheit, stand: heute() };
+  const zurueck = await setzeEigenePreise(schluessel, neu);
+  const wo = w.laden === 'alle' ? '' : ` (${LADEN_NAME[w.laden] || w.laden})`;
+  toast(w.weg ? `Eigener Preis für „${name}“${wo} entfernt.` : `Preis für „${name}“${wo} gespeichert.`,
+    { aktion: { text: 'Rückgängig', onclick: () => zurueck().catch(() => toast('Speichern hat nicht geklappt.')) } });
+  return true;
+}
+
+function leseGruppierung() {
+  try {
+    return localStorage.getItem(GRUPPIERUNG) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function merkeGruppierung(nachLaden) {
+  try {
+    localStorage.setItem(GRUPPIERUNG, nachLaden ? '1' : '0');
+  } catch {
+    // ohne Speicher gilt die Wahl nur bis zum Verlassen
+  }
+}
+
 // Fokus über das Neuzeichnen hinweg behalten (Bedienelemente tragen data-fokus)
 const merkeFokus = (box) => (box.contains(document.activeElement) ? document.activeElement.dataset?.fokus ?? null : null);
 function stelleFokusHer(box, schluessel) {
@@ -52,8 +176,9 @@ function stelleFokusHer(box, schluessel) {
 
 export async function zeige(container, route) {
   setzeTitel('Einkauf');
-  const s = {}; // aktueller Stand: einst, runde, offeneRunden, liste, plan, rezepte, aliase, zustaende, manuelle
+  const s = {}; // aktueller Stand: einst, runde, offeneRunden, liste, plan, rezepte, aliase, zustaende, manuelle, laeden, kosten
   const offen = { erledigt: false, vorrat: false }; // aufgeklappte Bereiche
+  let nachLaden = leseGruppierung(); // Abschnitte je Laden statt je Abteilung (nur bei mehreren Läden)
   // ?von=…&bis=… gilt einmal; danach ohne Zeitraum im Verlauf, sonst setzte „Zurück“ eine spätere Wahl zurück
   let wunsch = bereichAusQuery(route.query);
   if ((route.query.has('von') || route.query.has('bis')) && location.hash === route.hash) {
@@ -115,8 +240,11 @@ export async function zeige(container, route) {
     }
     wunsch = null;
     erstesLaden = false;
+    // geschätzte Kosten der offenen Posten im jeweils günstigsten der gewählten Läden
+    const laeden = gewaehlteLaeden(einst.planerProfil);
+    const kosten = kostenFuerZeilen(liste, laeden, { eigenePreise: einst.eigenePreise, vorrat });
     Object.assign(s, {
-      einst: { ...einst, vorrat }, runde, liste, plan, aliase,
+      einst: { ...einst, vorrat }, runde, liste, plan, aliase, laeden, kosten,
       rezepte: new Map(rezepte.map((r) => [r.id, r])),
       offeneRunden: new Set([runde.id, ...offene.map((t) => t.id)]),
       zustaende: new Map(zustaende.map((z) => [z.id, z])),
@@ -125,7 +253,17 @@ export async function zeige(container, route) {
   }
 
   // ------------------------------------------------------------ Darstellung
-  function postenZeile(z, { vorrat = false } = {}) {
+  // Preis einer offenen Zeile ('≈ 1,29 €', eigener Preis ohne ≈) und bei mehreren Läden der günstigste
+  function preisKnoten(z, mitLaden) {
+    const k = s.kosten?.proZeile.get(z.mergeKey);
+    if (!k || !k.laden || !(k.betrag > 0.004)) return null;
+    const eigen = k.quelle === 'eigen';
+    return el('span', { class: 'preis', title: eigen ? 'Eigener Preis' : `Geschätzt, Stand ${PREIS_STAND_TEXT}` },
+      el('span', null, eigen ? formatEuro(k.betrag) : `≈ ${formatEuro(k.betrag)}`),
+      mitLaden && s.laeden.length > 1 ? el('span', { class: 'laden' }, LADEN_NAME[k.laden] || k.laden) : null);
+  }
+
+  function postenZeile(z, { vorrat = false, mitLaden = true } = {}) {
     const quelle = z.manuell ? z.manuell.note || '' : [...new Set((z.quellen || []).map((q) => q.titel).filter(Boolean))].join(', ');
     // „noch …“ nur, wenn nach dem Abhaken etwas dazukam
     const rest = !z.manuell && !z.erledigt && z.restText && z.restText !== z.text ? z.restText : '';
@@ -140,6 +278,7 @@ export async function zeige(container, route) {
     });
     return el('li', { class: ['posten', z.erledigt && 'erledigt'] },
       el('label', null, haken, text),
+      vorrat || z.erledigt ? null : preisKnoten(z, mitLaden),
       el('button', {
         type: 'button', class: 'icon-knopf', 'aria-label': `Optionen für ${z.name}`,
         dataset: { fokus: `m:${z.mergeKey}` }, onclick: () => menue(z),
@@ -168,7 +307,38 @@ export async function zeige(container, route) {
           () => setzeZeitraum(standardZeitraum(z.art, heute(), s.einst.wochenstart)))),
         chip('Anderer …', !passend, 'z:eigen', eigenerZeitraum)),
       el('span', { class: 'nebentext' },
-        `${formatZeitraum(s.runde.from, s.runde.to)} · ${anzahlText(gerichte, 'Gericht', 'Gerichte')}`));
+        `${formatZeitraum(s.runde.from, s.runde.to)} · ${anzahlText(gerichte, 'Gericht', 'Gerichte')}`),
+      kostenZeile());
+  }
+
+  // „≈ 48,20 € geschätzt“, bei mehreren Läden die Summe je Laden; Posten ohne Schätzung werden genannt
+  function kostenZeile() {
+    const { gesamt, proLaden, proZeile } = s.kosten;
+    if (!(gesamt > 0.004)) return null;
+    const zaehle = (quelle) => [...proZeile.values()].filter((k) => k.quelle === quelle).length;
+    const nicht = [zaehle('vorrat') && `${anzahlText(zaehle('vorrat'), 'Posten', 'Posten')} Grundvorrat (Gewürze, Öl, Mehl …)`,
+      zaehle('unbekannt') && `${anzahlText(zaehle('unbekannt'), 'Posten', 'Posten')} ohne Schätzung`].filter(Boolean);
+    const laeden = s.laeden.filter((id) => proLaden[id] > 0.004);
+    return el('div', { class: 'einkauf-kosten' },
+      el('p', null, el('span', { class: 'betrag' }, `≈ ${formatEuro(gesamt)}`), ' geschätzt',
+        el('span', { class: 'nebentext' }, ` · Stand ${PREIS_STAND_TEXT}`)),
+      s.laeden.length > 1 && laeden.length ? el('p', { class: 'laden-summen' }, laeden.map((id) =>
+        el('span', null, el('span', { class: 'laden' }, LADEN_NAME[id] || id), ` ${formatEuroGerundet(proLaden[id])}`))) : null,
+      nicht.length ? el('p', { class: 'nebentext' }, `Nicht mitgerechnet: ${nicht.join(', ')}.`) : null);
+  }
+
+  // Offene Posten je Laden (günstigster), innen in Abteilungs-Reihenfolge; Grundvorrat und ohne Preis zum Schluss
+  function ladenGruppen(liste) {
+    const gruppen = new Map(s.laeden.map((id) => [id, []]));
+    const grundvorrat = [];
+    const ohne = [];
+    for (const z of liste.abteilungen.flatMap((a) => a.zeilen)) {
+      const k = s.kosten.proZeile.get(z.mergeKey);
+      (gruppen.get(k?.laden) ?? (k?.quelle === 'vorrat' ? grundvorrat : ohne)).push(z);
+    }
+    return [...[...gruppen].map(([id, zeilen]) => ({ name: LADEN_NAME[id] || id, summe: s.kosten.proLaden[id], zeilen })),
+      { name: 'Grundvorrat (meist zu Hause)', summe: 0, zeilen: grundvorrat },
+      { name: 'Ohne Preis', summe: 0, zeilen: ohne }].filter((g) => g.zeilen.length);
   }
 
   function zeichneListe() {
@@ -183,9 +353,26 @@ export async function zeige(container, route) {
     } else if (!liste.abteilungen.length && liste.erledigt.length) {
       teile.push(el('p', { class: 'hinweis erfolg' }, 'Alles erledigt! Du kannst den Einkauf jetzt abschließen.'));
     }
-    for (const a of liste.abteilungen) {
-      teile.push(el('section', { class: 'abteilung' }, el('h2', null, a.name),
-        el('ul', { class: 'liste' }, a.zeilen.map((z) => postenZeile(z)))));
+    const mehrereLaeden = s.laeden.length > 1;
+    if (mehrereLaeden && liste.abteilungen.length) {
+      const chip = (text, wert) => el('button', {
+        type: 'button', class: ['chip', nachLaden === wert && 'aktiv'], 'aria-pressed': String(nachLaden === wert),
+        dataset: { fokus: `g:${wert}` },
+        onclick: () => {
+          nachLaden = wert;
+          merkeGruppierung(wert);
+          zeichneListe();
+          stelleFokusHer(listenBox, `g:${wert}`);
+        },
+      }, text);
+      teile.push(el('div', { class: 'chips', role: 'group', 'aria-label': 'Sortierung' },
+        chip('Nach Abteilung', false), chip('Nach Laden', true)));
+    }
+    const gruppen = mehrereLaeden && nachLaden ? ladenGruppen(liste) : liste.abteilungen;
+    for (const g of gruppen) {
+      teile.push(el('section', { class: 'abteilung' },
+        el('h2', null, g.name, g.summe > 0.004 ? el('span', { class: 'summe' }, formatEuroGerundet(g.summe)) : null),
+        el('ul', { class: 'liste' }, g.zeilen.map((z) => postenZeile(z, { mitLaden: gruppen === liste.abteilungen })))));
     }
     if (liste.erledigt.length) {
       teile.push(klappe('erledigt', `Erledigt (${liste.erledigt.length})`,
@@ -322,6 +509,7 @@ export async function zeige(container, route) {
       !manuell && (z.imVorrat
         ? { text: 'Nicht mehr Vorrat', wert: 'vorrat-weg', beschreibung: 'Wieder auf die Liste setzen' }
         : { text: 'Zum Vorrat', wert: 'vorrat', beschreibung: 'Hast du meistens zu Hause' }),
+      !z.imVorrat && { text: 'Preis eintragen', wert: 'preis', beschreibung: preisBeschreibung(z) },
       !manuell && !z.imVorrat && { text: 'Ausblenden', wert: 'ausblenden', beschreibung: 'Nur für diesen Einkauf' },
       manuell && { text: 'Löschen', wert: 'loeschen' },
     ].filter(Boolean);
@@ -331,6 +519,10 @@ export async function zeige(container, route) {
       if (w === 'herkunft') await herkunft(z);
       else if (w === 'bearbeiten') await bearbeiten(manuell);
       else if (w === 'abteilung') await abteilungAendern(z, manuell);
+      else if (w === 'preis') {
+        await preisDialog({ schluessel: preisSchluessel(z), name: z.name, laeden: s.laeden,
+          einheitVorschlag: (z.teile || []).find((t) => t.unit)?.unit ?? null });
+      }
       else if (w === 'zusammen') await zusammenfuehren(z, andere);
       else if (w === 'vorrat' || w === 'vorrat-weg') await vorratAendern(z, w === 'vorrat');
       else if (w === 'trennen') {
@@ -344,6 +536,16 @@ export async function zeige(container, route) {
         meldeMitZurueck(`„${z.name}“ gelöscht.`, () => db.wiederherstellen('shoppingItems', manuell.id));
       }
     });
+  }
+
+  // Untertitel für „Preis eintragen“: eigener Preis oder die Schätzung dieser Zeile
+  function preisBeschreibung(z) {
+    const eigene = s.einst.eigenePreise?.[preisSchluessel(z)];
+    if (eigene) {
+      return Object.entries(eigene).map(([id, p]) => `${id === 'alle' ? 'Eigener Preis' : LADEN_NAME[id] || id}: ${eigenerPreisText(p)}`).join(' · ');
+    }
+    const k = s.kosten.proZeile.get(z.mergeKey);
+    return k?.laden && k.betrag > 0.004 ? `Geschätzt ≈ ${formatEuro(k.betrag)} – eigenen Preis eintragen` : 'Eigenen Preis eintragen';
   }
 
   async function bearbeiten(item) {

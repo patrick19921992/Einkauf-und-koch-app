@@ -3,6 +3,7 @@
 // Wozu? Der Browser darf Rezeptseiten (chefkoch.de, rewe.de, …) wegen CORS nicht direkt lesen.
 // Dieser Worker holt die Seite, sucht darin nur die Rezeptdaten (JSON-LD) und den Titel und
 // schickt nur diese an die App zurück – nie die ganze Seite. Geheimnisse braucht er keine.
+// Zusätzlich (freiwillig): neue Rezeptideen von der KI (Workers AI) für „Automatisch planen“.
 //
 // Einrichten (einmalig, alles im Browser, kein Programm nötig):
 //   1. Auf https://dash.cloudflare.com kostenlos registrieren und anmelden.
@@ -13,15 +14,23 @@
 //      Mehr → Import-Dienst eintragen, „Speichern“ und „Testen“ tippen.
 //   Die Adresse gehört nur in die App auf dem Gerät, nicht ins öffentliche Repo.
 //
+// KI-Rezeptideen (optional): im Worker „Settings“ → „Bindings“ → „Add“ → „Workers AI“ →
+// Variable name „AI“ → „Deploy“. Der kostenlose Plan enthält 10.000 Neurons pro Tag – das reicht
+// für mindestens etwa 40 KI-Anfragen; ist das Kontingent aufgebraucht, meldet die App das bis zum
+// nächsten Tag (es entstehen keine Kosten). Cloudflare nutzt die Anfragen nicht zum Trainieren.
+// Anderes Modell: Text-Variable KI_MODELL (Standard siehe KI_MODELL unten); meldet die App danach, dass das
+// Modell nicht passt, die Variable wieder löschen.
+//
 // Weitere erlaubte Herkunft (z. B. die App lokal am PC): im Worker unter „Settings“ →
 // „Variables and Secrets“ eine Text-Variable ERLAUBTE_ORIGINS anlegen, mehrere Einträge mit
 // Komma getrennt, z. B. „http://localhost:8080, https://beispiel.github.io“. Die Standard-Origin
 // unten bleibt immer erlaubt. Weitere Rezeptseiten: Domain in ERLAUBTE_HOSTS ergänzen → „Deploy“.
 //
-// Schutz: nur GET/OPTIONS, nur die App-Origin, nur https-Adressen der Erlaubt-Liste (auch nach
-// jeder Weiterleitung geprüft), höchstens 3 MB pro Seite. Der Free-Plan kann nichts kosten.
+// Schutz: nur GET/OPTIONS (POST nur für KI-Ideen, höchstens 8 KB), nur die App-Origin, nur
+// https-Adressen der Erlaubt-Liste (auch nach jeder Weiterleitung geprüft), höchstens 3 MB pro
+// Seite. Der Free-Plan kann nichts kosten.
 
-const VERSION = '1';
+const VERSION = '2';
 const MAX_BYTES = 3 * 1024 * 1024;        // Seitengröße
 const MAX_BLOECKE = 10;                   // JSON-LD-Blöcke in der Antwort
 const MAX_BLOCK_ZEICHEN = 500 * 1024;     // je Block
@@ -88,7 +97,7 @@ export function pruefeZielUrl(text) {
 export function corsHeaders(origin) {
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
@@ -182,7 +191,8 @@ function zaehlStrom(zustand) {
   });
 }
 
-async function leseAlles(strom) {
+// Liest einen Strom ganz; über max Bytes → DienstFehler 413
+async function leseAlles(strom, max = Infinity) {
   const leser = strom.getReader();
   const teile = [];
   let laenge = 0;
@@ -191,6 +201,10 @@ async function leseAlles(strom) {
     if (done) break;
     teile.push(value);
     laenge += value.byteLength;
+    if (laenge > max) {
+      leser.cancel().catch(() => {});
+      throw new DienstFehler(413, { fehler: 'zu-gross' });
+    }
   }
   const alles = new Uint8Array(laenge);
   let pos = 0;
@@ -282,6 +296,215 @@ async function ladeUndWerteAus(start, signal) {
   return { url: url.href, title, jsonld };
 }
 
+// ---------------------------------------------------------------- KI-Rezeptideen (Workers AI)
+
+const KI_MODELL = '@cf/google/gemma-4-26b-a4b-it';
+const MAX_KI_BODY = 8 * 1024;             // Anfrage der App
+const KI_TOKENS_JE_REZEPT = 1800;
+const KI_PROTEINE = ['schwein', 'rind', 'gefluegel', 'fisch', 'vegetarisch', 'vegan'];
+const KI_FLEISCH = { schwein: 'Schwein', rind: 'Rind', gefluegel: 'Geflügel', fisch: 'Fisch' };
+const KI_ALLERGENE = {
+  nuesse: 'Nüsse und Erdnüsse', laktose: 'Milch und Milchprodukte (Laktose)',
+  gluten: 'Gluten (Weizen, Dinkel, Roggen, Gerste – also auch normale Nudeln, Brot und Mehl)',
+  ei: 'Eier (auch Mayonnaise)', soja: 'Soja (auch Tofu und Sojasauce)', fisch: 'Fisch und Meeresfrüchte',
+};
+// höchste Gesamtzeit in Minuten je Kochzeit: [Hauptgericht, Frühstück]
+const KI_KOCHZEIT = { schnell: [25, 15], normal: [45, 25], egal: [null, null] };
+
+/** JSON-Schema der Antwort (gleich KI_SCHEMA in js/ki.js). */
+export const KI_SCHEMA = {
+  type: 'object',
+  properties: {
+    rezepte: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          servings: { type: 'integer' },
+          totalMin: { type: 'integer' },
+          mahlzeit: { type: 'string', enum: ['haupt', 'frueh'] },
+          protein: { type: 'array', items: { type: 'string', enum: KI_PROTEINE } },
+          zutaten: { type: 'array', items: { type: 'string' } },
+          schritte: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['title', 'servings', 'totalMin', 'mahlzeit', 'protein', 'zutaten', 'schritte'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['rezepte'],
+  additionalProperties: false,
+};
+
+const istObjekt = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+const klemme = (n, min, max) => Math.min(max, Math.max(min, Math.round(n)));
+// Text für den Prompt: ohne Steuer- und Anführungszeichen, Leerraum zusammengefasst, gekürzt
+const promptText = (s, max) => String(s).replace(/[\u0000-\u001f\u007f"„“”«»`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+
+// Liste aus Texten (fehlend = leer, kein Array = null); andere Typen fallen weg, Dubletten auch
+function textListe(wert, max, laenge) {
+  if (wert === undefined) return [];
+  if (!Array.isArray(wert)) return null;
+  const liste = [];
+  for (const x of wert) {
+    const t = typeof x === 'string' ? promptText(x, laenge) : '';
+    if (t && !liste.includes(t)) liste.push(t);
+    if (liste.length >= max) break;
+  }
+  return liste;
+}
+
+// Zahl (fehlend = std); anderer Typ = null
+const zahl = (w, std) => (w === undefined ? std : typeof w === 'number' && Number.isFinite(w) ? w : null);
+
+/**
+ * Prüft die Anfrage der App und behält nur bekannte Felder:
+ * { profil: { protein, ohne, allergene, kochzeit, personen }, anzahl (1–4), mahlzeit, vermeiden } | null.
+ */
+export function pruefeKiBody(json) {
+  if (!istObjekt(json) || !istObjekt(json.profil) || !Array.isArray(json.profil.protein)) return null;
+  const p = json.profil;
+  const protein = KI_PROTEINE.filter((id) => p.protein.includes(id));
+  const allergene = p.allergene === undefined ? [] : p.allergene;
+  const ohne = textListe(p.ohne, 20, 40);
+  const vermeiden = textListe(json.vermeiden, 30, 80);
+  const personen = zahl(p.personen, 2);
+  const anzahl = zahl(json.anzahl, 2);
+  const mahlzeit = json.mahlzeit ?? 'haupt';
+  if (!protein.length || !Array.isArray(allergene) || !ohne || !vermeiden || personen === null || anzahl === null
+    || !['haupt', 'frueh'].includes(mahlzeit)) return null;
+  return {
+    profil: {
+      protein,
+      ohne,
+      allergene: Object.keys(KI_ALLERGENE).filter((id) => allergene.includes(id)),
+      kochzeit: typeof p.kochzeit === 'string' && Object.hasOwn(KI_KOCHZEIT, p.kochzeit) ? p.kochzeit : 'normal',
+      personen: klemme(personen, 1, 12),
+    },
+    anzahl: klemme(anzahl, 1, 4),
+    mahlzeit,
+    vermeiden,
+  };
+}
+
+const KI_SYSTEM = [
+  'Du bist eine erfahrene Hobbyköchin bzw. ein erfahrener Hobbykoch und schreibst eigene, alltagstaugliche '
+    + 'deutsche Rezepte. Alle Zutaten gibt es im Discounter (Aldi, Lidl); keine Marken, keine Spezialzutaten.',
+  'Die Mengen passen genau zu servings. Jede Zutat ist ein eigener Eintrag, Menge zuerst, Einheiten wie g, kg, ml, l, '
+    + 'EL, TL, Prise, Bund, Dose, Pck., Zehe, Scheibe, Becher; Stückzahlen ohne Einheit („2 Zwiebeln“), Dosen so: '
+    + '„1 Dose gehackte Tomaten (400 g)“. Salz, Pfeffer und Öl zum Braten dürfen ohne Menge stehen.',
+  '3 bis 8 kurze Schritte in eigenen Worten als Aufforderung („Zwiebel würfeln.“), Garzeiten immer ausgeschrieben '
+    + 'wie „10 Minuten“. Keine Nährwert- oder Gesundheitsversprechen. totalMin = gesamte Zeit in Minuten.',
+  'protein nennt die Hauptzutaten: schwein, rind, gefluegel, fisch (auch Meeresfrüchte); ohne Fleisch und Fisch '
+    + 'vegetarisch, ganz ohne tierische Produkte (auch ohne Milch, Butter, Sahne, Käse, Joghurt, Quark, Ei, Honig) '
+    + 'vegan. Schinken, Speck, Salami und Wurst zählen als schwein, gemischtes Hackfleisch als rind und schwein.',
+  'Halte die Ernährungsvorgaben strikt ein. Vegetarisch heißt auch: keine Gelatine, keine Fleisch- oder '
+    + 'Hühnerbrühe (nimm Gemüsebrühe), keine Fisch-, Austern- oder Worcestersauce.',
+  'Antworte nur mit JSON nach dem vorgegebenen Schema, ohne weiteren Text.',
+].join('\n');
+
+/** Nachrichten an das Modell für eine geprüfte Anfrage (siehe pruefeKiBody). */
+export function kiPrompt(body) {
+  const { profil, anzahl, mahlzeit, vermeiden } = body;
+  const frueh = mahlzeit === 'frueh';
+  const art = frueh ? (anzahl === 1 ? 'Frühstücksidee' : 'Frühstücksideen') : (anzahl === 1 ? 'Hauptgericht' : 'Hauptgerichte');
+  const fleisch = profil.protein.filter((id) => KI_FLEISCH[id]);
+  const veg = profil.protein.includes('vegetarisch');
+  let ernaehrung;
+  if (!fleisch.length) {
+    ernaehrung = veg ? 'Nur vegetarische Gerichte (vegan ist auch gut), ohne Fleisch und Fisch.' : 'Nur vegane Gerichte.';
+  } else {
+    const ohneFleisch = veg ? ', oder vegetarisch' : profil.protein.includes('vegan') ? ', oder vegan' : '';
+    const verboten = Object.keys(KI_FLEISCH).filter((id) => !fleisch.includes(id)).map((id) => KI_FLEISCH[id]);
+    ernaehrung = `Erlaubt als Hauptzutat: ${fleisch.map((id) => KI_FLEISCH[id]).join(', ')}${ohneFleisch}.`
+      + (ohneFleisch ? '' : ' Jedes Gericht enthält eine davon.')
+      + (verboten.length ? ` Nicht verwenden: ${verboten.join(', ')}${fleisch.includes('schwein') ? '' : ' (auch kein Speck, Schinken oder Wurst)'}.` : '');
+  }
+  const minuten = KI_KOCHZEIT[profil.kochzeit]?.[frueh ? 1 : 0];
+  const zeilen = [
+    `Bitte ${anzahl} ${art} für ${profil.personen} ${profil.personen === 1 ? 'Person' : 'Personen'} `
+      + `(servings ${profil.personen}, mahlzeit "${mahlzeit}").`,
+    ernaehrung,
+    minuten ? `Höchstens ${minuten} Minuten Gesamtzeit.` : '',
+    profil.allergene.length ? `Frei von: ${profil.allergene.map((id) => KI_ALLERGENE[id]).join('; ')}.` : '',
+    profil.ohne.length ? `Diese Zutaten bitte nicht verwenden: ${profil.ohne.join(', ')}.` : '',
+    'Gern günstig und abwechslungsreich (verschiedene Küchen und Beilagen).',
+    vermeiden.length ? `Diese Gerichte gibt es schon, bitte etwas anderes: ${vermeiden.join('; ')}.` : '',
+  ];
+  return [{ role: 'system', content: KI_SYSTEM }, { role: 'user', content: zeilen.filter(Boolean).join('\n') }];
+}
+
+/** Antwort von env.AI.run → Liste der Rezepte (roh) oder null, wenn kein passendes JSON darin steht. */
+export function leseKiAntwort(ergebnis) {
+  let inhalt = ergebnis?.response ?? ergebnis?.choices?.[0]?.message?.content ?? ergebnis;
+  if (typeof inhalt === 'string') {
+    const s = inhalt.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    try {
+      inhalt = JSON.parse(s);
+    } catch {
+      const [a, b] = [s.indexOf('{'), s.lastIndexOf('}')];
+      try { inhalt = a >= 0 && b > a ? JSON.parse(s.slice(a, b + 1)) : null; } catch { inhalt = null; }
+    }
+  }
+  const liste = Array.isArray(inhalt) ? inhalt : inhalt?.rezepte;
+  return Array.isArray(liste) ? liste : null;
+}
+
+// Modell passt nicht: unbekannt, nur im Bezahlplan, Bedingungen nicht bestätigt, Limit zu klein, Funktion fehlt
+const KI_MODELL_FEHLER_RE = new RegExp(['\\b(?:5007|3042|5035|5016|5018|3041)\\b', 'no such model', 'model (?:name )?is invalid',
+  'invalid model', 'paid plan', 'model terms', 'access this model', 'model limit', 'context (?:window|length)',
+  'max_(?:completion_)?tokens', 'not supported', 'unsupported'].join('|'), 'i');
+
+/**
+ * Fehler von env.AI.run → { status, fehler } für die App (Codes laut developers.cloudflare.com/workers-ai/platform/errors):
+ * 'limit' = Tageskontingent aufgebraucht (3036, früher 4006), 'beschaeftigt' = kurz ausgelastet (3040, Ratenlimit),
+ * 'ki-modell' = Modell passt nicht (unbekannt, nur im Bezahlplan, zu kleines Limit), 'ki-format' = kein JSON, sonst 'ki'.
+ */
+export function kiFehlerKennung(fehler) {
+  const text = `${fehler?.message ?? fehler} ${fehler?.code ?? ''}`;
+  if (/\b(?:3036|4006)\b|\bneurons?\b|daily|free allocation/i.test(text)) return { status: 429, fehler: 'limit' };
+  if (/\b3040\b|capacity|rate.?limit|too many requests/i.test(text)) return { status: 429, fehler: 'beschaeftigt' };
+  if (KI_MODELL_FEHLER_RE.test(text)) return { status: 502, fehler: 'ki-modell' };
+  if (/json/i.test(text)) return { status: 502, fehler: 'ki-format' };   // „JSON Mode couldn't be met“
+  return { status: 502, fehler: 'ki' };
+}
+
+// Nur die Felder des Schemas, Größe begrenzt; genau geprüft wird in der App (js/ki.js)
+function kuerzeKiRezepte(liste, anzahl) {
+  const felder = Object.keys(KI_SCHEMA.properties.rezepte.items.properties);
+  const kurz = (x) => (typeof x === 'string' ? x.slice(0, 600) : x);
+  return liste.filter(istObjekt).slice(0, anzahl).map((r) => Object.fromEntries(felder.filter((k) => k in r)
+    .map((k) => [k, Array.isArray(r[k]) ? r[k].slice(0, 40).map(kurz) : kurz(r[k])])));
+}
+
+async function kiRezepte(request, env) {
+  if (!env?.AI) throw new DienstFehler(501, { fehler: 'ki-fehlt' });
+  if (!/json/i.test(request.headers.get('Content-Type') || '')) throw new DienstFehler(415, { fehler: 'kein-json' });
+  if (Number(request.headers.get('Content-Length')) > MAX_KI_BODY) throw new DienstFehler(413, { fehler: 'zu-gross' });
+  let json;
+  const roh = request.body ? await leseAlles(request.body, MAX_KI_BODY) : new Uint8Array(0);
+  try { json = JSON.parse(new TextDecoder().decode(roh)); } catch { json = null; }
+  const body = pruefeKiBody(json);
+  if (!body) throw new DienstFehler(400, { fehler: 'ungueltig' });
+  let ergebnis;
+  try {
+    ergebnis = await env.AI.run(env.KI_MODELL || KI_MODELL, {
+      messages: kiPrompt(body),
+      response_format: { type: 'json_schema', json_schema: { name: 'rezepte', schema: KI_SCHEMA, strict: true } },
+      max_completion_tokens: KI_TOKENS_JE_REZEPT * body.anzahl,
+      chat_template_kwargs: { enable_thinking: false },
+    });
+  } catch (e) {
+    // Rohe Fehlertexte gehen nie an die App, nur die Kennung
+    const { status, fehler } = kiFehlerKennung(e);
+    throw new DienstFehler(status, { fehler });
+  }
+  const liste = leseKiAntwort(ergebnis);
+  if (!liste) throw new DienstFehler(502, { fehler: 'ki-format' });
+  return { rezepte: kuerzeKiRezepte(liste, body.anzahl) };
+}
+
 // ---------------------------------------------------------------- Antworten
 
 function antwortJson(daten, status, origin = null, extra = {}) {
@@ -304,8 +527,10 @@ export default {
       if (!erlaubt) return antwortJson({ fehler: 'origin' }, 403);
       return new Response(null, { status: 204, headers: corsHeaders(erlaubt) });
     }
-    if (request.method !== 'GET') {
-      return antwortJson({ fehler: 'methode' }, 405, erlaubt, { Allow: 'GET, OPTIONS' });
+    const parameter = new URL(request.url).searchParams;
+    const ki = parameter.get('aktion') === 'ki-rezepte';      // nur KI-Ideen per POST, sonst nur GET
+    if (request.method !== (ki ? 'POST' : 'GET')) {
+      return antwortJson({ fehler: 'methode' }, 405, erlaubt, { Allow: ki ? 'POST, OPTIONS' : 'GET, OPTIONS' });
     }
     if (!erlaubt) {
       // Die Absage selbst darf jede Seite lesen (sie verrät nichts): so kann die App den Grund anzeigen
@@ -315,8 +540,16 @@ export default {
         meldung: 'Der Import-Dienst läuft, antwortet aber nur der App „Einkauf & Koch“.',
       }, 403, null, { 'Access-Control-Allow-Origin': '*' });
     }
-    const parameter = new URL(request.url).searchParams;
-    if (parameter.get('ping') === '1') return antwortJson({ ok: true, version: VERSION }, 200, erlaubt);
+    if (ki) {
+      try {
+        return antwortJson(await kiRezepte(request, env), 200, erlaubt);
+      } catch (e) {
+        return e instanceof DienstFehler ? antwortJson(e.daten, e.status, erlaubt) : antwortJson({ fehler: 'ki' }, 502, erlaubt);
+      }
+    }
+    if (parameter.get('ping') === '1') {
+      return antwortJson({ ok: true, version: VERSION, ki: Boolean(env?.AI) }, 200, erlaubt);
+    }
     const p = pruefe(parameter.get('url') ?? '');
     if (!p.url) return antwortJson({ fehler: p.fehler }, 400, erlaubt);
 
