@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Einkauf &amp; Koch">
+  <rect width="512" height="512" rx="112" fill="#2e7d32"/>
+  <g fill="none" stroke="#ffffff" stroke-width="18" stroke-linecap="round">
+    <path d="M200 162c-16-18 16-34 0-54"/>
+    <path d="M256 162c-16-18 16-34 0-54"/>
+    <path d="M312 162c-16-18 16-34 0-54"/>
+  </g>
+  <rect x="236" y="182" width="40" height="28" rx="12" fill="#ffffff"/>
+  <rect x="92" y="206" width="328" height="38" rx="19" fill="#ffffff"/>
+  <rect x="62" y="262" width="58" height="28" rx="14" fill="#ffffff"/>
+  <rect x="392" y="262" width="58" height="28" rx="14" fill="#ffffff"/>
+  <path d="M118 252h276v108c0 30-24 54-54 54H172c-30 0-54-24-54-54z" fill="#ffffff"/>
+  <path d="M206 330l34 34 70-70" fill="none" stroke="#2e7d32" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,622 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { parseZeile, parseZeilen, zutatSchluessel } from '../js/zutaten.js';
+import {
+  ABTEILUNGEN, sortierteAbteilungen, abteilungVon, kanonischerSchluessel, standardZeitraum,
+  planEintraegeFuerRunde, berechneListe, abhakZustand, listeAlsText, postenSchluessel, abteilungEintrag,
+  vorratEintraegeFuer, geplantePortionen, offeneRundenVereinen,
+} from '../js/einkaufsliste.js';
+
+// Abteilung direkt aus einem Zutatennamen (wie in der App: erst Schlüssel, dann Abteilung)
+const ab = (name, aliase, einheiten) => abteilungVon(zutatSchluessel(parseZeile(name).name), aliase, einheiten);
+
+test('ABTEILUNGEN: 22 Abteilungen in Standard-Reihenfolge, sonstiges zuletzt', () => {
+  assert.equal(ABTEILUNGEN.length, 22);
+  assert.deepEqual(ABTEILUNGEN.slice(0, 3), [
+    { id: 'obst-gemuese', name: 'Obst & Gemüse' }, { id: 'brot', name: 'Brot & Backwaren' },
+    { id: 'fleisch', name: 'Fleisch & Wurst' }]);
+  assert.deepEqual(ABTEILUNGEN.map((a) => a.id), ['obst-gemuese', 'brot', 'fleisch', 'fisch', 'molkerei', 'kaese',
+    'kuehl', 'tk', 'nudeln-reis', 'backen', 'gewuerze', 'oel-essig', 'saucen', 'konserven', 'nuesse', 'fruehstueck',
+    'suesses', 'getraenke', 'alkohol', 'international', 'haushalt', 'sonstiges']);
+  assert.equal(ABTEILUNGEN.find((a) => a.id === 'molkerei').name, 'Milch, Butter & Eier');
+});
+
+test('sortierteAbteilungen: eigene Reihenfolge, Unbekanntes ignoriert, Fehlendes hinten', () => {
+  assert.deepEqual(sortierteAbteilungen(null), ABTEILUNGEN);
+  assert.deepEqual(sortierteAbteilungen(undefined), ABTEILUNGEN);
+  const s = sortierteAbteilungen(['tk', 'gibt-es-nicht', 'brot', 'tk']).map((a) => a.id);
+  assert.deepEqual(s.slice(0, 4), ['tk', 'brot', 'obst-gemuese', 'fleisch']);
+  assert.equal(s.length, 22);
+  assert.equal(new Set(s).size, 22);
+  assert.equal(s.at(-1), 'sonstiges');
+});
+
+test('abteilungVon: Pflichtfälle aus der Spezifikation', () => {
+  const faelle = { '400 g Kirschtomaten': 'obst-gemuese', '2 EL Tomatenmark': 'saucen', '200 g Reis': 'nudeln-reis',
+    '3 Eier': 'molkerei', '1 Ei': 'molkerei', '300 g TK-Erbsen': 'tk', '300 g Erbsen (TK)': 'tk',
+    '500 ml passierte Tomaten': 'konserven', '2 Zwiebeln': 'obst-gemuese', '200 ml Sahne': 'molkerei' };
+  for (const [zeile, erwartet] of Object.entries(faelle)) assert.equal(ab(zeile), erwartet, zeile);
+});
+
+test('abteilungVon: Komposita, Wortgrenzen und Doppeldeutigkeiten', () => {
+  const faelle = {
+    'Rinderhackfleisch': 'fleisch', 'Schlagsahne': 'molkerei', 'Kokosmilch': 'konserven', 'Mais': 'konserven',
+    'Maismehl': 'backen', 'Maiskolben': 'obst-gemuese', 'Milchreis': 'nudeln-reis', 'Basmatireis': 'nudeln-reis',
+    'Reisessig': 'oel-essig', 'Preiselbeeren': 'obst-gemuese', 'Salbei': 'obst-gemuese', 'Eis': 'tk',
+    'Vanilleeis': 'tk', 'Koriander': 'obst-gemuese', 'gemahlener Koriander': 'gewuerze', 'Koriandersamen': 'gewuerze',
+    'Lachsfilet': 'fisch', 'Wildlachsfilet': 'fisch', 'Hähnchenbrustfilet': 'fleisch', 'Schweinefleisch': 'fleisch',
+    'Schweinebauch': 'fleisch', 'Weißwein': 'alkohol', 'Weißweinessig': 'oel-essig', 'Olivenöl': 'oel-essig',
+    'Paprika': 'obst-gemuese', 'Paprikapulver': 'gewuerze', 'Paprika edelsüß': 'gewuerze',
+    'Zwiebelpulver': 'gewuerze', 'Gemüsebrühe': 'saucen', 'Muskatnuss': 'gewuerze', 'Erdnussbutter': 'fruehstueck',
+    'Butterkekse': 'suesses', 'Butterschmalz': 'molkerei', 'Zitronensaft': 'obst-gemuese',
+    'Orangensaft': 'getraenke', 'Zuckerschoten': 'obst-gemuese', 'Kartoffelstärke': 'backen',
+    'Leberkäse': 'fleisch', 'Frischkäse': 'kaese', 'Gewürzgurken': 'konserven', 'Thunfisch': 'konserven',
+    'Kürbiskerne': 'nuesse', 'Hokkaido-Kürbis': 'obst-gemuese', 'Backpapier': 'haushalt',
+    'Reispapier': 'international', 'Röstzwiebeln': 'konserven', 'Mandeldrink': 'molkerei',
+    'Erdnuss Sauce': 'saucen', 'Kartoffeln, festkochend': 'obst-gemuese', 'Zwiebelchen': 'obst-gemuese',
+  };
+  for (const [name, erwartet] of Object.entries(faelle)) assert.equal(ab(name), erwartet, name);
+});
+
+test('abteilungVon: Zusätze getrocknet / gemahlen / Dose / in Öl', () => {
+  assert.equal(ab('getrockneter Oregano'), 'gewuerze');
+  assert.equal(ab('getrocknete Petersilie'), 'gewuerze');
+  assert.equal(ab('getrocknete Aprikosen'), 'nuesse');
+  assert.equal(ab('getrocknete Tomaten'), 'konserven');
+  assert.equal(ab('getrocknete Tomaten in Öl'), 'konserven');
+  assert.equal(ab('Thunfisch in Öl'), 'konserven');
+  assert.equal(ab('gemahlene Mandeln'), 'backen');
+  assert.equal(ab('Mandeln'), 'nuesse');
+  assert.equal(ab('Tomaten aus der Dose'), 'konserven');
+  assert.equal(ab('Dosentomaten'), 'konserven');
+  assert.equal(ab('tiefgekühlte Himbeeren'), 'tk');
+  assert.equal(ab('Mineralwasser mit Kohlensäure'), 'getraenke');
+  // Einheiten-Hinweis: Gemüse aus Dose oder Glas steht bei den Konserven
+  assert.equal(ab('Tomaten'), 'obst-gemuese');
+  assert.equal(ab('Tomaten', {}, ['Dose']), 'konserven');
+  assert.equal(ab('Tomaten', {}, ['Dose', 'Stück']), 'obst-gemuese');
+  assert.equal(ab('Rote Bete', {}, ['Glas']), 'konserven');
+  assert.equal(ab('Bier', {}, ['Dose']), 'alkohol');
+});
+
+test('abteilungVon: Unbekanntes → sonstiges, Korrekturen haben Vorrang', () => {
+  assert.equal(abteilungVon('xyzabc'), 'sonstiges');
+  assert.equal(abteilungVon(''), 'sonstiges');
+  assert.equal(abteilungVon(null), 'sonstiges');
+  assert.equal(abteilungVon('tofu', { tofu: { id: 'tofu', section: 'international', kanonisch: null } }), 'international');
+  assert.equal(abteilungVon('tofu', new Map([['tofu', { section: 'tk' }]])), 'tk');
+  // ungültige oder gelöschte Korrektur zählt nicht
+  assert.equal(abteilungVon('tofu', { tofu: { section: 'gibt-es-nicht' } }), 'kuehl');
+  assert.equal(abteilungVon('tofu', { tofu: { section: 'tk', deleted: true } }), 'kuehl');
+  // geerbte Objekt-Eigenschaften sind keine Korrekturen
+  assert.equal(abteilungVon('constructor', {}), 'sonstiges');
+});
+
+test('kanonischerSchluessel: Ketten, Kreise, höchstens 5 Schritte', () => {
+  const aliase = {
+    möhre: { kanonisch: 'karotte' }, karotte: { kanonisch: 'mohrrübe' },
+    a: { kanonisch: 'b' }, b: { kanonisch: 'a' }, selbst: { kanonisch: 'selbst' },
+    weg: { kanonisch: 'ziel', deleted: true },
+  };
+  assert.equal(kanonischerSchluessel('möhre', aliase), 'mohrrübe');
+  assert.equal(kanonischerSchluessel('karotte', aliase), 'mohrrübe');
+  assert.equal(kanonischerSchluessel('mohrrübe', aliase), 'mohrrübe');
+  assert.equal(kanonischerSchluessel('a', aliase), 'a');
+  assert.equal(kanonischerSchluessel('b', aliase), 'a');
+  assert.equal(kanonischerSchluessel('selbst', aliase), 'selbst');
+  assert.equal(kanonischerSchluessel('weg', aliase), 'weg');
+  assert.equal(kanonischerSchluessel('x', undefined), 'x');
+  const lang = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, { kanonisch: `k${i + 1}` }]));
+  assert.equal(kanonischerSchluessel('k0', lang), 'k5');
+});
+
+test('standardZeitraum: Woche, nächste Woche, 7 Tage, Wochenstart', () => {
+  // 15.10.2026 ist ein Donnerstag
+  assert.deepEqual(standardZeitraum('diese-woche', '2026-10-15', 1), { von: '2026-10-12', bis: '2026-10-18' });
+  assert.deepEqual(standardZeitraum('naechste-woche', '2026-10-15', 1), { von: '2026-10-19', bis: '2026-10-25' });
+  assert.deepEqual(standardZeitraum('sieben-tage', '2026-10-15', 1), { von: '2026-10-15', bis: '2026-10-21' });
+  assert.deepEqual(standardZeitraum('diese-woche', '2026-10-15', 0), { von: '2026-10-11', bis: '2026-10-17' });
+  assert.deepEqual(standardZeitraum('diese-woche', '2026-10-15', 6), { von: '2026-10-10', bis: '2026-10-16' });
+  assert.deepEqual(standardZeitraum('diese-woche', '2026-10-15', null), { von: '2026-10-12', bis: '2026-10-18' });
+  assert.deepEqual(standardZeitraum('unbekannt', '2026-10-12'), { von: '2026-10-12', bis: '2026-10-18' });
+  // Zeitumstellung (25.10.2026) und Jahreswechsel
+  assert.deepEqual(standardZeitraum('naechste-woche', '2026-10-21', 1), { von: '2026-10-26', bis: '2026-11-01' });
+  assert.deepEqual(standardZeitraum('diese-woche', '2026-12-31', 1), { von: '2026-12-28', bis: '2027-01-03' });
+  assert.deepEqual(standardZeitraum('sieben-tage', '2027-03-26', 1), { von: '2027-03-26', bis: '2027-04-01' });
+});
+
+const RUNDE = { id: 't2', from: '2026-10-19', to: '2026-10-25', closedAt: null };
+
+test('planEintraegeFuerRunde: Zeitraum inklusive, gelöscht und andere Runden raus', () => {
+  const plan = [
+    { id: 'e1', date: '2026-10-19', slot: 'abend', tripId: null },
+    { id: 'e2', date: '2026-10-25', slot: 'mittag', tripId: 't2' },
+    { id: 'e3', date: '2026-10-21', slot: 'abend', tripId: 't1' }, // abgeschlossene Runde
+    { id: 'e4', date: '2026-10-26', slot: 'abend', tripId: null },
+    { id: 'e5', date: '2026-10-18', slot: 'abend', tripId: null },
+    { id: 'e6', date: '2026-10-22', slot: 'abend', tripId: null, deleted: true },
+    { id: 'e7', date: '2026-10-19', slot: 'frueh' },
+    { id: 'e8', date: 'kaputt', slot: 'abend', tripId: null },
+  ];
+  assert.deepEqual(planEintraegeFuerRunde(plan, RUNDE).map((e) => e.id), ['e7', 'e1', 'e2']);
+  assert.deepEqual(planEintraegeFuerRunde(plan, { ...RUNDE, id: 't1' }).map((e) => e.id), ['e7', 'e1', 'e3']);
+  assert.deepEqual(planEintraegeFuerRunde(plan, null), []);
+  assert.deepEqual(planEintraegeFuerRunde(null, RUNDE), []);
+  // vertauschter Zeitraum
+  assert.deepEqual(planEintraegeFuerRunde(plan, { ...RUNDE, from: '2026-10-25', to: '2026-10-19' }).length, 3);
+});
+
+// ---------------------------------------------------------------- Testdaten für die Liste
+
+const kopf = parseZeile('Für die Soße:'); // importierte Gruppen-Überschrift als Zutat
+const GULASCH = {
+  id: 'r-gulasch', title: 'Gulasch', servings: 2,
+  ingredients: [kopf, ...parseZeilen('500 g Rindergulasch\n2 Zwiebeln\n1 EL Tomatenmark\n1 Prise Salz\n' +
+    'etwas Petersilie\n200 ml Rotwein\n1 Prise Zucker\n1-2 Knoblauchzehen')],
+};
+const SUPPE = {
+  id: 'r-suppe', title: 'Tomatensuppe', servings: 4,
+  ingredients: parseZeilen('Suppe:\n1 Zwiebel\n2 EL Tomatenmark\n1 kg Tomaten\n0,5 l Gemüsebrühe\n' +
+    '100 g Zucker\nSalz und Pfeffer\n1 Knoblauchzehe'),
+};
+const OHNE_PORTIONEN = { id: 'r-ohne', title: 'Brot', servings: null, ingredients: parseZeilen('500 g Mehl') };
+const PLAN = [
+  { id: 'e1', date: '2026-10-19', slot: 'abend', recipeId: 'r-gulasch', servings: 4, tripId: null },
+  { id: 'e2', date: '2026-10-20', slot: 'abend', recipeId: 'r-suppe', servings: 2, tripId: null },
+  { id: 'e3', date: '2026-10-21', slot: 'abend', recipeId: 'r-gulasch', servings: 4, tripId: 't1' },
+  { id: 'e4', date: '2026-10-27', slot: 'abend', recipeId: 'r-suppe', servings: 4, tripId: null },
+  { id: 'e5', date: '2026-10-22', slot: 'abend', recipeId: 'r-suppe', servings: 4, tripId: null, deleted: true },
+  { id: 'e6', date: '2026-10-23', slot: 'abend', recipeId: null, title: 'Pizza essen', servings: 2, tripId: null },
+  { id: 'e7', date: '2026-10-24', slot: 'abend', recipeId: 'r-geloescht', servings: 2, tripId: null },
+];
+const VORRAT = ['salz', 'pfeffer', 'wasser'];
+const alleZeilen = (l) => [...l.abteilungen.flatMap((a) => a.zeilen), ...l.erledigt, ...l.vorrat];
+const zeile = (l, key) => alleZeilen(l).find((z) => z.mergeKey === key);
+const liste = (extra = {}) => berechneListe({
+  planEintraege: PLAN, rezepte: [GULASCH, SUPPE], manuelle: [], zustaende: [], aliase: {}, vorrat: VORRAT,
+  runde: RUNDE, reihenfolge: null, ...extra,
+});
+
+test('berechneListe: zwei Rezepte skaliert und zusammengefasst', () => {
+  const l = liste();
+  assert.deepEqual(l.eintraege.map((e) => e.id), ['e1', 'e2', 'e6', 'e7']);
+  // Gulasch ×2, Suppe ×0,5
+  const zwiebel = zeile(l, 'zwiebel');
+  assert.deepEqual(zwiebel.teile, [{ qty: 4.5, qty2: null, unit: 'Stück' }]);
+  assert.equal(zwiebel.text, '4½');
+  assert.equal(zwiebel.abteilung, 'obst-gemuese');
+  assert.deepEqual(zwiebel.quellen, [
+    { planEntryId: 'e1', recipeId: 'r-gulasch', titel: 'Gulasch', datum: '2026-10-19' },
+    { planEntryId: 'e2', recipeId: 'r-suppe', titel: 'Tomatensuppe', datum: '2026-10-20' }]);
+  assert.equal(zeile(l, 'rindergulasch').text, '1 kg');
+  assert.equal(zeile(l, 'rindergulasch').abteilung, 'fleisch');
+  // 2 EL + 1 EL = 9 TL → '3 EL'
+  assert.equal(zeile(l, 'tomatenmark').text, '3 EL');
+  assert.equal(zeile(l, 'tomatenmark').abteilung, 'saucen');
+  assert.equal(zeile(l, 'gemüsebrühe').text, '250 ml');
+  assert.equal(zeile(l, 'tomate').text, '500 g');
+  assert.equal(zeile(l, 'rotwein').abteilung, 'alkohol');
+  // Spanne: (1–2) × 2 + 1 × 0,5 → 2,5–4,5
+  assert.deepEqual(zeile(l, 'knoblauchzehe').teile, [{ qty: 2.5, qty2: 4.5, unit: 'Stück' }]);
+  assert.equal(zeile(l, 'knoblauchzehe').text, '2½–4½');
+  // Gruppen-Überschrift ist keine Zutat
+  assert.equal(alleZeilen(l).some((z) => /soße/i.test(z.mergeKey)), false);
+  // jede Zeile ist vollständig
+  for (const z of alleZeilen(l)) {
+    assert.equal(typeof z.text, 'string');
+    assert.equal(z.versteckt, false);
+    assert.equal(z.manuell, null);
+    assert.ok(ABTEILUNGEN.some((a) => a.id === z.abteilung), z.abteilung);
+  }
+});
+
+test('berechneListe: Prise/etwas sind vage, außer es gibt auch eine Menge', () => {
+  const l = liste();
+  const petersilie = zeile(l, 'petersilie');
+  assert.equal(petersilie.vage, true);
+  assert.deepEqual(petersilie.teile, []);
+  assert.equal(petersilie.text, '');
+  // 1 Prise Zucker (Gulasch) + 100 g × 0,5 (Suppe) → nur die Grammzahl zählt
+  const zucker = zeile(l, 'zucker');
+  assert.equal(zucker.vage, false);
+  assert.equal(zucker.text, '50 g');
+  assert.equal(zucker.quellen.length, 2);
+  // nur vage → vage
+  const nurPrise = berechneListe({ planEintraege: PLAN.slice(0, 1), rezepte: [GULASCH], runde: RUNDE });
+  assert.equal(zeile(nurPrise, 'zucker').vage, true);
+  assert.equal(zeile(nurPrise, 'zucker').text, '');
+});
+
+test('berechneListe: Vorrat, Zählung, Sortierung und Reihenfolge', () => {
+  const l = liste();
+  assert.deepEqual(l.vorrat.map((z) => z.mergeKey), ['salz', 'salz und pfeffer']);
+  assert.ok(l.vorrat.every((z) => z.imVorrat));
+  const offen = l.abteilungen.flatMap((a) => a.zeilen);
+  assert.equal(l.anzahlOffen, offen.length);
+  assert.equal(l.anzahlGesamt, offen.length);
+  assert.equal(offen.some((z) => z.imVorrat), false);
+  // Standard-Reihenfolge, leere Abteilungen fehlen, Namen alphabetisch
+  const ids = l.abteilungen.map((a) => a.id);
+  assert.deepEqual(ids, ['obst-gemuese', 'fleisch', 'backen', 'saucen', 'alkohol']);
+  const obst = l.abteilungen[0].zeilen.map((z) => z.name);
+  assert.deepEqual(obst, [...obst].sort((a, b) => a.localeCompare(b, 'de')));
+  const eigene = liste({ reihenfolge: ['alkohol', 'saucen'] }).abteilungen.map((a) => a.id);
+  assert.deepEqual(eigene, ['alkohol', 'saucen', 'obst-gemuese', 'fleisch', 'backen']);
+  // ohne Vorrat steht Salz in den Gewürzen
+  const ohne = liste({ vorrat: [] });
+  assert.equal(ohne.vorrat.length, 0);
+  assert.ok(ohne.abteilungen.find((a) => a.id === 'gewuerze').zeilen.some((z) => z.mergeKey === 'salz'));
+});
+
+test('berechneListe: Portionen fehlen → Faktor nach Spezifikation', () => {
+  const plan = [
+    { id: 'p1', date: '2026-10-19', slot: 'abend', recipeId: 'r-ohne', servings: 3, tripId: null },
+    { id: 'p2', date: '2026-10-20', slot: 'abend', recipeId: 'r-gulasch', servings: null, tripId: null },
+  ];
+  const l = berechneListe({ planEintraege: plan, rezepte: new Map([[GULASCH.id, GULASCH], [OHNE_PORTIONEN.id, OHNE_PORTIONEN]]), runde: RUNDE });
+  assert.equal(zeile(l, 'mehl').text, '1,5 kg'); // Rezept ohne Portionen = 1 → × 3
+  assert.equal(zeile(l, 'rindergulasch').text, '500 g'); // Eintrag ohne Portionen = Rezept
+});
+
+test('abteilungVon: Schlüssel mit Produkt-Zusatz', () => {
+  const faelle = { 'Tomate(n), passierte': 'konserven', 'stückige Tomaten': 'konserven', 'geschälte Tomaten': 'konserven',
+    'Tomaten, gehackt': 'konserven', 'getrocknete Tomaten': 'konserven', 'Thymian, getrockneter': 'gewuerze',
+    'Koriander, gemahlener': 'gewuerze', 'gemahlene Mandeln': 'backen', 'Mandeln, gemahlen': 'backen',
+    'geräuchertes Paprikapulver': 'gewuerze', 'Tomaten': 'obst-gemuese', 'Thymian': 'obst-gemuese', 'Mandeln': 'nuesse' };
+  for (const [name, erwartet] of Object.entries(faelle)) assert.equal(abteilungVon(zutatSchluessel(name)), erwartet, name);
+  assert.equal(abteilungVon('tomate, dose'), 'konserven');
+  assert.equal(abteilungVon('rote bete, glas'), 'konserven');
+  assert.equal(abteilungVon('erbse, dose'), 'konserven');
+});
+
+test('postenSchluessel: Notiz-Zusatz, Dose und Glas bei Frischware', () => {
+  const k = (zeile) => postenSchluessel(parseZeile(zeile));
+  assert.equal(k('500 g Tomate(n), passierte'), 'tomate, passiert');
+  assert.equal(k('1 TL Koriander (gemahlen)'), 'koriander, gemahlen');
+  assert.equal(k('2 Zwiebel(n), gewürfelt'), 'zwiebel');
+  assert.equal(k('3 Tomaten, geschält'), 'tomate'); // gezählt = frisch
+  // frisch aus Dose/Glas ist eine Konserve, Konserven bleiben beim Schlüssel
+  assert.equal(k('1 Dose Tomaten (400 g)'), 'tomate, dose');
+  assert.equal(k('400 g Tomaten (aus der Dose)'), 'tomate, dose');
+  assert.equal(k('400 g Tomaten aus der Dose'), 'tomate, dose');
+  assert.equal(k('200 g passierte Tomaten aus der Dose'), 'tomate, passiert');
+  assert.equal(k('1 Glas Kapern'), 'kaper');
+  assert.equal(k('1 Dose Erbsen'), 'erbse, dose');
+  assert.equal(k('1 Glas Rote Bete'), 'rote bete, glas');
+  assert.equal(k('1 Dose Kichererbsen'), 'kichererbse');
+  assert.equal(k('400 g gekochte Kichererbsen (Dose)'), 'gekochte kichererbse');
+  assert.equal(k('1 Dose Kokosmilch'), 'kokosmilch');
+  assert.equal(k('1 Dose stückige Tomaten'), 'tomate, stückig');
+  assert.equal(k('1 Glas Pesto'), 'pesto');
+  assert.equal(k('1 Dose Bier'), 'bier');
+  assert.equal(k('3 Tomaten'), 'tomate');
+  assert.equal(postenSchluessel(null), '');
+});
+
+test('berechneListe: Produkt-Zusätze trennen Frisches von Verarbeitetem', () => {
+  const r = { id: 'r-z', title: 'Z', servings: 1, ingredients: parseZeilen('500 g Tomate(n), passierte\n' +
+    '1 TL Thymian, getrockneter\n1 Dose Tomate(n), geschälte\n3 Tomaten\n2 Zweige Thymian\n200 g passierte Tomaten\n' +
+    '1 Dose Tomaten\n1 Zwiebel, gewürfelt\n1 gehackte Zwiebel\n2 Zwiebeln\n1 Bund frische Petersilie\n' +
+    '1 TL Koriander, gemahlener\n1 Bund Koriander\n100 g gemahlene Mandeln\n50 g Mandeln') };
+  const plan = [{ id: 'z1', date: '2026-10-19', slot: 'abend', recipeId: 'r-z', servings: 1, tripId: null }];
+  const l = berechneListe({ planEintraege: plan, rezepte: [r], runde: RUNDE });
+  const zeigen = (key) => { const z = zeile(l, key); return z && [z.name, z.text, z.abteilung]; };
+  assert.deepEqual(zeigen('tomate, passiert'), ['Tomaten, passierte', '700 g', 'konserven']);
+  assert.deepEqual(zeigen('tomate, geschält'), ['Tomate, geschälte', '1 Dose', 'konserven']);
+  assert.deepEqual(zeigen('tomate, dose'), ['Tomaten', '1 Dose', 'konserven']);
+  assert.deepEqual(zeigen('tomate'), ['Tomaten', '3', 'obst-gemuese']);
+  assert.deepEqual(zeigen('thymian, getrocknet'), ['Thymian, getrockneter', '1 TL', 'gewuerze']);
+  assert.deepEqual(zeigen('thymian'), ['Thymian', '2 Zweige', 'obst-gemuese']);
+  assert.deepEqual(zeigen('zwiebel'), ['Zwiebel', '4', 'obst-gemuese']);
+  assert.deepEqual(zeigen('petersilie'), ['frische Petersilie', '1 Bund', 'obst-gemuese']);
+  assert.deepEqual(zeigen('koriander, gemahlen'), ['Koriander, gemahlener', '1 TL', 'gewuerze']);
+  assert.deepEqual(zeigen('koriander'), ['Koriander', '1 Bund', 'obst-gemuese']);
+  assert.deepEqual(zeigen('mandel, gemahlen'), ['gemahlene Mandeln', '100 g', 'backen']);
+  assert.deepEqual(zeigen('mandel'), ['Mandeln', '50 g', 'nuesse']);
+  // TK aus der Notiz wird Teil des Namens
+  const r3 = { ...r, ingredients: parseZeilen('200 g Erbsen, TK') };
+  assert.equal(zeile(berechneListe({ planEintraege: plan, rezepte: [r3], runde: RUNDE }), 'tk-erbse').abteilung, 'tk');
+});
+
+test('berechneListe: eigene Einträge bleiben einzeln', () => {
+  const manuelle = [
+    { id: 'm1', kind: 'manual', name: 'Milch', qty: 1, qty2: null, unit: 'l', note: 'fettarm', section: null, checked: false },
+    { id: 'm2', kind: 'manual', name: 'Klopapier', qty: null, qty2: null, unit: null, note: null, section: null, checked: true },
+    { id: 'm3', kind: 'manual', name: 'Zwiebeln', qty: 2, qty2: null, unit: null, note: null, section: 'sonstiges', checked: false },
+    { id: 'm4', kind: 'manual', name: 'Brot', qty: 1, unit: null, section: null, checked: false, deleted: true },
+    { id: 'm5', kind: 'manual', name: 'Tomaten', qty: 1, unit: 'Dose', section: 'gibt-es-nicht', checked: false },
+  ];
+  const l = liste({ manuelle });
+  const milch = zeile(l, 'manuell:m1');
+  assert.equal(milch.text, '1 l');
+  assert.equal(milch.abteilung, 'molkerei');
+  assert.equal(milch.manuell, manuelle[0]);
+  assert.equal(milch.erledigt, false);
+  assert.deepEqual(milch.quellen, []);
+  assert.deepEqual(l.erledigt.map((z) => z.mergeKey), ['manuell:m2']);
+  assert.equal(zeile(l, 'manuell:m2').abteilung, 'haushalt');
+  assert.equal(zeile(l, 'manuell:m2').text, '');
+  // nicht mit der Rezept-Zeile 'zwiebel' zusammengeführt, eigene Abteilung gilt
+  assert.equal(zeile(l, 'manuell:m3').abteilung, 'sonstiges');
+  assert.equal(zeile(l, 'manuell:m3').text, '2');
+  assert.equal(zeile(l, 'zwiebel').text, '4½');
+  assert.equal(zeile(l, 'manuell:m4'), undefined);
+  assert.equal(zeile(l, 'manuell:m5').abteilung, 'konserven');
+  assert.equal(l.anzahlGesamt, l.anzahlOffen + 1);
+  // abteilungEintrag rechnet wie die Liste (Zusatz aus Notiz, Einheit, Korrektur)
+  for (const m of manuelle.filter((x) => !x.deleted)) assert.equal(abteilungEintrag(m), zeile(l, `manuell:${m.id}`).abteilung);
+  assert.equal(abteilungEintrag({ name: 'Tomaten', note: 'passiert' }), 'konserven');
+  assert.equal(abteilungEintrag({ name: 'Mandeln', qty: 100, unit: 'g', note: 'gemahlen' }), 'backen');
+  assert.equal(abteilungEintrag({ name: 'Tomaten', qty: 1, unit: 'Dose' }), 'konserven');
+  assert.equal(abteilungEintrag({ name: 'Milch' }, { milch: { section: 'getraenke' } }), 'getraenke');
+});
+
+test('berechneListe: Korrekturen – Abteilung und Zusammenführen', () => {
+  const aliase = {
+    knoblauchzehe: { id: 'knoblauchzehe', kanonisch: 'zwiebel', section: null },
+    rotwein: { id: 'rotwein', kanonisch: null, section: 'getraenke' },
+  };
+  const l = liste({ aliase });
+  assert.equal(zeile(l, 'knoblauchzehe'), undefined);
+  const z = zeile(l, 'zwiebel');
+  assert.deepEqual(z.teile, [{ qty: 7, qty2: 9, unit: 'Stück' }]);
+  assert.equal(zeile(l, 'rotwein').abteilung, 'getraenke');
+  // Vorrat folgt der Zusammenführung
+  const l2 = liste({ aliase: { salz: { kanonisch: 'meersalz' } }, vorrat: ['salz'] });
+  assert.ok(l2.vorrat.some((x) => x.mergeKey === 'meersalz'));
+});
+
+test('vorratEintraegeFuer: welche Einträge eine Zeile zum Vorrat machen', () => {
+  const vorrat = ['salz', 'pfeffer', 'Wasser', 'tomate, passiert'];
+  assert.deepEqual(vorratEintraegeFuer('salz', vorrat), ['salz']);
+  assert.deepEqual(vorratEintraegeFuer('wasser', vorrat), ['Wasser']);
+  assert.deepEqual(vorratEintraegeFuer('salz und pfeffer', vorrat), ['salz', 'pfeffer']);
+  assert.deepEqual(vorratEintraegeFuer('tomate, passiert', vorrat), ['tomate, passiert']);
+  assert.deepEqual(vorratEintraegeFuer('tomate', vorrat), []);
+  assert.deepEqual(vorratEintraegeFuer('meersalz', vorrat, { salz: { kanonisch: 'meersalz' } }), ['salz']);
+  assert.deepEqual(vorratEintraegeFuer('zucker', null), []);
+  // Zusatz mit Komma ist kein Paar: 'tomate, passiert' zählt nicht schon wegen 'tomate'
+  const r = { id: 'r', title: 'R', servings: 1, ingredients: parseZeilen('200 g passierte Tomaten') };
+  const plan = [{ id: 'p', date: '2026-10-19', slot: 'abend', recipeId: 'r', servings: 1, tripId: null }];
+  const l = berechneListe({ planEintraege: plan, rezepte: [r], runde: RUNDE, vorrat: ['tomate', 'passiert'] });
+  assert.equal(l.vorrat.length, 0);
+});
+
+// Abhak-Stand speichern wie die Ansicht (id = runde|mergeKey)
+const stand = (z, tripId = 't2') => ({ id: `${tripId}|${z.mergeKey}`, kind: 'state', tripId, mergeKey: z.mergeKey,
+  ...abhakZustand(z), versteckt: false });
+
+test('abhakZustand: aktuelle Mengen in Basis-Einheiten', () => {
+  const l = liste();
+  // eintraege: für welche Gerichte eingekauft wurde
+  assert.deepEqual(abhakZustand(zeile(l, 'tomatenmark')), { abgehakt: { TL: 9 }, erledigt: true, eintraege: ['e1', 'e2'] });
+  assert.deepEqual(abhakZustand(zeile(l, 'knoblauchzehe')), { abgehakt: { Stück: 4.5 }, erledigt: true, eintraege: ['e1', 'e2'] });
+  assert.deepEqual(abhakZustand(zeile(l, 'petersilie')), { abgehakt: {}, erledigt: true, eintraege: ['e1'] });
+  assert.deepEqual(abhakZustand({ teile: [{ qty: 1.5, qty2: null, unit: 'kg' }, { qty: 2, unit: 'EL' }] }),
+    { abgehakt: { g: 1500, TL: 6 }, erledigt: true, eintraege: null });
+  assert.deepEqual(abhakZustand(null), { abgehakt: {}, erledigt: true, eintraege: null });
+});
+
+test('berechneListe: Abhaken, nachträglich mehr → Rest', () => {
+  const vorher = liste();
+  const zustaende = ['zwiebel', 'rindergulasch', 'petersilie', 'tomatenmark']
+    .map((k) => stand(zeile(vorher, k)));
+  const l = liste({ zustaende });
+  assert.deepEqual(l.erledigt.map((z) => z.mergeKey).sort(), ['petersilie', 'rindergulasch', 'tomatenmark', 'zwiebel']);
+  assert.ok(l.erledigt.every((z) => z.erledigt && z.rest.length === 0 && z.restText === ''));
+  assert.equal(l.anzahlGesamt, vorher.anzahlGesamt);
+  assert.equal(l.anzahlOffen, vorher.anzahlOffen - 4);
+  // Gulasch-Portionen 4 → 6: Zwiebeln 6,5 statt 4,5 → noch 2
+  const mehr = PLAN.map((e) => (e.id === 'e1' ? { ...e, servings: 6 } : e));
+  const l2 = liste({ zustaende, planEintraege: mehr });
+  const z = zeile(l2, 'zwiebel');
+  assert.equal(z.erledigt, false);
+  assert.equal(z.text, '6½');
+  assert.deepEqual(z.rest, [{ qty: 2, qty2: null, unit: 'Stück' }]);
+  assert.equal(z.restText, '2');
+  assert.equal(zeile(l2, 'rindergulasch').restText, '500 g');
+  assert.equal(zeile(l2, 'tomatenmark').restText, '1 EL');
+  // vage abgehakt bleibt erledigt
+  assert.equal(zeile(l2, 'petersilie').erledigt, true);
+  // weniger als abgehakt → weiter erledigt
+  const weniger = PLAN.map((e) => (e.id === 'e1' ? { ...e, servings: 2 } : e));
+  assert.equal(zeile(liste({ zustaende, planEintraege: weniger }), 'zwiebel').erledigt, true);
+});
+
+test('berechneListe: Rest bei Spannen, neuer Einheit und Löffel ↔ ml', () => {
+  const vorher = liste();
+  const zustaende = [stand(zeile(vorher, 'knoblauchzehe'))]; // 4,5 Stück abgehakt
+  const plan = [...PLAN, { id: 'e9', date: '2026-10-21', slot: 'mittag', recipeId: 'r-gulasch', servings: 2, tripId: null }];
+  const z = zeile(liste({ zustaende, planEintraege: plan }), 'knoblauchzehe'); // jetzt 3,5–6,5
+  assert.equal(z.erledigt, false);
+  assert.deepEqual(z.rest, [{ qty: 2, qty2: null, unit: 'Stück' }]);
+  // neue Einheit (vorher nur Stück) kommt komplett als Rest
+  const rz = { teile: [{ qty: 2, qty2: null, unit: 'Stück' }] };
+  const neu = { id: 'r-n', title: 'N', servings: 1, ingredients: parseZeilen('2 Zwiebeln\n100 g Zwiebeln') };
+  const p = [{ id: 'n1', date: '2026-10-19', slot: 'abend', recipeId: 'r-n', servings: 1, tripId: null }];
+  const zs = [{ id: 't2|zwiebel', kind: 'state', tripId: 't2', mergeKey: 'zwiebel', ...abhakZustand(rz), versteckt: false }];
+  const zw = zeile(berechneListe({ planEintraege: p, rezepte: [neu], zustaende: zs, runde: RUNDE }), 'zwiebel');
+  assert.equal(zw.erledigt, false);
+  assert.equal(zw.restText, '100 g');
+  // 2 EL Öl abgehakt, dann kommen 100 ml dazu → Öl steht in ml, 30 ml sind schon da
+  const oel = { id: 'r-o', title: 'O', servings: 1, ingredients: parseZeilen('2 EL Olivenöl') };
+  const oel2 = { ...oel, ingredients: parseZeilen('2 EL Olivenöl\n100 ml Olivenöl') };
+  const po = [{ id: 'o1', date: '2026-10-19', slot: 'abend', recipeId: 'r-o', servings: 1, tripId: null }];
+  const so = [stand(zeile(berechneListe({ planEintraege: po, rezepte: [oel], runde: RUNDE }), 'olivenöl'))];
+  const o = zeile(berechneListe({ planEintraege: po, rezepte: [oel2], zustaende: so, runde: RUNDE }), 'olivenöl');
+  assert.equal(o.text, '130 ml');
+  assert.equal(o.restText, '100 ml');
+});
+
+test('berechneListe: Abhak-Stände anderer Runden, Ausblenden, Zurücknehmen', () => {
+  const vorher = liste();
+  const z = zeile(vorher, 'zwiebel');
+  // Stand einer anderen (abgeschlossenen) Runde zählt nicht
+  assert.equal(zeile(liste({ zustaende: [stand(z, 't1')] }), 'zwiebel').erledigt, false);
+  // zurückgenommen
+  const aus = { ...stand(z), erledigt: false, abgehakt: null };
+  const l = liste({ zustaende: [aus] });
+  assert.equal(zeile(l, 'zwiebel').erledigt, false);
+  assert.deepEqual(zeile(l, 'zwiebel').rest, zeile(l, 'zwiebel').teile);
+  assert.equal(zeile(l, 'zwiebel').restText, zeile(l, 'zwiebel').text);
+  // ausgeblendet: nirgends, nicht gezählt
+  const versteckt = liste({ zustaende: [{ ...aus, versteckt: true }] });
+  assert.equal(zeile(versteckt, 'zwiebel'), undefined);
+  assert.equal(versteckt.anzahlOffen, vorher.anzahlOffen - 1);
+  assert.equal(versteckt.anzahlGesamt, vorher.anzahlGesamt - 1);
+  assert.deepEqual(versteckt.ausgeblendet.map((x) => [x.mergeKey, x.versteckt]), [['zwiebel', true]]);
+  assert.deepEqual(vorher.ausgeblendet, []);
+  // alter Stand ohne Mengen: erledigt
+  assert.equal(zeile(liste({ zustaende: [{ ...aus, erledigt: true }] }), 'zwiebel').erledigt, true);
+});
+
+test('berechneListe: Runde filtert Einträge, leere Eingaben', () => {
+  // Einträge einer abgeschlossenen Runde (e3) fehlen; in Runde t1 sind sie dabei
+  const t1 = { id: 't1', from: '2026-10-19', to: '2026-10-25', closedAt: 1 };
+  assert.equal(zeile(liste({ runde: t1 }), 'rindergulasch').text, '2 kg'); // e1 + e3
+  assert.equal(zeile(liste(), 'rindergulasch').quellen.length, 1);
+  const leer = berechneListe();
+  assert.deepEqual(leer, { abteilungen: [], erledigt: [], vorrat: [], anzahlOffen: 0, anzahlGesamt: 0, eintraege: [],
+    ausgeblendet: [] });
+  const nurManuell = berechneListe({ manuelle: [{ id: 'm', kind: 'manual', name: 'Brot', qty: null, checked: false }] });
+  assert.equal(nurManuell.anzahlOffen, 1);
+  assert.equal(nurManuell.abteilungen[0].id, 'brot');
+});
+
+test('berechneListe: Haken gelten nur für die Gerichte von damals (Zeitraum gewechselt)', () => {
+  // Gulasch diese Woche abgehakt, Runde nicht abgeschlossen, dann auf nächste Woche (Bolognese) gewechselt
+  const gulasch = { id: 'r-g', title: 'Gulasch', servings: 4, ingredients: parseZeilen('500 g Rinderhack\n3 Zwiebeln\n200 ml Sahne\netwas Petersilie') };
+  const bolo = { id: 'r-b', title: 'Bolognese', servings: 4, ingredients: parseZeilen('500 g Rinderhack\n2 Zwiebeln\n1 Dose Tomaten\nPetersilie') };
+  const plan = [
+    { id: 'g1', date: '2026-10-14', slot: 'abend', recipeId: 'r-g', servings: 4, tripId: null },
+    { id: 'b1', date: '2026-10-21', slot: 'abend', recipeId: 'r-b', servings: 4, tripId: null },
+  ];
+  const woche1 = { id: 't9', from: '2026-10-12', to: '2026-10-18', closedAt: null };
+  const basis = { planEintraege: plan, rezepte: [gulasch, bolo] };
+  const vorher = berechneListe({ ...basis, runde: woche1 });
+  const zustaende = alleZeilen(vorher).map((z) => stand(z, 't9'));
+  assert.equal(berechneListe({ ...basis, runde: woche1, zustaende }).anzahlOffen, 0);
+  // gleiche Runde, anderer Zeitraum: nichts für Bolognese gekauft → alles offen
+  const woche2 = { ...woche1, from: '2026-10-19', to: '2026-10-25' };
+  const l = berechneListe({ ...basis, runde: woche2, zustaende });
+  assert.deepEqual(l.erledigt, []);
+  assert.equal(l.anzahlOffen, 4);
+  assert.equal(zeile(l, 'rinderhack').restText, '500 g');
+  assert.equal(zeile(l, 'zwiebel').restText, '2');
+  assert.equal(zeile(l, 'petersilie').erledigt, false); // vage, aber anderes Gericht
+  // zurück auf Woche 1: die Haken sind wieder da
+  assert.equal(berechneListe({ ...basis, runde: woche1, zustaende }).anzahlOffen, 0);
+  // beide Wochen im Zeitraum: Gulasch-Mengen sind gekauft, Bolognese fehlt noch
+  const beide = berechneListe({ ...basis, runde: { ...woche1, to: '2026-10-25' }, zustaende });
+  assert.equal(zeile(beide, 'zwiebel').text, '5');
+  assert.equal(zeile(beide, 'zwiebel').restText, '2');
+  assert.equal(zeile(beide, 'zwiebel').erledigt, false);
+  assert.equal(zeile(beide, 'rinderhack').restText, '500 g');
+  assert.equal(zeile(beide, 'sahne').erledigt, true);
+  // Gulasch-Portionen danach erhöht: nur der Zuwachs fehlt
+  const mehr = plan.map((e) => (e.id === 'g1' ? { ...e, servings: 8 } : e));
+  assert.equal(zeile(berechneListe({ ...basis, planEintraege: mehr, runde: woche1, zustaende }), 'zwiebel').restText, '3');
+  // in Woche 2 dieselbe Zutat abgehakt: der Haken für Woche 1 bleibt gültig
+  const zw2 = zeile(l, 'zwiebel');
+  const st2 = { ...stand(zw2, 't9'), ...abhakZustand(zw2, zustaende.find((x) => x.mergeKey === 'zwiebel')) };
+  assert.deepEqual([st2.abgehakt, st2.eintraege], [{ Stück: 5 }, ['b1', 'g1']]);
+  const mit2 = zustaende.map((x) => (x.mergeKey === 'zwiebel' ? st2 : x));
+  assert.equal(zeile(berechneListe({ ...basis, runde: woche1, zustaende: mit2 }), 'zwiebel').erledigt, true);
+  assert.equal(zeile(berechneListe({ ...basis, runde: woche2, zustaende: mit2 }), 'zwiebel').erledigt, true);
+  // gleiche Gerichte (z. B. mehr Portionen): der neue Stand ersetzt den alten
+  assert.deepEqual(abhakZustand(zeile(vorher, 'zwiebel'), zustaende.find((x) => x.mergeKey === 'zwiebel')).abgehakt, { Stück: 3 });
+  // alter Stand ohne eintraege: bisherige Regel (nur Mengen)
+  const alt = zustaende.map((z) => ({ ...z, eintraege: undefined }));
+  assert.equal(zeile(berechneListe({ ...basis, runde: woche2, zustaende: alt }), 'zwiebel').erledigt, true);
+});
+
+test('berechneListe: nach dem Einkauf mehr Portionen geplant → nur die Differenz', () => {
+  const r = { id: 'r-g', title: 'Gulasch', servings: 2, ingredients: parseZeilen('500 g Rindfleisch\n2 Zwiebeln') };
+  const e = { id: 'g', date: '2026-10-20', slot: 'abend', recipeId: 'r-g', servings: 6, tripId: 't1', eingekauftPortionen: 2 };
+  assert.deepEqual(planEintraegeFuerRunde([e], RUNDE).map((x) => x.id), ['g']);
+  const l = berechneListe({ planEintraege: [e], rezepte: [r], runde: RUNDE });
+  assert.equal(zeile(l, 'rindfleisch').text, '1 kg');
+  assert.equal(zeile(l, 'zwiebel').text, '4');
+  // in der eigenen Runde zählt alles
+  assert.equal(zeile(berechneListe({ planEintraege: [e], rezepte: [r], runde: { ...RUNDE, id: 't1' } }), 'zwiebel').text, '6');
+  // gleich viele oder weniger Portionen, oder alter Eintrag ohne eingekauftPortionen: nichts
+  for (const x of [{ ...e, servings: 2 }, { ...e, servings: 1 }, { ...e, eingekauftPortionen: undefined }, { ...e, servings: null }]) {
+    assert.deepEqual(planEintraegeFuerRunde([x], RUNDE), []);
+  }
+  assert.equal(geplantePortionen({ servings: 3 }, r), 3);
+  assert.equal(geplantePortionen({ servings: null }, r), 2);
+  assert.equal(geplantePortionen({}, { servings: null }), 1);
+});
+
+test('offeneRundenVereinen: älteste Runde bleibt, Haken wandern mit (je Posten der neuere)', () => {
+  const a = { id: 'ta', from: '2026-09-28', to: '2026-10-04', closedAt: null, createdAt: 100 };
+  const b = { id: 'tb', from: '2026-10-12', to: '2026-10-18', closedAt: null, createdAt: 200 };
+  const st = (trip, key, updatedAt, extra = {}) => ({ id: `${trip}|${key}`, kind: 'state', tripId: trip, mergeKey: key,
+    erledigt: true, abgehakt: {}, eintraege: ['x'], versteckt: false, updatedAt, ...extra });
+  const zustaende = [st('ta', 'zwiebel', 5), st('tb', 'zwiebel', 9, { abgehakt: { Stück: 2 } }), st('tb', 'mehl', 9),
+    st('ta', 'salz', 50), st('tb', 'salz', 10), st('tx', 'milch', 1)];
+  // Reihenfolge der Eingabe egal: auf jedem Gerät dasselbe Ergebnis
+  for (const offene of [[a, b], [b, a]]) {
+    const v = offeneRundenVereinen(offene, zustaende);
+    assert.equal(v.runde, a);
+    assert.deepEqual(v.entfernen, [{ ...b, deleted: true }]);
+    const kopien = v.zustaende.filter((x) => !x.deleted);
+    assert.deepEqual(kopien.map((x) => [x.id, x.tripId, x.abgehakt]).sort(), [
+      ['ta|mehl', 'ta', {}], ['ta|zwiebel', 'ta', { Stück: 2 }]]);
+    assert.deepEqual(v.zustaende.filter((x) => x.deleted).map((x) => x.id).sort(), ['tb|mehl', 'tb|salz', 'tb|zwiebel']);
+  }
+  // gleiche createdAt: kleinste id
+  assert.equal(offeneRundenVereinen([{ ...b, createdAt: 1 }, { ...a, createdAt: 1 }]).runde.id, 'ta');
+  assert.deepEqual(offeneRundenVereinen([]), { runde: null, entfernen: [], zustaende: [] });
+});
+
+test('postenSchluessel: Gewürz in Löffeln ist nicht das frische Gemüse', () => {
+  const a = { id: 'r-a', title: 'A', servings: 1, ingredients: parseZeilen('2 Paprika\n2 Zweige Thymian\n1 Chilischote\n1 TL Ingwer, gerieben') };
+  const b = { id: 'r-b', title: 'B', servings: 1,
+    ingredients: parseZeilen('1 TL Paprika, edelsüß\n1 TL Thymian\n1 TL Chili\n1 EL Paprika\n1 Prise Ingwer\n2 EL Petersilie, gehackt') };
+  const plan = ['r-a', 'r-b'].map((id, i) => ({ id: `p${i}`, date: '2026-10-19', slot: 'abend', recipeId: id, servings: 1, tripId: null }));
+  const l = berechneListe({ planEintraege: plan, rezepte: [a, b], runde: RUNDE });
+  const text = (id) => l.abteilungen.find((x) => x.id === id).zeilen.map((z) => `${z.text} ${z.name}`.trim());
+  assert.deepEqual(text('obst-gemuese'), ['1 Chilischote', '1 TL Ingwer', '2 Paprika', '2 EL Petersilie', '2 Zweige Thymian']);
+  assert.deepEqual(text('gewuerze'), ['1 TL Chili', 'Ingwer', '4 TL Paprika', '1 TL Thymian']); // Prise: ohne Menge
+  const k = (t) => postenSchluessel(parseZeile(t));
+  assert.equal(k('1 TL Paprika, edelsüß'), 'paprika, gemahlen');
+  assert.equal(k('1 TL Rosmarin'), 'rosmarin, getrocknet');
+  assert.equal(k('1 EL Thymian'), 'thymian'); // EL frischer Blättchen bleibt frisch
+  assert.equal(k('1 TL Knoblauch'), 'knoblauch');
+  assert.equal(k('1 TL Chili, fein gehackt'), 'chili');
+  assert.equal(k('2 TL Rosmarin, frisch oder TK'), 'rosmarin');
+  assert.equal(k('1 TL Paprikapulver'), 'paprikapulver');
+});
+
+test('listeAlsText: Titel, Abteilungen, Rest statt Gesamt, ohne Erledigtes und Vorrat', () => {
+  const r = { id: 'r-t', title: 'T', servings: 1, ingredients: parseZeilen('500 g Kartoffeln\n3 Zwiebeln\n' +
+    'etwas Petersilie\n1 Prise Salz\n200 g Speck\n1 l Milch') };
+  const plan = [{ id: 't', date: '2026-10-19', slot: 'abend', recipeId: 'r-t', servings: 1, tripId: null }];
+  const basis = { planEintraege: plan, rezepte: [r], vorrat: ['salz'], runde: RUNDE };
+  const vorher = berechneListe(basis);
+  const zustaende = [
+    stand({ ...zeile(vorher, 'zwiebel'), teile: [{ qty: 1, qty2: null, unit: 'Stück' }] }), // 1 von 3
+    stand(zeile(vorher, 'speck')),
+  ];
+  const manuelle = [{ id: 'm1', kind: 'manual', name: 'Spülmittel', qty: null, note: 'Zitrone', checked: false },
+    { id: 'm2', kind: 'manual', name: 'Brot', qty: 1, checked: true }];
+  const l = berechneListe({ ...basis, zustaende, manuelle });
+  assert.equal(listeAlsText(l, { titel: 'Einkaufsliste 19.10.–25.10.2026' }), [
+    'Einkaufsliste 19.10.–25.10.2026',
+    '',
+    '— Obst & Gemüse —',
+    '• 500 g Kartoffeln',
+    '• Petersilie',
+    '• 2 Zwiebeln',
+    '',
+    '— Milch, Butter & Eier —',
+    '• 1 l Milch',
+    '',
+    '— Haushalt —',
+    '• Spülmittel (Zitrone)',
+  ].join('\n'));
+  assert.equal(listeAlsText(l).split('\n')[0], '— Obst & Gemüse —');
+  assert.equal(listeAlsText({ abteilungen: [] }, { titel: 'Leer' }), 'Leer');
+  assert.equal(listeAlsText(null), '');
+});
