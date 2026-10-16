@@ -18,7 +18,8 @@
 // Variable name „AI“ → „Deploy“. Der kostenlose Plan enthält 10.000 Neurons pro Tag – das reicht
 // für mindestens etwa 40 KI-Anfragen; ist das Kontingent aufgebraucht, meldet die App das bis zum
 // nächsten Tag (es entstehen keine Kosten). Cloudflare nutzt die Anfragen nicht zum Trainieren.
-// Anderes Modell: Text-Variable KI_MODELL (Standard siehe KI_MODELL unten).
+// Anderes Modell: Text-Variable KI_MODELL (Standard siehe KI_MODELL unten); meldet die App danach, dass das
+// Modell nicht passt, die Variable wieder löschen.
 //
 // Weitere erlaubte Herkunft (z. B. die App lokal am PC): im Worker unter „Settings“ →
 // „Variables and Secrets“ eine Text-Variable ERLAUBTE_ORIGINS anlegen, mehrere Einträge mit
@@ -450,6 +451,25 @@ export function leseKiAntwort(ergebnis) {
   return Array.isArray(liste) ? liste : null;
 }
 
+// Modell passt nicht: unbekannt, nur im Bezahlplan, Bedingungen nicht bestätigt, Limit zu klein, Funktion fehlt
+const KI_MODELL_FEHLER_RE = new RegExp(['\\b(?:5007|3042|5035|5016|5018|3041)\\b', 'no such model', 'model (?:name )?is invalid',
+  'invalid model', 'paid plan', 'model terms', 'access this model', 'model limit', 'context (?:window|length)',
+  'max_(?:completion_)?tokens', 'not supported', 'unsupported'].join('|'), 'i');
+
+/**
+ * Fehler von env.AI.run → { status, fehler } für die App (Codes laut developers.cloudflare.com/workers-ai/platform/errors):
+ * 'limit' = Tageskontingent aufgebraucht (3036, früher 4006), 'beschaeftigt' = kurz ausgelastet (3040, Ratenlimit),
+ * 'ki-modell' = Modell passt nicht (unbekannt, nur im Bezahlplan, zu kleines Limit), 'ki-format' = kein JSON, sonst 'ki'.
+ */
+export function kiFehlerKennung(fehler) {
+  const text = `${fehler?.message ?? fehler} ${fehler?.code ?? ''}`;
+  if (/\b(?:3036|4006)\b|\bneurons?\b|daily|free allocation/i.test(text)) return { status: 429, fehler: 'limit' };
+  if (/\b3040\b|capacity|rate.?limit|too many requests/i.test(text)) return { status: 429, fehler: 'beschaeftigt' };
+  if (KI_MODELL_FEHLER_RE.test(text)) return { status: 502, fehler: 'ki-modell' };
+  if (/json/i.test(text)) return { status: 502, fehler: 'ki-format' };   // „JSON Mode couldn't be met“
+  return { status: 502, fehler: 'ki' };
+}
+
 // Nur die Felder des Schemas, Größe begrenzt; genau geprüft wird in der App (js/ki.js)
 function kuerzeKiRezepte(liste, anzahl) {
   const felder = Object.keys(KI_SCHEMA.properties.rezepte.items.properties);
@@ -477,10 +497,8 @@ async function kiRezepte(request, env) {
     });
   } catch (e) {
     // Rohe Fehlertexte gehen nie an die App, nur die Kennung
-    const text = `${e?.message ?? e} ${e?.code ?? ''}`;
-    if (/4006|neuron|limit/i.test(text)) throw new DienstFehler(429, { fehler: 'limit' });   // Tageskontingent
-    if (/json/i.test(text)) throw new DienstFehler(502, { fehler: 'ki-format' });   // „JSON Mode couldn't be met“
-    throw new DienstFehler(502, { fehler: 'ki' });
+    const { status, fehler } = kiFehlerKennung(e);
+    throw new DienstFehler(status, { fehler });
   }
   const liste = leseKiAntwort(ergebnis);
   if (!liste) throw new DienstFehler(502, { fehler: 'ki-format' });

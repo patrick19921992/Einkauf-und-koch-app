@@ -1,6 +1,7 @@
 // Automatisch planen: Vorlieben abfragen, daraus einen Plan mit geschätzten Kosten vorschlagen,
 // einzelne Gerichte tauschen und den Plan in die Woche übernehmen. Auf Wunsch neue Ideen von der KI.
 // Der letzte nicht übernommene Plan bleibt in dieser Sitzung erhalten (sessionStorage).
+// Die Läden gehören zum Haushalt (wie unter Mehr und in der Einkaufsliste): gespeichert in planerProfil.laeden.
 
 import { el, symbol, SYMBOLE, setzeTitel, toast, dialog, auswahl, navigiere, fehlerAnzeige } from './app.js';
 import * as db from './db.js';
@@ -22,9 +23,109 @@ const LADEN_NAME = Object.fromEntries(LAEDEN.map((l) => [l.id, l.name]));
 const STAND_TEXT = PREIS_STAND.replace(/^(\d{4})-(\d{2})$/, '$2/$1'); // '2026-10' → '10/2026'
 const PREIS_HINWEIS = `Preise sind Schätzwerte (Stand ${STAND_TEXT}). Eigene Preise kannst du in der Einkaufsliste eintragen.`;
 
+// Kurze Meldungen bei KI-Fehlern; der ausführliche Text steht als Hinweis beim Plan
+const KI_KURZ = {
+  'ki-fehlt': 'KI ist im Import-Dienst noch nicht eingerichtet – Anleitung unter Mehr.',
+  limit: 'KI-Kontingent für heute aufgebraucht – der Plan nutzt die vorhandenen Rezepte.',
+  sonst: 'Keine neuen KI-Ideen – der Plan nutzt die vorhandenen Rezepte.',
+};
+const KI_EINRICHTEN = new Set(['ki-fehlt', 'kein-proxy', 'origin']); // Hinweis mit Weg zu Mehr → Import-Dienst
+const WOCHE_SLOTS = ['frueh', 'mittag', 'abend', 'snack'];
+
 const mehrzahl = (n, eins, viele) => `${n} ${n === 1 ? eins : viele}`;
 const istKi = (id) => String(id ?? '').startsWith('ki-');
 const pause = () => new Promise((r) => setTimeout(r, 30)); // Statustext zeichnen lassen, bevor gerechnet wird
+const gleicheLaeden = (a, b) => [...(a || [])].sort().join() === [...(b || [])].sort().join();
+// wie die Woche: unbekannte Mahlzeit zählt als Abendessen
+const slotVon = (p) => (WOCHE_SLOTS.includes(p.slot) ? p.slot : 'abend');
+
+/** 'A', 'A und B', 'A, B und C' */
+function aufzaehlung(liste) {
+  return liste.length < 2 ? liste.join('') : `${liste.slice(0, -1).join(', ')} und ${liste.at(-1)}`;
+}
+
+/** Titel geplanter Einträge in Anführungszeichen, schon Eingekauftes zuerst und markiert; höchstens `max`. */
+function titelListe(eintraege, max = 3) {
+  const titel = [...eintraege].sort((a, b) => Boolean(b.tripId) - Boolean(a.tripId))
+    .map((p) => `„${String(p.title || 'Ohne Titel').slice(0, 60)}“${p.tripId ? ' (schon eingekauft)' : ''}`);
+  return titel.length > max + 1 ? `${titel.slice(0, max).join(', ')} und ${titel.length - max} weitere` : aufzaehlung(titel);
+}
+
+// KI laut Ping des Import-Dienstes: true/false, null = unbekannt (offline, keine Antwort). „Verfügbar“ merkt sich
+// die Seite; „nicht eingerichtet“ wird bei jedem Öffnen neu gefragt (vielleicht ist es inzwischen eingerichtet).
+const kiVerfuegbar = new Set();
+async function kiPing(proxyUrl) {
+  const basis = String(proxyUrl || '').trim();
+  if (!basis || globalThis.navigator?.onLine === false) return null;
+  if (kiVerfuegbar.has(basis)) return true;
+  try {
+    const ziel = new URL(/^https?:\/\//i.test(basis) ? basis : `https://${basis}`);
+    ziel.searchParams.set('ping', '1');
+    const antwort = await fetch(ziel.href, {
+      cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(8000),
+    });
+    const json = antwort.ok ? await antwort.json() : null;
+    if (json?.ok !== true) return null;
+    // ohne Feld `ki` ist der Worker noch die alte Version ohne KI
+    if (json.ki === true) kiVerfuegbar.add(basis);
+    return json.ki === true;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Was „Übernehmen“ mit schon geplanten Einträgen im Zeitraum macht:
+ * frei – Plan-Einträge für leere Plätze (Tag + Mahlzeit); belegt – für schon belegte Plätze;
+ * ersetzt – davon die, die „Ersetzen“ einträgt; ersetzbar – vorhandene Einträge, die „Ersetzen“ entfernt.
+ * Gekochtes und Notizen (ohne Rezept) bleiben immer; ihr Platz bekommt kein zweites Gericht.
+ */
+function belegung(planEintraege, vorhanden) {
+  const nachPlatz = new Map();
+  for (const p of vorhanden) {
+    const platz = `${p.date}|${slotVon(p)}`;
+    if (!nachPlatz.has(platz)) nachPlatz.set(platz, []);
+    nachPlatz.get(platz).push(p);
+  }
+  const b = { frei: [], belegt: [], ersetzt: [], ersetzbar: [] };
+  for (const e of planEintraege) {
+    const dort = nachPlatz.get(`${e.datum}|${e.slot}`);
+    if (!dort) {
+      b.frei.push(e);
+      continue;
+    }
+    b.belegt.push(e);
+    if (dort.some((p) => p.cooked || !p.recipeId)) continue;
+    b.ersetzt.push(e);
+    b.ersetzbar.push(...dort);
+  }
+  return b;
+}
+
+/**
+ * Macht „Übernehmen“ rückgängig: neue Einträge weg, ersetzte zurück, dabei angelegte Rezepte wieder heraus.
+ * Läuft auch noch, wenn der Planer schon verlassen ist (Meldung in der Woche).
+ */
+async function uebernahmeRueckgaengig({ eintragIds, wegIds, rezepte, zurueck, sitzung, start }) {
+  try {
+    const neu = (await Promise.all(eintragIds.map((id) => db.hole('planEntries', id)))).filter(Boolean);
+    await db.speichereViele('planEntries', neu.map((p) => ({ ...p, deleted: true })));
+    for (const id of wegIds) await db.wiederherstellen('planEntries', id);
+    // inzwischen anders verplante oder geänderte Rezepte bleiben
+    const verplant = new Set((await db.alle('planEntries')).map((p) => p.recipeId).filter(Boolean));
+    for (const [id, stand] of rezepte) {
+      const r = await db.hole('recipes', id);
+      // ganz entfernen statt Lösch-Markierung: die gilt sonst als „nicht mehr vorschlagen“
+      if (r && r.updatedAt === stand && !verplant.has(id)) await db.entferne('recipes', id);
+    }
+    for (const id of zurueck) if (!verplant.has(id)) await db.loesche('recipes', id);
+    schreibeSitzung(sitzung);
+    toast('Rückgängig gemacht.', { aktion: { text: 'Zum Plan', onclick: () => navigiere(`#/planer?start=${start}`) } });
+  } catch (e) {
+    console.error(e);
+    toast('Rückgängig hat nicht geklappt.');
+  }
+}
 
 /** Liste in zufälliger Reihenfolge (Kopie). */
 function mische(liste) {
@@ -156,30 +257,79 @@ export async function zeige(container, route) {
   const sitzung = leseSitzung();
   const gespeichert = einst.planerProfil && typeof einst.planerProfil === 'object' ? einst.planerProfil : {};
   const basis = { ...STANDARD_PROFIL, personen: einst.standardPortionen, mahlzeiten: einst.mahlzeiten.filter((m) => SLOT_NAME[m]) };
+  // Läden immer aus den Einstellungen (unter Mehr geändert gilt sofort, auch bei gemerktem Formular)
+  const laeden = Array.isArray(gespeichert.laeden) && LAEDEN.some((l) => gespeichert.laeden.includes(l.id))
+    ? { laeden: gespeichert.laeden } : {};
   const zustand = {
-    form: formAusProfil(normalisiereProfil({ ...basis, ...gespeichert, ...(sitzung?.form || {}) }),
+    form: formAusProfil(normalisiereProfil({ ...basis, ...gespeichert, ...(sitzung?.form || {}), ...laeden }),
       angefragt ?? klemmeStart(sitzung?.form?.start)),
     plan: sitzung?.plan && istSchluessel(sitzung.plan.start) && Array.isArray(sitzung.plan.eintraege) ? sitzung.plan : null,
     ki: Array.isArray(sitzung?.ki) ? sitzung.ki.filter((r) => r && istKi(r.id) && Array.isArray(r.ingredients)) : [],
+    // ausführliche Meldung, warum es keine KI-Ideen gab (steht beim Plan)
+    kiMeldung: typeof sitzung?.kiMeldung?.text === 'string'
+      ? { text: sitzung.kiMeldung.text.slice(0, 800), mehr: sitzung.kiMeldung.mehr === true } : null,
     rezepte: new Map(),
+    gespeichert: new Set(), // ids der Rezepte in der Rezeptliste (nicht gelöscht)
   };
   // Text der Freitextfelder aus der Sitzung behalten
   if (sitzung?.form) Object.assign(zustand.form, { ohneText: String(sitzung.form.ohneText ?? ''), budgetText: String(sitzung.form.budgetText ?? '') });
   // andere Woche gewünscht oder Plan von gestern: neu planen
   if (zustand.plan && ((angefragt && angefragt !== zustand.plan.start) || zustand.plan.start < heuteKey)) zustand.plan = null;
-  const merke = () => schreibeSitzung({ form: zustand.form, plan: zustand.plan, ki: zustand.ki });
+  if (!zustand.plan) zustand.kiMeldung = null;
+  const merke = () => schreibeSitzung({ form: zustand.form, plan: zustand.plan, ki: zustand.ki, kiMeldung: zustand.kiMeldung });
+  let kiDa = null;            // KI im Import-Dienst eingerichtet? (Ping; null = unbekannt)
+  let kiPingLaeuft = false;
+  let aktualisiereKi = null;  // zeichnet die KI-Option im Formular neu
 
-  // Kandidaten: Grundsammlung + eigene Rezepte (+ KI-Ideen mit kleinem Vorzug, damit sie auch vorkommen)
+  // Kandidaten: Grundsammlung + eigene Rezepte (+ KI-Ideen mit kleinem Vorzug, damit sie auch vorkommen).
+  // Gespeicherte Fassungen gehen vor; gelöschte Grundrezepte und KI-Ideen schlägt der Planer nicht mehr vor.
   async function rezeptPool() {
-    const eigene = await db.alle('recipes');
-    const liste = [...ladeGrundrezepte(), ...eigene, ...zustand.ki.map((r) => ({ ...r, favorite: true }))];
-    zustand.rezepte = new Map(liste.map((r) => [r.id, r]));
-    return liste;
+    const gespeicherteRezepte = await db.alle('recipes', { mitGeloeschten: true });
+    const geloescht = new Set(gespeicherteRezepte.filter((r) => r.deleted).map((r) => r.id));
+    const pool = new Map();
+    for (const r of ladeGrundrezepte()) if (!geloescht.has(r.id)) pool.set(r.id, r);
+    for (const r of zustand.ki) if (!geloescht.has(r.id)) pool.set(r.id, { ...r, favorite: true });
+    for (const r of gespeicherteRezepte) if (!r.deleted) pool.set(r.id, r);
+    zustand.rezepte = pool;
+    zustand.gespeichert = new Set(gespeicherteRezepte.filter((r) => !r.deleted).map((r) => r.id));
+    return [...pool.values()];
   }
 
   async function frischeEinstellungen() {
     einst = await db.holeEinstellungen();
     return { eigenePreise: einst.eigenePreise, vorrat: einst.vorrat };
+  }
+
+  // Läden im Formular geändert: gleich für den Haushalt speichern (Mehr und Einkaufsliste rechnen damit)
+  let laedenKette = Promise.resolve();
+  function speichereLaeden(liste) {
+    laedenKette = laedenKette.then(async () => {
+      const e = await db.holeEinstellungen();
+      const profil = e.planerProfil && typeof e.planerProfil === 'object' ? e.planerProfil : {};
+      await db.speichereEinstellungen({ planerProfil: { ...profil, laeden: [...liste] } });
+    }).catch((e) => console.error(e));
+  }
+
+  // Gemerkter Plan mit anderen Läden als jetzt eingestellt: mit denselben Vorlieben und Würfeln neu rechnen
+  async function passeLaedenAn() {
+    const plan = zustand.plan;
+    if (!plan || gleicheLaeden(plan.laeden, zustand.form.laeden)) return;
+    const pool = await rezeptPool();
+    const preise = await frischeEinstellungen();
+    const profil = { ...(plan.profil || profilAusForm(zustand.form)), start: plan.start, laeden: zustand.form.laeden };
+    zustand.plan = plane({ rezepte: pool, profil, ...preise, seed: plan.seed, heute: heuteKey });
+    merke();
+    if (aktiv) toast(`Läden geändert – Plan für ${aufzaehlung(zustand.plan.laeden.map((id) => LADEN_NAME[id] || id))} neu berechnet.`);
+  }
+
+  function pruefeKi() {
+    if (kiPingLaeuft || kiDa !== null || !proxyUrl) return;
+    kiPingLaeuft = true;
+    kiPing(proxyUrl).then((w) => {
+      kiPingLaeuft = false;
+      if (kiDa === null) kiDa = w;
+      if (aktiv) aktualisiereKi?.();
+    });
   }
 
   // ------------------------------------------------------------ KI-Ideen
@@ -198,10 +348,21 @@ export async function zeige(container, route) {
       const { rezepte } = pruefeKiRezepte(roh, profil, { vorhanden: pool.filter((r) => !istKi(r.id)).map((r) => r.title) });
       const neu = rezepte.filter((r) => r.mahlzeit === mahlzeit).map(kiRezeptZuRezept);
       zustand.ki = [...neu, ...zustand.ki.filter((r) => !neu.some((n) => n.id === r.id))].slice(0, MAX_KI);
-      if (aktiv && !neu.length) toast('Die KI-Ideen passten diesmal nicht zu deinen Vorlieben – der Plan nutzt die vorhandenen Rezepte.', { dauer: 6000 });
+      if (!neu.length) {
+        zustand.kiMeldung = { text: 'Die Ideen der KI passten diesmal nicht zu deinen Vorlieben.', mehr: false };
+        if (aktiv) toast(KI_KURZ.sonst);
+      }
     } catch (e) {
       if (!(e instanceof KiFehler)) console.error(e);
-      if (aktiv) toast(e instanceof KiFehler ? e.message : 'Die KI-Anfrage hat nicht geklappt.', { dauer: 9000 });
+      const code = e instanceof KiFehler ? e.code : null;
+      zustand.kiMeldung = { text: e instanceof KiFehler ? e.message : 'Die KI-Anfrage hat nicht geklappt.', mehr: KI_EINRICHTEN.has(code) };
+      // nicht eingerichtet oder Tageskontingent aufgebraucht: nicht bei jedem Plan wieder fragen
+      if (code === 'ki-fehlt' || code === 'limit') zustand.form.kiIdeen = false;
+      if (code === 'ki-fehlt') {
+        kiDa = false;
+        kiVerfuegbar.delete(proxyUrl);
+      }
+      if (aktiv) toast(KI_KURZ[code] ?? KI_KURZ.sonst);
     }
   }
 
@@ -213,10 +374,11 @@ export async function zeige(container, route) {
       const profil = zustand.plan && !mitKi ? normalisiereProfil({ ...zustand.plan.profil, start: zustand.plan.start })
         : profilAusForm(zustand.form);
       if (mitKi) {
+        zustand.kiMeldung = null;
         await db.speichereEinstellungen({ planerProfil: { ...profil, start: null } }).catch((e) => console.error(e));
       }
       let pool = await rezeptPool();
-      if (mitKi && profil.kiIdeen && proxyUrl) {
+      if (mitKi && profil.kiIdeen && proxyUrl && kiDa !== false) {
         await holeIdeen(profil, pool, melde);
         pool = await rezeptPool();
       }
@@ -237,8 +399,9 @@ export async function zeige(container, route) {
     }
   }
 
-  async function tauschen(index) {
-    if (laeuft || !zustand.plan) return;
+  // → true, wenn getauscht wurde; still: keine Meldung, wenn nichts anderes passt
+  async function tauschen(index, { still = false } = {}) {
+    if (laeuft || !zustand.plan) return false;
     laeuft = true;
     try {
       const alt = zustand.plan.eintraege[index];
@@ -247,21 +410,52 @@ export async function zeige(container, route) {
       const neu = tausche(zustand.plan, index, { rezepte: pool, profil: zustand.plan.profil, ...preise });
       const ersatz = neu.eintraege.find((e) => e.datum === alt.datum && e.slot === alt.slot);
       if (neu === zustand.plan || !ersatz || ersatz.rezeptId === alt.rezeptId) {
-        toast('Keine andere passende Idee gefunden.');
-        return;
+        if (!still) toast('Keine andere passende Idee gefunden.');
+        return false;
       }
       zustand.plan = neu;
       merke();
-      zeichneErgebnis(`t:${alt.datum}:${alt.slot}`);
+      if (aktiv) zeichneErgebnis(`t:${alt.datum}:${alt.slot}`);
+      return true;
     } catch (e) {
       console.error(e);
       toast('Tauschen hat nicht geklappt.');
+      return false;
     } finally {
       laeuft = false;
     }
   }
 
-  function ansehen(eintrag) {
+  // Grundrezept oder KI-Idee, die nicht in der Rezeptliste steht → Vorlage, sonst null
+  function vorlage(id) {
+    if (zustand.gespeichert.has(id)) return null;
+    return ladeGrundrezepte().find((r) => r.id === id) ?? zustand.ki.find((r) => r.id === id) ?? null;
+  }
+
+  // „Nicht mehr vorschlagen“: eine Lösch-Markierung merkt es sich (bleibt auch beim Aufräumen, siehe db.bereinige)
+  async function ausblenden(index, quelle) {
+    const titel = quelle.title || 'Das Gericht';
+    try {
+      await db.speichere('recipes', { ...structuredClone(quelle), deleted: true });
+    } catch (e) {
+      console.error(e);
+      toast('Das hat nicht geklappt.');
+      return;
+    }
+    const getauscht = await tauschen(index, { still: true });
+    toast(getauscht ? `„${titel}“ wird nicht mehr vorgeschlagen.`
+      : `„${titel}“ wird nicht mehr vorgeschlagen – in diesem Plan bleibt es, weil nichts anderes passt.`, {
+      aktion: {
+        text: 'Rückgängig',
+        onclick: async () => {
+          const d = await db.hole('recipes', quelle.id, { mitGeloeschten: true });
+          if (d?.deleted) await db.entferne('recipes', quelle.id);
+        },
+      },
+    });
+  }
+
+  async function ansehen(eintrag, index) {
     const r = zustand.rezepte.get(eintrag.rezeptId);
     if (!r) {
       toast('Das Rezept ist nicht mehr da.');
@@ -271,7 +465,8 @@ export async function zeige(container, route) {
     const faktor = Number(r.servings) > 0 ? portionen / Number(r.servings) : 1;
     const ki = istKi(r.id) || r.herkunft === 'ki';
     const herkunft = ki ? 'KI-Idee' : r.herkunft === 'grund' ? 'Grundsammlung' : 'Eigenes Rezept';
-    dialog({
+    const quelle = vorlage(r.id);
+    const w = await dialog({
       titel: r.title || 'Rezept',
       fokus: false,
       inhalt: [
@@ -284,8 +479,12 @@ export async function zeige(container, route) {
           ? el('ol', { class: 'schritte' }, r.steps.map((s) => el('li', { class: 'schritt' }, s.text)))
           : el('p', { class: 'nebentext' }, 'Keine Zubereitungsschritte eingetragen.'),
       ],
-      knoepfe: [{ text: 'Schließen', wert: null, art: 'primaer' }],
+      knoepfe: [
+        ...(quelle ? [{ text: 'Nicht mehr vorschlagen', wert: 'ausblenden', art: 'flach' }] : []),
+        { text: 'Schließen', wert: null, art: 'primaer' },
+      ],
     });
+    if (w === 'ausblenden' && aktiv && zustand.plan?.eintraege[index] === eintrag) await ausblenden(index, quelle);
   }
 
   // ------------------------------------------------------------ Übernehmen
@@ -298,42 +497,78 @@ export async function zeige(container, route) {
     }
     laeuft = true;
     try {
-      const slots = new Set(plan.eintraege.map((e) => e.slot));
       const vorhanden = (await db.alle('planEntries')).filter((p) => p.date >= plan.start && p.date <= plan.ende);
+      const b = belegung(plan.eintraege, vorhanden);
+      let rein = b.frei;
       let weg = [];
-      if (vorhanden.length) {
-        const ersetzbar = vorhanden.filter((p) => slots.has(p.slot) && !p.cooked);
-        const w = await auswahl(`Im Zeitraum ${mehrzahl(vorhanden.length, 'Eintrag', 'Einträge')} vorhanden`, [
-          { text: 'Vorhandene Einträge behalten', wert: 'behalten', beschreibung: 'Die neuen Gerichte kommen dazu.' },
-          { text: 'Ersetzen', wert: 'ersetzen', beschreibung: ersetzbar.length
-            ? `${mehrzahl(ersetzbar.length, 'Eintrag', 'Einträge')} (${[...slots].map((s) => SLOT_NAME[s]).join(', ')}) ${ersetzbar.length === 1 ? 'wird' : 'werden'} entfernt.`
-            : 'Nichts zu entfernen – Gekochtes und andere Mahlzeiten bleiben.' },
+      if (b.ersetzbar.length) {
+        // belegte Plätze: nur Freies füllen (Standard) oder geplante Gerichte ersetzen – Gekochtes und Notizen bleiben
+        const bleiben = b.belegt.length - b.ersetzt.length;
+        const w = await auswahl(`${mehrzahl(b.belegt.length, 'Mahlzeit ist', 'Mahlzeiten sind')} schon belegt`, [
+          {
+            text: 'Nur freie Mahlzeiten füllen', wert: 'frei',
+            beschreibung: `${b.frei.length ? `${mehrzahl(b.frei.length, 'Gericht kommt', 'Gerichte kommen')} dazu` : 'Es kommt nichts dazu'}, `
+              + 'alles schon Geplante bleibt.',
+          },
+          {
+            text: 'Ersetzen', wert: 'ersetzen',
+            beschreibung: `Entfernt ${titelListe(b.ersetzbar)}.`
+              + (bleiben ? ` ${mehrzahl(bleiben, 'Mahlzeit', 'Mahlzeiten')} mit Gekochtem oder Notiz ${bleiben === 1 ? 'bleibt' : 'bleiben'}.` : ''),
+          },
         ]);
         if (!w) return;
-        if (w === 'ersetzen') weg = ersetzbar;
+        if (w === 'ersetzen') {
+          rein = [...b.frei, ...b.ersetzt];
+          weg = b.ersetzbar;
+        }
       }
-      // benutzte Grund- und KI-Rezepte speichern, die noch nicht (oder nur gelöscht) da sind
+      if (!rein.length) {
+        toast('Alle Mahlzeiten im Zeitraum sind schon belegt – nichts übernommen.');
+        return;
+      }
+      const eintraege = plan.eintraege.filter((e) => rein.includes(e));
+      // benutzte Grund- und KI-Rezepte speichern, die noch nicht da sind; gelöschte eigene Fassungen zurückholen
+      // (nie die Grundfassung über eine gelöschte schreiben)
       const grund = new Map(ladeGrundrezepte().map((r) => [r.id, r]));
       const ki = new Map(zustand.ki.map((r) => [r.id, r]));
-      const ids = [...new Set(plan.eintraege.map((e) => e.rezeptId))];
       const neueRezepte = [];
+      const zurueck = [];
       const fehlt = new Set();
-      for (const id of ids) {
-        if (await db.hole('recipes', id)) continue;
+      for (const id of new Set(eintraege.map((e) => e.rezeptId))) {
+        const d = await db.hole('recipes', id, { mitGeloeschten: true });
+        if (d && !d.deleted) continue;
+        if (d) {
+          await db.wiederherstellen('recipes', id);
+          zurueck.push(id);
+          continue;
+        }
         const quelle = grund.get(id) ?? ki.get(id);
         if (quelle) neueRezepte.push(structuredClone(quelle));
-        else if (!(await db.wiederherstellen('recipes', id))) fehlt.add(id);
+        else fehlt.add(id);
       }
-      await db.speichereViele('recipes', neueRezepte);
+      const angelegt = await db.speichereViele('recipes', neueRezepte);
       await db.speichereViele('planEntries', weg.map((p) => ({ ...p, deleted: true })));
-      await db.speichereViele('planEntries', plan.eintraege.map((e) => ({
+      const gespeichert = await db.speichereViele('planEntries', eintraege.map((e) => ({
         date: e.datum, slot: e.slot, recipeId: fehlt.has(e.rezeptId) ? null : e.rezeptId, title: e.titel,
         servings: e.portionen, note: '', cooked: false, tripId: null,
       })));
+      const vorher = { form: zustand.form, plan, ki: zustand.ki, kiMeldung: zustand.kiMeldung };
       zustand.plan = null;
       schreibeSitzung(null);
-      toast('Plan übernommen', {
-        aktion: { text: 'Zur Einkaufsliste', onclick: () => navigiere(`#/einkauf?von=${plan.start}&bis=${plan.ende}`) },
+      const uebersprungen = plan.eintraege.length - eintraege.length;
+      toast(uebersprungen ? `Plan übernommen – ${mehrzahl(uebersprungen, 'belegte Mahlzeit', 'belegte Mahlzeiten')} übersprungen.`
+        : 'Plan übernommen.', {
+        dauer: 8000,
+        aktionen: [
+          {
+            text: 'Rückgängig',
+            onclick: () => uebernahmeRueckgaengig({
+              eintragIds: gespeichert.map((p) => p.id), wegIds: weg.map((p) => p.id),
+              rezepte: angelegt.map((r) => [r.id, r.updatedAt]), zurueck, sitzung: vorher, start: plan.start,
+            }),
+          },
+          { text: 'Zur Einkaufsliste', onclick: () => navigiere(`#/einkauf?von=${plan.start}&bis=${plan.ende}`) },
+        ],
       });
       // ersetzen: „Zurück“ in der Woche führt nicht wieder in den (jetzt leeren) Planer
       navigiere(`#/woche/${plan.start}`, { ersetzen: true });
@@ -392,7 +627,20 @@ export async function zeige(container, route) {
       },
     }, symbol(SYMBOLE.automatisch), 'Plan erstellen');
 
-    const kiAus = !proxyUrl;
+    // KI-Option: aus ohne Import-Dienst oder wenn der Dienst meldet, dass die KI fehlt (Ping läuft im Hintergrund)
+    const kiBox = el('input', { type: 'checkbox', onchange: (ev) => aendern({ kiIdeen: ev.target.checked }) });
+    const kiText = el('p', { class: 'nebentext' });
+    aktualisiereKi = () => {
+      const aus = !proxyUrl || kiDa === false;
+      kiBox.disabled = aus;
+      kiBox.checked = f.kiIdeen && !aus;
+      const mehr = el('a', { href: '#/mehr' }, 'Mehr → Import-Dienst');
+      if (!proxyUrl) kiText.replaceChildren('Dafür brauchst du den Import-Dienst: ', mehr, '.');
+      else if (kiDa === false) kiText.replaceChildren('Im Import-Dienst ist die KI noch nicht eingerichtet – Anleitung unter ', mehr, '.');
+      else kiText.replaceChildren('KI-Ideen sind Vorschläge – bitte vor dem Kochen prüfen.');
+    };
+    aktualisiereKi();
+    pruefeKi();
     container.replaceChildren(el('div', { class: 'planer-form' },
       karte('Was esst ihr gern?',
         chipGruppe('Was esst ihr gern?', PROTEINE, (id) => f.protein.includes(id), (id) => aendern({
@@ -413,8 +661,12 @@ export async function zeige(container, route) {
         chipGruppe('Mahlzeiten', MAHLZEITEN, (id) => f.mahlzeiten.includes(id), (id) => aendern({
           mahlzeiten: umschalten(f.mahlzeiten, id, { min: 1, zuWenig: 'Wähl mindestens eine Mahlzeit aus.' }) }))),
       karte('Supermärkte',
-        chipGruppe('Supermärkte', LAEDEN, (id) => f.laeden.includes(id), (id) => aendern({
-          laeden: umschalten(f.laeden, id, { min: 1, max: 3, zuWenig: 'Mindestens ein Laden', zuViel: 'Höchstens 3 Läden' }) })),
+        chipGruppe('Supermärkte', LAEDEN, (id) => f.laeden.includes(id), (id) => {
+          const neu = umschalten(f.laeden, id, { min: 1, max: 3, zuWenig: 'Mindestens ein Laden', zuViel: 'Höchstens 3 Läden' });
+          if (neu === f.laeden) return;
+          aendern({ laeden: neu });
+          speichereLaeden(neu);
+        }),
         el('p', { class: 'nebentext' }, 'Bei mehreren Läden zählt je Zutat der günstigste.')),
       karte('Budget',
         el('label', { class: 'feld' }, el('span', null, '€ für den ganzen Zeitraum (optional)'), budgetFeld),
@@ -423,16 +675,18 @@ export async function zeige(container, route) {
         el('label', { class: 'checkbox' },
           el('input', { type: 'checkbox', checked: f.eigeneRezepte, onchange: (ev) => aendern({ eigeneRezepte: ev.target.checked }) }),
           el('span', null, 'Meine eigenen Rezepte mit einplanen')),
-        el('label', { class: 'checkbox' },
-          el('input', { type: 'checkbox', checked: f.kiIdeen && !kiAus, disabled: kiAus, onchange: (ev) => aendern({ kiIdeen: ev.target.checked }) }),
-          el('span', null, 'Neue Ideen von der KI (bis zu 3 neue Rezepte)')),
-        kiAus
-          ? el('p', { class: 'nebentext' }, 'Dafür brauchst du den Import-Dienst: ', el('a', { href: '#/mehr' }, 'Mehr → Import-Dienst'), '.')
-          : el('p', { class: 'nebentext' }, 'KI-Ideen sind Vorschläge – bitte vor dem Kochen prüfen.')),
+        el('label', { class: 'checkbox' }, kiBox, el('span', null, 'Neue Ideen von der KI (bis zu 3 neue Rezepte)')),
+        kiText),
       el('div', { class: 'stapel' },
         knopf,
         status,
-        zustand.plan ? el('button', { type: 'button', class: 'knopf flach', onclick: () => zeichneErgebnis() }, 'Zurück zum letzten Plan') : null)));
+        zustand.plan ? el('button', {
+          type: 'button', class: 'knopf flach',
+          onclick: async () => {
+            await passeLaedenAn().catch((e) => console.error(e));
+            if (aktiv) zeichneErgebnis();
+          },
+        }, 'Zurück zum letzten Plan') : null)));
   }
 
   // ------------------------------------------------------------ Ergebnis
@@ -467,6 +721,15 @@ export async function zeige(container, route) {
     return texte.length ? el('div', { class: 'hinweis warnung', role: 'status' }, texte.map((t) => el('p', null, t))) : null;
   }
 
+  // Warum es keine KI-Ideen gab – bleibt beim Plan stehen (zum Nachlesen und Kopieren der Anleitung)
+  function kiHinweis() {
+    const m = zustand.kiMeldung;
+    if (!m?.text) return null;
+    return el('div', { class: 'hinweis' },
+      el('p', null, el('span', { class: 'fett' }, 'Keine neuen KI-Ideen: '), m.text),
+      m.mehr ? el('p', null, el('a', { href: '#/mehr' }, 'Mehr → Import-Dienst öffnen')) : null);
+  }
+
   function eintragZeile(e, index, mitMahlzeit) {
     const rezept = zustand.rezepte.get(e.rezeptId);
     const ki = istKi(e.rezeptId) || rezept?.herkunft === 'ki';
@@ -483,7 +746,7 @@ export async function zeige(container, route) {
           onclick: () => tauschen(index),
         }, symbol(SYMBOLE.tauschen), 'Tauschen'),
         el('button', {
-          type: 'button', class: 'knopf klein flach', 'aria-label': `Ansehen: ${e.titel}`, onclick: () => ansehen(e),
+          type: 'button', class: 'knopf klein flach', 'aria-label': `Ansehen: ${e.titel}`, onclick: () => ansehen(e, index),
         }, symbol(SYMBOLE.ansehen), 'Ansehen')));
   }
 
@@ -510,6 +773,7 @@ export async function zeige(container, route) {
 
   function zeichneErgebnis(fokus = null) {
     const plan = zustand.plan;
+    aktualisiereKi = null;
     if (!plan) {
       zeichneFormular();
       return;
@@ -524,6 +788,7 @@ export async function zeige(container, route) {
     container.replaceChildren(...[
       zusammenfassung(plan),
       warnungen(plan),
+      kiHinweis(),
       ...(leer ? [] : tage.map((d) => tagKarte(plan, d, slots.size > 1))),
       el('div', { class: 'aktionen-leiste planer-aktionen' }, leer
         ? el('button', { type: 'button', class: 'knopf primaer', onclick: () => { zeichneFormular(); window.scrollTo(0, 0); } },
@@ -539,6 +804,7 @@ export async function zeige(container, route) {
   try {
     if (zustand.plan) {
       await rezeptPool(); // für „Ansehen“ und die KI-Kennzeichnung
+      await passeLaedenAn();
       zeichneErgebnis();
     } else {
       zeichneFormular();

@@ -3,7 +3,7 @@
 
 import { zutatSchluessel, skaliere, inBasis, parseZahl, parseZeile } from './zutaten.js';
 import { postenSchluessel, abteilungVon } from './einkaufsliste.js';
-import { kostenFuer, LAEDEN } from './preise.js';
+import { kostenFuer, verteileLaeden, formatEuroGerundet, LAEDEN } from './preise.js';
 import { heute as heuteSchluessel, plusTage, istSchluessel } from './datum.js';
 
 // ---------------------------------------------------------------- Auswahl-Listen
@@ -15,34 +15,44 @@ export const PROTEINE = einfrieren([['schwein', 'Schwein'], ['rind', 'Rind'], ['
   ['fisch', 'Fisch'], ['vegetarisch', 'Vegetarisch'], ['vegan', 'Vegan']].map(([id, name]) => ({ id, name })));
 
 const MILCH = ['milch', 'sahne', 'butter', 'käse', 'joghurt', 'jogurt', 'quark', 'schmand', 'mozzarella', 'parmesan',
-  'crème fraîche', 'creme fraiche', 'crème fraiche', 'mascarpone', 'ricotta', 'feta', 'gouda', 'emmentaler', 'cheddar',
-  'kefir', 'molke', 'skyr', 'rahm', 'raclette', 'halloumi', 'camembert', 'brie', 'gorgonzola', 'pecorino', 'burrata',
-  'pudding'];
+  'parmigiano', 'grana padano', 'crème fraîche', 'creme fraiche', 'crème fraiche', 'mascarpone', 'ricotta', 'feta', 'gouda',
+  'emmentaler', 'edamer', 'tilsiter', 'cheddar', 'manchego', 'provolone', 'scamorza', 'cheese', 'kefir', 'molke', 'skyr',
+  'rahm', 'raclette', 'halloumi', 'paneer', 'camembert', 'brie', 'gorgonzola', 'pecorino', 'burrata', 'pudding', 'ghee',
+  'butterreinfett', 'tsatsiki', 'tzatziki', 'zaziki', 'labneh', 'ayran', 'hollandaise', 'béchamel', 'bechamel'];
 const MILCH_AUSSER = ['kokosmilch', 'kokosnussmilch', 'hafermilch', 'sojamilch', 'mandelmilch', 'reismilch', 'milchreis',
   'erdnussbutter', 'kakaobutter', 'mandelbutter', 'cashewbutter', 'sojasahne', 'hafersahne', 'kokossahne', 'sojajoghurt',
   'kokosjoghurt', 'vegan', 'pflanzlich'];
+// auch Teigwaren, die fast immer Ei enthalten (frische Tortellini, Mie-Nudeln, Schupfnudeln, Löffelbiskuits)
 const EI = ['ei', 'eier', 'eigelb', 'eiweiß', 'eiklar', 'hühnerei', 'wachtelei', 'rührei', 'spiegelei', 'mayonnaise',
-  'mayo', 'remoulade', 'aioli', 'spätzle', 'eiernudel', 'eierlikör', 'baiser'];
+  'mayo', 'remoulade', 'aioli', 'hollandaise', 'spätzle', 'eiernudel', 'eierteigware', 'mie', 'mienudel', 'tortellini',
+  'tortelloni', 'maultasche', 'schupfnudel', 'biskuit', 'eierlikör', 'baiser'];
 const FISCH = ['fisch', 'lachs', 'kabeljau', 'forelle', 'hering', 'matjes', 'makrele', 'sardine', 'sardelle', 'anchovis',
-  'garnele', 'shrimp', 'krabbe', 'scampi', 'gamba', 'muschel', 'calamar', 'oktopus', 'surimi', 'dorsch', 'pangasius',
-  'rotbarsch', 'scholle', 'zander', 'karpfen', 'dorade', 'heilbutt', 'meeresfrüchte', 'worcester', 'kaviar', 'rollmops'];
-const FISCH_AUSSER = ['muschelnudel', 'lachsschinken'];
+  'garnele', 'shrimp', 'krabbe', 'scampi', 'gamba', 'muschel', 'calamar', 'kalmar', 'sepia', 'oktopus', 'surimi', 'dorsch',
+  'pangasius', 'barsch', 'hecht', 'tilapia', 'wels', 'scholle', 'zander', 'karpfen', 'dorade', 'heilbutt', 'steinbutt',
+  'seezunge', 'rotzunge', 'seeteufel', 'saibling', 'renke', 'felchen', 'pollack', 'sprotte', 'bückling', 'aal', 'aalfilet',
+  'räucheraal', 'schillerlocke', 'hummer', 'languste', 'krebs', 'auster', 'rogen', 'kaviar', 'rollmops', 'dashi', 'bonito',
+  'katsuobushi', 'meeresfrüchte', 'worcester'];
+const FISCH_AUSSER = ['muschelnudel', 'lachsschinken', 'austernpilz', 'austernseitling', 'welschriesling'];
 
 /** Allergene und Unverträgliches („Lieber nicht“): Wörter in den Zutaten-Schlüsseln, `ausser` hebt Treffer auf. */
 export const ALLERGENE = einfrieren([
   { id: 'nuesse', name: 'Nüsse', woerter: ['nuss', 'nüsse', 'mandel', 'cashew', 'pistazie', 'macadamia', 'pinienkern',
-    'erdnuss', 'marzipan', 'nougat', 'krokant', 'praline'], ausser: ['muskatnuss', 'kokosnuss'] },
+    'erdnuss', 'marzipan', 'nougat', 'krokant', 'praline', 'amaretti', 'pesto'], ausser: ['muskatnuss', 'kokosnuss'] },
   { id: 'laktose', name: 'Laktose', woerter: MILCH, ausser: MILCH_AUSSER },
-  { id: 'gluten', name: 'Gluten', woerter: ['mehl', 'weizen', 'dinkel', 'roggen', 'gerste', 'hafer', 'nudel', 'spaghetti',
-    'penne', 'fusilli', 'farfalle', 'tagliatelle', 'lasagne', 'makkaroni', 'maccheroni', 'rigatoni', 'tortellini',
-    'ravioli', 'gnocchi', 'spätzle', 'schupfnudel', 'maultasche', 'pasta', 'brot', 'brötchen', 'toast', 'baguette',
-    'ciabatta', 'wrap', 'tortilla', 'pita', 'naan', 'couscous', 'bulgur', 'grieß', 'paniermehl', 'semmelbrösel',
-    'panko', 'teig', 'croissant', 'zwieback', 'knödel', 'keks', 'kuchen', 'sojasauce', 'seitan', 'graupe', 'cracker',
-    'müsli', 'bier', 'orzo', 'kritharaki', 'udon', 'ramen', 'mie'],
+  // auch Paniertes und Fertiges mit Weizenmehl (Fischstäbchen, Röstzwiebeln, fertige Frikadellen)
+  { id: 'gluten', name: 'Gluten', woerter: ['mehl', 'weizen', 'dinkel', 'grünkern', 'roggen', 'gerste', 'hafer', 'malz',
+    'nudel', 'teigware', 'spaghetti', 'penne', 'fusilli', 'farfalle', 'tagliatelle', 'pappardelle', 'linguine', 'lasagne',
+    'cannelloni', 'makkaroni', 'maccheroni', 'rigatoni', 'conchiglie', 'orecchiette', 'tortellini', 'tortelloni', 'ravioli',
+    'gnocchi', 'spätzle', 'schupfnudel', 'maultasche', 'pasta', 'brot', 'brötchen', 'toast', 'baguette', 'ciabatta', 'wrap',
+    'tortilla', 'pita', 'naan', 'couscous', 'bulgur', 'grieß', 'paniermehl', 'semmelbrösel', 'panko', 'paniert', 'panade',
+    'fischstäbchen', 'backfisch', 'cordon', 'nugget', 'krokette', 'frikadelle', 'bulette', 'hackbällchen', 'köttbullar',
+    'röstzwiebel', 'crouton', 'croûton', 'tempura', 'pizzaboden', 'teig', 'croissant', 'zwieback', 'knödel', 'kloß', 'klöße',
+    'keks', 'kuchen', 'sojasauce', 'sojasoße', 'sojasosse', 'worcester', 'seitan', 'graupe', 'cracker', 'müsli', 'bier',
+    'orzo', 'kritharaki', 'udon', 'ramen', 'mie'],
   ausser: ['reisnudel', 'glasnudel', 'maismehl', 'reismehl', 'kichererbsenmehl', 'mandelmehl', 'kokosmehl', 'buchweizen',
-    'maistortilla', 'glutenfrei', 'reispapier', 'johannisbrotkernmehl'] },
+    'maistortilla', 'glutenfrei', 'reispapier', 'johannisbrotkernmehl', 'schmalz'] },
   { id: 'ei', name: 'Ei', woerter: EI, ausser: ['vegan', 'pflanzlich'] },
-  { id: 'soja', name: 'Soja', woerter: ['soja', 'tofu', 'tempeh', 'edamame', 'miso'], ausser: [] },
+  { id: 'soja', name: 'Soja', woerter: ['soja', 'tofu', 'tempeh', 'edamame', 'miso', 'shoyu', 'tamari'], ausser: [] },
   { id: 'fisch', name: 'Fisch', woerter: FISCH, ausser: FISCH_AUSSER },
 ]);
 
@@ -78,7 +88,7 @@ export function normalisiereProfil(p = {}) {
   const q = p && typeof p === 'object' ? p : {};
   const protein = auswahl(q.protein, PROTEIN_IDS);
   const mahlzeiten = auswahl(q.mahlzeiten, SLOT_IDS);
-  // Läden in der gewählten Reihenfolge (bei Gleichstand gewinnt der erste), höchstens 3
+  // Läden in der gewählten Reihenfolge (bei gleichen Gesamtkosten ist der erste der Hauptladen), höchstens 3
   const laeden = [...new Set(Array.isArray(q.laeden) ? q.laeden : [])].filter((id) => LADEN_IDS.includes(id)).slice(0, 3);
   const ohneRoh = Array.isArray(q.ohne) ? q.ohne : typeof q.ohne === 'string' ? q.ohne.split(',') : [];
   const budget = parseZahl(q.budget);
@@ -149,40 +159,71 @@ function zutatenSchluessel(rezept) {
   return keys;
 }
 
-const ERSATZ_RE = /vegan|vegetarisch|veggie|pflanzlich|fleischersatz|soja|tofu|seitan|tempeh/;
+// Ersatzprodukt, wenn das Ersatz-Wort vorne steht ('Sojahack', 'Tofu-Würstchen', 'vegane Bratwurst'); in
+// 'Hähnchenbrust in Sojasauce' ist nur der Teil nach 'in' Soja – das Hähnchen zählt
+const ERSATZ_RE = new RegExp('(?:^|[\\s-])(?:vegan|vegetarisch|veggie|pflanzlich|fleischersatz|fleischlos|fleischfrei)' +
+  '|^(?:soja|tofu|seitan|tempeh|lupine)');
+const TEILE_RE = / (?:in|im|mit|und|oder|auf|aus|an|nach) |, /;
 const KEIN_FLEISCH_RE = /fruchtfleisch|kokosfleisch|fleischtomate|butterschmalz|hirschhornsalz|ochsenherz/g;
 // Muster aus Wortlisten: `ueberall` auch mitten im Wort, `anfang` nur am Wortanfang ('reh' ≠ 'rehydriert')
 const muster = (ueberall, anfang = []) =>
   new RegExp([...ueberall, ...(anfang.length ? [`(?:^|[\\s-])(?:${anfang.join('|')})`] : [])].join('|'));
 const GEFLUEGEL_RE = muster(['hähnchen', 'hühnchen', 'huhn', 'hühner(?!ei)', 'hendl', 'chicken', 'geflügel', 'poularde',
-  'kaninchen', 'truthahn'], ['pute', 'ente(?:n|$|[\\s,])', 'gans', 'gänse']);
-const RIND_RE = muster(['rind', 'beef', 'kalb', 'tafelspitz', 'rumpsteak', 'hüftsteak', 'entrecote', 'bresaola', 'hammel',
-  'hirsch'], ['lamm', 'ochse', 'reh', 'steak', 'gulasch', 'roulade']);
+  'kaninchen', 'truthahn', 'wachtel(?!ei)'], ['pute', 'ente(?:n|$|[\\s,])', 'gans', 'gänse']);
+// 'Steak', 'Gulasch', 'Roulade' allein sind Rind ('Halloumi-Steak', 'Pilz-Gulasch' nicht)
+const RIND_RE = muster(['rind', 'beef', 'kalb', 'tafelspitz', 'rumpsteak', 'hüftsteak', 'entrecote', 'bresaola', 'pastrami',
+  'hammel', 'hirsch', 'merguez', 'köfte', 'kofta', '^(?:steak|gulasch|roulade)'], ['lamm', 'ochse', 'reh',
+  'wild(?:gulasch|braten|fleisch|ragout|keule|rücken|steak|medaillon|hack|bret)']);
 const SCHWEIN_RE = muster(['schwein', 'speck', 'bacon', 'kassler', 'kasseler', 'pancetta', 'guanciale', 'prosciutto',
-  'chorizo', 'gelatine', 'eisbein', 'spareribs', 'pork']);
+  'serrano', 'lardo', 'chorizo', 'salsiccia', 'nduja', 'gelatine', 'eisbein', 'spareribs', 'rippchen', 'nacken',
+  'bauchfleisch', 'schaschlik', 'cordon bleu', 'pork']);
 // Wurst, Schinken & Co. sind Schwein, außer Geflügel/Rind steht dabei ('putenschinken', 'rindersalami')
 const WURST_RE = muster(['schinken', 'salami', 'wurst', 'würstchen', 'mortadella', 'leberkäse', 'fleischkäse', 'schmalz',
-  'cabanossi', 'lyoner', 'zwiebelmett'], ['mett', 'wiener', 'schnitzel', 'kotelett', 'haxe', 'gyros']);
+  'cabanossi', 'kabanos', 'krakauer', 'debrecziner', 'lyoner', 'zwiebelmett', 'landjäger'],
+['mett', 'wiener', 'frankfurter(?:$|,)', 'schnitzel', 'kotelett', 'haxe', 'gyros']);
 const ANDERES_TIER_RE = muster(['hähnchen', 'hühnchen', 'huhn', 'hühner', 'pute', 'geflügel', 'gans', 'gänse', 'ente',
   'rind', 'kalb', 'lamm', 'hirsch', 'reh']);
 // Hack ohne Tierart = gemischt; 'gehackt' (Tomaten) zählt nicht
 const HACK_RE = muster(['[a-zäöü]hack(?:fleisch)?(?:$|[\\s,])'],
   ['hack', 'gehacktes', 'frikadelle', 'bulette', 'köttbullar', 'cevapcici']);
+// Fleisch, dessen Tierart offen ist (Geschnetzeltes, Minutensteak, Leber, Bratenfond …) → zählt als jedes Fleisch
+const UNBEKANNT_RE = muster(['geschnetzelt', 'steak', 'medaillon', 'leber', 'niere', 'innerei', 'döner', 'kebab',
+  'schawarma', 'shawarma', 'fond(?!ue|ant)', 'bratensaft', 'bratenfett'], ['braten(?!soße|sosse|sauce)']);
+const UNBEKANNT = ['schwein', 'rind', 'gefluegel'];
+// Gemüse & Co. vorne: 'Blumenkohlsteak', 'Pilzgulasch', 'Gemüsefond' sind kein Fleisch
+const PFLANZE_VORNE_RE = new RegExp(`^(?:${['gemüse', 'pilz', 'champignon', 'kartoffel', 'süßkartoffel', 'sellerie',
+  'blumenkohl', 'brokkoli', 'kohlrabi', 'kohl', 'aubergine', 'zucchini', 'kürbis', 'spargel', 'tomate', 'paprika', 'spinat',
+  'möhre', 'karotte', 'rote[- ]bete', 'linse', 'bohne', 'kichererbse', 'erbse', 'lupine', 'grünkern', 'hafer', 'dinkel',
+  'quinoa', 'falafel', 'halloumi', 'käse', 'nuss', 'walnuss', 'jackfruit', 'reis'].join('|')})`);
 
 // Tierisches in einem Zutaten-Schlüssel
 function tiereIn(roh) {
-  const key = roh.replace(KEIN_FLEISCH_RE, ' ');
   const t = new Set();
-  if (ERSATZ_RE.test(key)) return t;
-  if (GEFLUEGEL_RE.test(key)) t.add('gefluegel');
-  if (RIND_RE.test(key)) t.add('rind');
-  if (SCHWEIN_RE.test(key)) t.add('schwein');
-  if (treffer(key, FISCH, FISCH_AUSSER)) t.add('fisch');
-  const anderes = ANDERES_TIER_RE.test(key);
-  if (WURST_RE.test(key) && !anderes) t.add('schwein');
-  if (HACK_RE.test(key) && !anderes && !/schwein/.test(key)) { t.add('rind'); t.add('schwein'); }
+  let ersatz = false;
+  for (const teil of roh.replace(KEIN_FLEISCH_RE, ' ').split(TEILE_RE)) {
+    const key = teil.trim();
+    if (!key) continue;
+    if (ERSATZ_RE.test(key)) { ersatz = true; continue; }
+    const vorher = t.size;
+    if (GEFLUEGEL_RE.test(key)) t.add('gefluegel');
+    if (RIND_RE.test(key)) t.add('rind');
+    if (SCHWEIN_RE.test(key)) t.add('schwein');
+    if (treffer(key, FISCH, FISCH_AUSSER)) t.add('fisch');
+    const anderes = ANDERES_TIER_RE.test(key);
+    if (WURST_RE.test(key) && !anderes) t.add('schwein');
+    if (HACK_RE.test(key) && !anderes && !/schwein/.test(key)) { t.add('rind'); t.add('schwein'); }
+    if (t.size === vorher && UNBEKANNT_RE.test(key) && !PFLANZE_VORNE_RE.test(key)) UNBEKANNT.forEach((x) => t.add(x));
+  }
   // nur 'Fleisch' ohne Tierart ('Suppenfleisch', 'Fleischbrühe') → Rind
-  if (!t.size && /fleisch/.test(key)) t.add('rind');
+  const ohneAusnahmen = roh.replace(KEIN_FLEISCH_RE, ' ');
+  if (!t.size && !ersatz && /fleisch/.test(ohneAusnahmen)) t.add('rind');
+  // Sicherheitsnetz: was die Einkaufsliste unter Fleisch oder Fisch einsortiert, ist nicht vegetarisch
+  if (!t.size && !ersatz && ohneAusnahmen === roh && !PFLANZE_VORNE_RE.test(roh) &&
+    !FISCH_AUSSER.some((a) => roh.includes(a))) {
+    const abteilung = abteilungVon(roh);
+    if (abteilung === 'fisch') t.add('fisch');
+    else if (abteilung === 'fleisch') UNBEKANNT.forEach((x) => t.add(x));
+  }
   return t;
 }
 
@@ -202,8 +243,52 @@ export function erkenneProtein(rezept) {
 const FRUEH_RE = /frühstück|fruehstueck|breakfast|müsli|porridge|overnight|granola|haferbrei/i;
 const KEIN_GERICHT_RE = muster(['torten?(?![a-zäöü])', 'plätzchen', 'kekse', 'cookies', 'muffins?(?![a-zäöü])', 'brownie',
   'dessert', 'nachtisch', 'cocktail', 'likör', 'marmelade', 'konfitüre', 'sirup', 'smoothie', 'getränk', 'punsch']);
+const GRUNDREZEPT_RE = /grundrezept|basisrezept|grundteig/;
 const KEIN_GERICHT_TAGS = new Set(['dessert', 'nachtisch', 'kuchen', 'torte', 'gebäck', 'plätzchen', 'kekse', 'getränk',
-  'getränke', 'drink', 'drinks', 'cocktail']);
+  'getränke', 'drink', 'drinks', 'cocktail', 'grundrezept', 'basisrezept', 'sauce', 'saucen', 'soße', 'soßen', 'dip',
+  'dips', 'dressing', 'aufstrich', 'brotaufstrich', 'marmelade', 'konfitüre']);
+// Letztes Wort des Gerichts: Teige, Butter, Saucen, Dips, Desserts und Getränke sind keine Mahlzeit ('Kräuterbutter',
+// 'Pizzateig', 'Tiramisu', 'Eistee'); 'Milchreis' ist kein Eis (wohl aber 'Erdbeereis')
+const KEIN_GERICHT_KOPF_RE = new RegExp(`(?:${['teig', 'butter', 'dips?', 'dressing', 'vinaigrette', 'marinade', 'sauce',
+  'soße', 'sosse', 'pesto', 'aioli', 'mayonnaise', 'mayo', 'remoulade', 'ketchup', 'chutney', 'relish', 'guacamole',
+  'hummus', 'tsatsiki', 'tzatziki', 'zaziki', 'hollandaise', 'béchamel', 'bechamel', 'aufstrich', 'creme', 'crème',
+  'brûlée', 'brulee', 'fond', 'gewürzmischung', 'gewürzsalz', 'glasur', 'füllung', 'topping', 'streusel', 'tiramisu',
+  'mousse', 'pudding', 'cotta', 'parfait', 'sorbet',
+  'kompott', 'grütze', 'mus', '(?<!r)eis', 'beereis', 'tee', 'saft', 'limonade', 'bowle', 'schorle', 'shake', 'kakao',
+  'kaffee', 'drink', 'cupcakes?', 'cheesecake', 'donuts?', 'schnecken?', 'makronen', 'cantuccini', 'pralinen?',
+  'konfekt', 'trüffel', 'riegel', 'stollen'].join('|')})$`);
+// Kuchen ist Gebäck, außer herzhaft ('Zwiebelkuchen', 'Pfannkuchen', 'Kartoffelküchlein')
+const KUCHEN_RE = /(?:kuchen|küchlein)$/;
+const HERZHAFT_RE = /zwiebel|pfann|kartoffel|flamm|reibe|lauch|spinat|gemüse|speck|kraut|hack|pilz|tomate|lachs|fisch/;
+// Brot, Brötchen & Co. mit Mehl oder Hefe in den Zutaten werden gebacken, nicht als Mahlzeit gegessen
+// ('Pizzabrötchen' und 'Abendbrot' schon)
+const GEBAECK_RE = /^(?!pizza|abend).*(?:brot|brötchen|baguette|ciabatta|focaccia|zopf|stuten|semmeln?|brezeln?|bagels?)$/;
+const BACKZUTAT_RE = /mehl|hefe|sauerteig/;
+// Zusätze hinter dem Gericht ('Apfelmus selbst gemacht', 'Pizzateig – schnell')
+const FUELLWORT_RE = new RegExp(`(?:^|\\s)(?:${['selbst ?gemacht', 'hausgemacht', 'klassisch', 'einfach', 'schnell',
+  'lecker', 'vegan', 'vegetarisch', 'glutenfrei', '[–—]'].join('|')})(?=\\s|$)`, 'g');
+
+// Kein Gericht nach dem Titel? Zählt nur das Gericht selbst, nicht die Beilage ('Pfannkuchen mit Ahornsirup')
+function keinGericht(r, tags) {
+  const ganz = String(r.title ?? '').toLowerCase();
+  const titel = ganz.split(/ (?:mit|und|an|auf|in|im|dazu|vom|von|aus|nach|für|zum|zur|à|alla|al|au|aux) /)[0];
+  if (KEIN_GERICHT_RE.test(titel) || GRUNDREZEPT_RE.test(ganz) || tags.some((t) => KEIN_GERICHT_TAGS.has(t))) return true;
+  const kopf = titel.replace(/\([^)]*\)/g, ' ').replace(FUELLWORT_RE, ' ').trim().split(/[\s,/-]+/).filter(Boolean)
+    .at(-1) ?? '';
+  if (KEIN_GERICHT_KOPF_RE.test(kopf)) return true;
+  if (KUCHEN_RE.test(kopf) && !HERZHAFT_RE.test(kopf)) return true;
+  if (GEBAECK_RE.test(kopf) && zutatenSchluessel(r).some((k) => BACKZUTAT_RE.test(k))) return true;
+  return zuckerGramm(r) >= 100;
+}
+
+// Angegebenes und erkanntes Protein zusammen: Fleisch und Fisch aus beiden zählen, fleischlos nur, wenn beides passt
+// (eine bearbeitete Kopie eines veganen Grundrezepts mit Speck ist nicht mehr vegan)
+function mitErkanntem(angegeben, erkannt) {
+  const tiere = [...angegeben, ...erkannt].filter((id) => id !== 'vegetarisch' && id !== 'vegan');
+  if (tiere.length) return [...new Set(tiere)];
+  const vegan = angegeben.includes('vegan') && !angegeben.includes('vegetarisch') && erkannt.includes('vegan');
+  return [vegan ? 'vegan' : 'vegetarisch'];
+}
 
 // Gramm Zucker (für Kuchen-Erkennung bei eigenen Rezepten ohne Mahlzeit-Angabe)
 function zuckerGramm(r) {
@@ -219,40 +304,103 @@ function zuckerGramm(r) {
 
 /**
  * { mahlzeit, protein, totalMin }: Angaben des Rezepts, sonst erkannt (mahlzeit 'haupt' bzw. 'frueh' an Titel/Tags;
- * Kuchen, Desserts und Getränke → null = nicht planbar; Zeit = totalMin ?? prep + cook ?? 30).
+ * Kuchen, Teige, Saucen, Desserts und Getränke → null = nicht planbar; Zeit = totalMin ?? prep + cook ?? 30).
+ * Ein angegebenes Protein gilt nie weniger streng als die Zutaten (Fleisch aus den Zutaten kommt dazu).
  */
 export function rezeptMeta(rezept) {
   const r = rezept && typeof rezept === 'object' ? rezept : {};
   const tags = Array.isArray(r.tags) ? r.tags.map((t) => String(t).toLowerCase()) : [];
   let mahlzeit = r.mahlzeit === 'haupt' || r.mahlzeit === 'frueh' ? r.mahlzeit : null;
   if (!mahlzeit) {
-    // nur das Gericht selbst zählt, nicht die Beilage ('Pfannkuchen mit Ahornsirup')
     const titel = String(r.title ?? '').toLowerCase().split(/ (?:mit|und|an|auf|in|dazu) /)[0];
-    const kein = KEIN_GERICHT_RE.test(titel) || tags.some((t) => KEIN_GERICHT_TAGS.has(t)) || zuckerGramm(r) >= 100;
-    mahlzeit = kein ? null : FRUEH_RE.test([titel, ...tags].join(' ')) ? 'frueh' : 'haupt';
+    mahlzeit = keinGericht(r, tags) ? null : FRUEH_RE.test([titel, ...tags].join(' ')) ? 'frueh' : 'haupt';
   }
-  const eigene = Array.isArray(r.protein) ? r.protein.filter((id) => PROTEIN_IDS.includes(id)) : [];
+  const eigene = Array.isArray(r.protein) ? [...new Set(r.protein.filter((id) => PROTEIN_IDS.includes(id)))] : [];
+  const erkannt = erkenneProtein(r);
   const zahl = (x) => (Number(x) > 0 ? Number(x) : null);
   const summe = (zahl(r.prepMin) ?? 0) + (zahl(r.cookMin) ?? 0);
-  return { mahlzeit, protein: eigene.length ? [...new Set(eigene)] : erkenneProtein(r),
+  return { mahlzeit, protein: eigene.length ? mitErkanntem(eigene, erkannt) : erkannt,
     totalMin: zahl(r.totalMin) ?? (summe > 0 ? summe : 30) };
 }
 
-// 'Pilze' meint auch Champignons; Allergen-Namen im Freitext ('gluten') zählen wie die Auswahl
-const OHNE_SYNONYME = {
-  pilz: ['pilz', 'champignon', 'pfifferling', 'shiitake', 'seitling', 'morchel', 'enoki'],
-  scharf: ['chili', 'peperoni', 'jalapeño', 'jalapeno', 'cayenne', 'sambal', 'sriracha', 'tabasco', 'harissa'],
-  zwiebel: ['zwiebel', 'schalotte'],
-  meeresfrüchte: ['garnele', 'shrimp', 'krabbe', 'scampi', 'gamba', 'muschel', 'calamar', 'tintenfisch', 'oktopus'],
+// „Lieber nicht“ im Freitext (Schlüssel-Form): Tierarten wirken wie das Abwählen bei „Was esst ihr gern?“
+// ('schwein' trifft auch Speck, Schinken und Wurst), Gruppen wie die Allergen-Auswahl ('milch' → Laktose),
+// sonst Wortteile samt verwandten Wörtern ('pilz' meint auch Champignons)
+const FLEISCH_IDS = ['schwein', 'rind', 'gefluegel', 'fisch'];
+const OHNE_TIERE = {
+  schwein: ['schwein'], schweinefleisch: ['schwein'], pork: ['schwein'],
+  rind: ['rind'], rinder: ['rind'], rindfleisch: ['rind'], beef: ['rind'],
+  geflügel: ['gefluegel'], geflügelfleisch: ['gefluegel'], hähnchen: ['gefluegel'], hähnchenfleisch: ['gefluegel'],
+  hühnchen: ['gefluegel'], huhn: ['gefluegel'], hühnerfleisch: ['gefluegel'], chicken: ['gefluegel'],
+  fleisch: ['schwein', 'rind', 'gefluegel'], fisch: ['fisch'],
 };
-function ohneWoerter(wort) {
-  const a = ALLERGENE.find((x) => x.id === wort || x.name.toLowerCase() === wort);
-  return a ? [a.woerter, a.ausser] : [OHNE_SYNONYME[wort] ?? [wort], []];
+const OHNE_GRUPPEN = {
+  milch: 'laktose', milchprodukt: 'laktose', milchprodukte: 'laktose', milchzucker: 'laktose', nuss: 'nuesse',
+  schalenfrucht: 'nuesse', schalenfrüchte: 'nuesse',
+};
+// Weizen: alles Glutenhaltige außer Hafer, Roggen und Gerste
+const GLUTEN = ALLERGENE.find((a) => a.id === 'gluten');
+const WEIZEN = { woerter: GLUTEN.woerter.filter((w) => !['hafer', 'roggen', 'gerste', 'graupe', 'malz'].includes(w)),
+  ausser: GLUTEN.ausser };
+const OHNE_SYNONYME = {
+  pilz: { woerter: ['pilz', 'champignon', 'pfifferling', 'shiitake', 'seitling', 'morchel', 'enoki'] },
+  scharf: { woerter: ['chili', 'peperoni', 'jalapeño', 'jalapeno', 'cayenne', 'sambal', 'sriracha', 'tabasco', 'harissa'] },
+  zwiebel: { woerter: ['zwiebel', 'schalotte'] },
+  meeresfrüchte: { woerter: ['garnele', 'shrimp', 'krabbe', 'scampi', 'gamba', 'muschel', 'calamar', 'kalmar',
+    'tintenfisch', 'sepia', 'oktopus', 'hummer', 'languste', 'krebs', 'auster'], ausser: FISCH_AUSSER },
+  pute: { woerter: ['pute', 'truthahn'] },
+  speck: { woerter: ['speck', 'bacon', 'pancetta', 'guanciale', 'lardo'] },
+  schinken: { woerter: ['schinken', 'prosciutto', 'serrano'] },
+  wurst: { woerter: ['wurst', 'würstchen', 'wiener', 'frankfurter', 'krakauer', 'debrecziner', 'salami', 'mortadella',
+    'chorizo', 'salsiccia', 'merguez', 'cabanossi', 'kabanos', 'lyoner', 'leberkäse', 'fleischkäse', 'landjäger', 'mett'] },
+  käse: { woerter: ['käse', 'mozzarella', 'parmesan', 'parmigiano', 'grana padano', 'gouda', 'emmentaler', 'edamer', 'feta',
+    'ricotta', 'mascarpone', 'halloumi', 'paneer', 'camembert', 'brie', 'gorgonzola', 'pecorino', 'burrata', 'cheddar',
+    'raclette', 'manchego', 'provolone', 'scamorza', 'cheese'], ausser: ['leberkäse', 'fleischkäse'] },
+  lamm: { woerter: ['lamm'], ausser: ['flammkuchen'] },
+  wein: { woerter: ['wein', 'sekt', 'prosecco', 'sherry', 'marsala'], ausser: ['schwein', 'weintraube', 'weinblatt',
+    'weinbeere', 'weinstein', 'weinessig'] },
+  weizen: WEIZEN, weizenmehl: WEIZEN,
+};
+
+// Regel zu einem Wort: { tiere, woerter, ausser, gruppe }
+function ohneRegel(wort) {
+  const id = OHNE_GRUPPEN[wort] ?? ALLERGENE.find((x) => x.id === wort || x.name.toLowerCase() === wort)?.id;
+  const gruppe = id ? ALLERGENE.find((x) => x.id === id) : null;
+  const tiere = OHNE_TIERE[wort] ?? [];
+  const s = OHNE_SYNONYME[wort];
+  if (gruppe) return { tiere, woerter: gruppe.woerter, ausser: gruppe.ausser, gruppe };
+  if (s) return { tiere, woerter: s.woerter, ausser: s.ausser ?? [], gruppe: null };
+  return { tiere, woerter: tiere.length ? [] : [wort], ausser: [], gruppe: null };
+}
+
+const TIER_TEXT = {
+  schwein: 'alle Gerichte mit Schweinefleisch, auch Speck, Schinken und Wurst',
+  rind: 'alle Gerichte mit Rindfleisch, auch gemischtes Hack',
+  gefluegel: 'alle Gerichte mit Geflügel (Hähnchen, Pute, Ente …)',
+  'gefluegel|rind|schwein': 'alle Gerichte mit Fleisch (Fisch bleibt erlaubt)',
+};
+
+/**
+ * Wie wirkt ein Wort aus „Lieber nicht“? → kurzer Text für die Anzeige, z. B. 'Schwein' → 'alle Gerichte mit
+ * Schweinefleisch, auch Speck, Schinken und Wurst'; '' ohne Wort.
+ */
+export function ohneBedeutung(eingabe) {
+  const wort = zutatSchluessel(String(eingabe ?? '').slice(0, 40));
+  if (!wort) return '';
+  const r = ohneRegel(wort);
+  if (r.tiere.includes('fisch')) return 'alle Gerichte mit Fisch und Meeresfrüchten';
+  if (r.tiere.length) return TIER_TEXT[[...r.tiere].sort().join('|')];
+  if (r.gruppe) return `wie „${r.gruppe.name}“: ${r.gruppe.woerter.slice(0, 5).join(', ')} …`;
+  if (r.woerter.length > 1) return `Zutaten mit ${r.woerter.slice(0, 4).join(', ')} …`;
+  return `Zutaten mit „${wort}“ im Namen`;
 }
 
 function pruefe(rezept, p, meta) {
+  // Frühstück: wer Fleisch oder Fisch wählt, isst morgens trotzdem Müsli & Co. – fleischlos ist dann erlaubt
+  const protein = meta.mahlzeit === 'frueh' && p.protein.some((x) => FLEISCH_IDS.includes(x))
+    ? [...p.protein, 'vegetarisch'] : p.protein;
   for (const pr of meta.protein) {
-    const ok = pr === 'vegan' ? p.protein.includes('vegan') || p.protein.includes('vegetarisch') : p.protein.includes(pr);
+    const ok = pr === 'vegan' ? protein.includes('vegan') || protein.includes('vegetarisch') : protein.includes(pr);
     if (!ok) return { ok: false, grund: `Nicht gewählt: ${PROTEINE.find((x) => x.id === pr)?.name ?? pr}` };
   }
   const keys = zutatenSchluessel(rezept);
@@ -261,8 +409,10 @@ function pruefe(rezept, p, meta) {
     if (keys.some((k) => treffer(k, a.woerter, a.ausser))) return { ok: false, grund: `Enthält ${a.name}` };
   }
   for (const wort of p.ohne) {
-    const [woerter, ausser] = ohneWoerter(wort);
-    if (keys.some((k) => treffer(k, woerter, ausser))) return { ok: false, grund: `Enthält ${wort}` };
+    const r = ohneRegel(wort);
+    if (r.tiere.some((t) => meta.protein.includes(t)) || keys.some((k) => treffer(k, r.woerter, r.ausser))) {
+      return { ok: false, grund: `Enthält ${wort}` };
+    }
   }
   if (!kochzeitPasst(meta.totalMin, p.kochzeit, meta.mahlzeit)) {
     return { ok: false, grund: `Dauert ${zeitText(meta.totalMin)}` };
@@ -360,7 +510,7 @@ function kostenVon(ctx, idx, alt, plus, vz, vage) {
     });
     const key = ctx.keys[idx];
     k = kostenFuer(key, teile, ctx.laeden, { eigenePreise: ctx.eigenePreise, tabelle: ctx.tabelle, vorrat: ctx.vorrat,
-      abteilung: abteilungVon(key, {}, teile.map((t) => t.unit)) });
+      abteilung: abteilungVon(key, {}, teile.map((t) => t.unit)), jeLaden: ctx.laeden.length > 1 });
     if (memo.size > 5000) memo.clear();
     memo.set(sig, k);
   }
@@ -371,7 +521,8 @@ function kostenVon(ctx, idx, alt, plus, vz, vage) {
 // `stand` zählt Änderungen, `geaendert[idx]` merkt den Stand der letzten Änderung einer Zutat.
 class Korb {
   constructor(ctx) {
-    Object.assign(this, { ctx, mengen: [], vage: [], betrag: [], laden: [], geaendert: [], gesamt: 0, stand: 0 });
+    Object.assign(this, { ctx, mengen: [], vage: [], betrag: [], laden: [], jeLaden: [], geaendert: [], gesamt: 0,
+      stand: 0 });
   }
 
   /** Kostenänderung, wenn das Gericht hinzukäme (vz = 1) bzw. wegfiele (vz = -1). */
@@ -394,6 +545,7 @@ class Korb {
       this.gesamt += k.betrag - (this.betrag[idx] || 0);
       this.betrag[idx] = k.betrag;
       this.laden[idx] = k.laden;
+      this.jeLaden[idx] = k.jeLaden;
       this.geaendert[idx] = this.stand;
     }
   }
@@ -417,6 +569,8 @@ function zufall(seed, platz, id) {
 
 const WIEDERHOLUNG = { frueh: 1.5, haupt: 6 };
 const FRUEH_PAUSE = 2; // Tage, bevor dasselbe Frühstück wiederkommt
+const FRUEH_WOCHE = 2; // so oft darf ein Frühstück beim Sparen in 7 Tagen vorkommen
+const BODEN = 0.2; // Mindestkosten eines Gerichts beim Bewerten (Anteil der typischen Kosten)
 const cent = (x) => Math.round(x * 100) / 100;
 const euroText = (x) => `${new Intl.NumberFormat('de-DE', { maximumFractionDigits: 2 }).format(x)} €`;
 
@@ -427,16 +581,31 @@ function alsListe(rezepte) {
   return [...nachId.values()];
 }
 
+// Eigene Rezepte ohne Mahlzeit-Angabe, die allein gekauft weniger als das je Portion kosten, sind Zutaten oder
+// Beilagen ('Croutons', 'Knoblauchöl', 'Gemüsebrühe'), keine Mahlzeit (Grießbrei, Milchreis kosten ≈ 0,45 €)
+const MAHLZEIT_AB = 0.4;
+function fastKostenlos(r, posten, ctx) {
+  let summe = 0;
+  for (const [key, m] of posten) {
+    const teile = Object.entries(m).map(([unit, qty]) => ({ qty, qty2: null, unit }));
+    summe += kostenFuer(key, teile, ctx.laeden, { tabelle: ctx.tabelle,
+      abteilung: abteilungVon(key, {}, teile.map((t) => t.unit)) }).betrag;
+  }
+  return summe / (Number(r.servings) > 0 ? Number(r.servings) : 1) < MAHLZEIT_AB;
+}
+
 // Kandidaten je Art: Mengen auf `personen` skaliert, Posten als [Zutat-Index, Mengen je Basis-Einheit, vage]
 function kandidaten(rezepte, p, ctx) {
   const nach = { frueh: [], haupt: [] };
   const roh = [];
   for (const r of alsListe(rezepte)) {
-    if (!p.eigeneRezepte && r.herkunft !== 'grund' && r.herkunft !== 'ki') continue;
+    const eigen = r.herkunft !== 'grund' && r.herkunft !== 'ki';
+    if (!p.eigeneRezepte && eigen) continue;
     const meta = rezeptMeta(r);
     if (!meta.mahlzeit || !pruefe(r, p, meta).ok) continue;
     const posten = rezeptPosten(r);
     if (posten.filter(([, m]) => Object.keys(m).length).length < 2) continue; // ohne Mengen nichts einzukaufen
+    if (eigen && r.mahlzeit !== 'haupt' && r.mahlzeit !== 'frueh' && fastKostenlos(r, posten, ctx)) continue;
     for (const [key, m] of posten) {
       const basen = ctx.basen[zutatIndex(ctx, key)];
       for (const b of Object.keys(m)) if (!basen.includes(b)) basen.push(b);
@@ -552,17 +721,62 @@ class Suche {
     return n;
   }
 
+  // Beilagen der nächsten `weite` Hauptgerichte in Richtung `schritt` (-1 davor, 1 danach)
+  beilagenNeben(i, schritt, weite) {
+    const liste = [];
+    for (let j = i + schritt; j >= 0 && j < this.slots.length && liste.length < weite; j += schritt) {
+      if (this.slots[j].art === 'haupt' && this.gewaehlt[j]) liste.push(this.gewaehlt[j].beilage);
+    }
+    return liste;
+  }
+
+  // gleiche Beilage in den letzten 6 Hauptgerichten: Nudeln nicht jeden zweiten Tag, auch wenn die angebrochene
+  // Packung sie billig macht
+  beilagen(c, i) {
+    return c.beilage ? this.beilagenNeben(i, -1, 6).filter((b) => b === c.beilage).length : 0;
+  }
+
+  // in allen 7 Hauptgerichten hintereinander, zu denen Platz i gehört, höchstens 3 gleiche Beilagen und nie
+  // dreimal in Folge
+  beilageZuOft(c, i) {
+    if (!c.beilage) return false;
+    const vor = this.beilagenNeben(i, -1, 6).map((b) => b === c.beilage).reverse();
+    const reihe = [...vor, true, ...this.beilagenNeben(i, 1, 6).map((b) => b === c.beilage)];
+    const mitte = vor.length;
+    const anzahl = (von, laenge) => reihe.slice(Math.max(0, von), von + laenge).filter(Boolean).length;
+    for (let a = mitte - 2; a <= mitte; a++) if (a >= 0 && anzahl(a, 3) === 3) return true;
+    for (let a = mitte - 6; a <= mitte; a++) if (anzahl(a, 7) > 3) return true;
+    return false;
+  }
+
   bewerte(c, i) {
-    let wert = -this.kosten(c) / this.typisch[c.art] - WIEDERHOLUNG[c.art] * this.anzahl(c, i);
-    if (c.art === 'haupt') wert -= this.strafe(c, i) + 0.5 * this.haeufung(c, i);
+    // fast kostenlose Gerichte (angebrochene Packungen, Vorrat) zählen mit einem Mindestanteil der üblichen Kosten
+    const typisch = this.typisch[c.art];
+    let wert = -Math.max(this.kosten(c), BODEN * typisch) / typisch - WIEDERHOLUNG[c.art] * this.anzahl(c, i);
+    if (c.art === 'haupt') {
+      const b = this.beilagen(c, i);
+      wert -= this.strafe(c, i) + 0.5 * this.haeufung(c, i) + 0.3 * b + (b >= 3 ? 1.5 : 0);
+    }
     return wert + (c.favorit ? 0.6 : 0) + zufall(this.seed, i, c.id);
   }
 
-  // bestes Rezept für Platz i aus `pool` (null, wenn keins da ist)
+  // Frühstück beim Sparen: höchstens FRUEH_WOCHE-mal in 7 Tagen (sonst gäbe es fünfmal das billigste)
+  fruehZuOft(c, i) {
+    let n = 1;
+    for (let j = 0; j < this.gewaehlt.length; j++) {
+      if (j !== i && this.gewaehlt[j] === c && Math.abs(this.slots[j].tag - this.slots[i].tag) < 7) n += 1;
+    }
+    return n > FRUEH_WOCHE;
+  }
+
+  // bestes Rezept für Platz i aus `pool` (null, wenn keins da ist); dieselbe Beilage nie dreimal in Folge und
+  // höchstens dreimal in sieben Hauptgerichten, solange es Alternativen gibt
   waehle(i, pool) {
     let liste = pool.filter((c) => this.erlaubt(c, i));
     if (!liste.length) liste = pool.filter((c) => c !== this.nachbar(i, -1) && c !== this.gewaehlt[i - 1]);
     if (!liste.length) liste = pool;
+    const abwechslungsreich = liste.filter((c) => c.art !== 'haupt' || !this.beilageZuOft(c, i));
+    if (abwechslungsreich.length) liste = abwechslungsreich;
     let best = null;
     let bestWert = -Infinity;
     for (const c of liste) {
@@ -579,7 +793,7 @@ class Suche {
   }
 
   // Günstiger tauschen, bis das Budget passt oder nichts mehr hilft (höchstens 60 Runden): zuerst der Platz mit
-  // dem größten Kostenanteil; die Vielfalt darf dabei nicht deutlich leiden
+  // dem größten Kostenanteil; die Vielfalt darf dabei nicht deutlich leiden (Nachbarn, Beilagen, Frühstück je Woche)
   spare(budget) {
     for (let runde = 0; runde < 60 && this.korb.gesamt > budget + 0.005; runde++) {
       const reihe = this.gewaehlt.map((c, i) => ({ i, anteil: c ? -this.korb.delta(c, -1) : -Infinity }))
@@ -593,7 +807,9 @@ class Suche {
         let best = alt;
         let bestKosten = vorher - this.korb.gesamt - 0.01; // so viel spart das Weglassen
         for (const c of this.nach[alt.art]) {
-          if (c === alt || !this.erlaubt(c, i) || (c.art === 'haupt' && this.strafe(c, i, true) > grenze)) continue;
+          if (c === alt || !this.erlaubt(c, i)) continue;
+          if (c.art === 'frueh' ? this.fruehZuOft(c, i) : this.strafe(c, i, true) > grenze ||
+            (c.beilage !== alt.beilage && this.beilageZuOft(c, i))) continue;
           const k = this.kosten(c);
           if (k < bestKosten - 1e-9) [best, bestKosten] = [c, k];
         }
@@ -616,8 +832,12 @@ class Suche {
       eintraege.push({ datum: s.datum, slot: s.slot, rezeptId: c.id, titel: c.titel, portionen: p.personen,
         minuten: c.minuten, kosten: cent(kosten) });
     });
+    // gleich teure Zutaten kommen in den Hauptladen (kein zweiter Laden ohne Ersparnis)
     const proLaden = Object.fromEntries(p.laeden.map((id) => [id, 0]));
-    korb.laden.forEach((l, idx) => { if (l && Object.hasOwn(proLaden, l)) proLaden[l] += korb.betrag[idx]; });
+    const posten = korb.laden.map((laden, idx) => ({ laden, betrag: korb.betrag[idx], jeLaden: korb.jeLaden[idx] }));
+    verteileLaeden(posten, p.laeden).forEach((l, idx) => {
+      if (l && Object.hasOwn(proLaden, l)) proLaden[l] += korb.betrag[idx];
+    });
     let gesamt = korb.gesamt;
     for (const e of fremd) {
       gesamt += Number(e.kosten) || 0;
@@ -655,18 +875,25 @@ export function plane({ rezepte = [], profil = {}, eigenePreise = {}, vorrat = [
   });
   if (p.budget != null) suche.spare(p.budget);
   const ergebnis = suche.ergebnis(p);
+  const hinweise = hinweiseFuer(p, slots, nach);
+  // nur direkt nach dem Sparen: danach (Tauschen) zeigt die Ansicht den Stand am Budget-Hinweis
+  if (ergebnis.imBudget === false) {
+    hinweise.push(`Das Budget von ${euroText(p.budget)} reicht mit diesen Vorlieben nicht: Der günstigste gefundene ` +
+      `Plan kostet ${formatEuroGerundet(ergebnis.kosten.gesamt)}.`);
+  }
+  return { start, ende: plusTage(start, p.tage - 1), tage: p.tage, personen: p.personen, laeden: [...p.laeden], seed: s0,
+    ...ergebnis, fehlend, hinweise, profil: p, getauscht: [] };
+}
+
+// Hinweise, die nur von Vorlieben und Rezepten abhängen (bleiben auch nach dem Tauschen richtig)
+function hinweiseFuer(p, slots, nach) {
   const hinweise = [];
   const hauptPlaetze = slots.filter((s) => s.art === 'haupt').length;
   if (nach.haupt.length && nach.haupt.length < hauptPlaetze) {
     hinweise.push(`Nur ${nach.haupt.length} passende Hauptgerichte für ${hauptPlaetze} Mahlzeiten – ` +
       'einige kommen doppelt vor.');
   }
-  if (ergebnis.imBudget === false) {
-    hinweise.push(`Mit diesen Vorlieben sind ≈ ${Math.ceil(ergebnis.kosten.gesamt)} € das Minimum ` +
-      `(Budget: ${euroText(p.budget)}).`);
-  }
-  return { start, ende: plusTage(start, p.tage - 1), tage: p.tage, personen: p.personen, laeden: [...p.laeden], seed: s0,
-    ...ergebnis, fehlend, hinweise, profil: p, getauscht: [] };
+  return hinweise;
 }
 
 /**
@@ -704,7 +931,8 @@ export function tausche(plan, index, { rezepte = [], profil, eigenePreise = {}, 
   if (!frei.length) [frei, weg] = [pool, new Set([alt.rezeptId])]; // alle schon einmal gezeigt → von vorn
   if (!frei.length) return plan;
   suche.setze(i, suche.waehle(i, frei));
-  return { ...plan, ...suche.ergebnis(p, fremd), getauscht: [...weg].slice(-200) };
+  // Hinweise neu: der Budget-Hinweis von plane() gilt nach dem Tauschen nicht mehr
+  return { ...plan, ...suche.ergebnis(p, fremd), hinweise: hinweiseFuer(p, slots, nach), getauscht: [...weg].slice(-200) };
 }
 
 /**
@@ -736,17 +964,23 @@ export function kostenDesPlans(eintraege, rezepteMap, profil, { eigenePreise = {
     }
   }
   const zeilen = [];
+  const posten = [];
   const proLaden = Object.fromEntries(p.laeden.map((id) => [id, 0]));
   let gesamt = 0;
   for (const [key, g] of nach) {
     const teile = Object.entries(g.mengen).map(([unit, qty]) => ({ qty: Math.round(qty * 1e6) / 1e6, qty2: null, unit }));
     const abteilung = abteilungVon(key, {}, teile.map((t) => t.unit));
-    const k = kostenFuer(key, teile, p.laeden, { eigenePreise: ctx.eigenePreise, abteilung, tabelle,
-      vorrat: ctx.vorrat });
+    const { jeLaden, ...k } = kostenFuer(key, teile, p.laeden, { eigenePreise: ctx.eigenePreise, abteilung, tabelle,
+      vorrat: ctx.vorrat, jeLaden: true });
     zeilen.push({ key, name: g.name, teile, abteilung, ...k });
+    posten.push({ ...k, jeLaden });
     gesamt += k.betrag;
-    if (k.laden && Object.hasOwn(proLaden, k.laden)) proLaden[k.laden] += k.betrag;
   }
+  // gleich teure Zutaten in den Hauptladen (wie im Plan)
+  verteileLaeden(posten, p.laeden).forEach((laden, i) => {
+    zeilen[i].laden = laden;
+    if (laden && Object.hasOwn(proLaden, laden)) proLaden[laden] += zeilen[i].betrag;
+  });
   for (const id of Object.keys(proLaden)) proLaden[id] = cent(proLaden[id]);
   return { gesamt: cent(gesamt), proLaden, zeilen };
 }

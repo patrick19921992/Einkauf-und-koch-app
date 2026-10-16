@@ -162,34 +162,42 @@ export function kopfAktionen(...knoepfe) {
 const toastEntfernen = new WeakMap();
 
 /**
- * Kurze Meldung unten. Optional mit Aktion, z. B. { text: 'Rückgängig', onclick }.
- * Gibt eine Funktion zum vorzeitigen Schließen zurück.
+ * Kurze Meldung unten. Optional mit Aktion, z. B. { text: 'Rückgängig', onclick }, oder mehreren (`aktionen`).
+ * Antippen der Meldung schließt sie. Gibt eine Funktion zum vorzeitigen Schließen zurück.
  */
-export function toast(text, { aktion = null, dauer = 3500 } = {}) {
+export function toast(text, { aktion = null, aktionen = [], dauer = 3500 } = {}) {
   const box = document.getElementById('toasts');
-  const t = el('div', { class: 'toast', role: 'status' }, el('span', null, text));
+  const knoepfe = [aktion, ...(Array.isArray(aktionen) ? aktionen : [])].filter((a) => a?.text);
+  const t = el('div', { class: ['toast', knoepfe.length > 1 && 'mehrere'], role: 'status' }, el('span', null, text));
   let timer = null;
+  let offen = true;
   const entfernen = () => {
+    if (!offen) return;
+    offen = false;
     clearTimeout(timer);
     t.classList.add('weg');
     setTimeout(() => t.remove(), 250);
   };
-  if (aktion) {
+  for (const a of knoepfe) {
     t.append(el('button', {
       type: 'button',
       class: 'toast-aktion',
       onclick: () => {
         entfernen();
-        aktion.onclick?.();
+        a.onclick?.();
       },
-    }, aktion.text));
+    }, a.text));
   }
+  // Antippen neben den Knöpfen schließt die Meldung (sie liegt sonst über Knöpfen der Seite)
+  t.addEventListener('click', (ev) => {
+    if (!ev.target.closest('button')) entfernen();
+  });
   toastEntfernen.set(t, entfernen);
   box.append(t);
   // höchstens drei Meldungen gleichzeitig, die älteste geht zuerst
-  const offen = [...box.querySelectorAll('.toast:not(.weg)')];
-  for (const alt of offen.slice(0, -3)) toastEntfernen.get(alt)?.();
-  timer = setTimeout(entfernen, aktion ? Math.max(dauer, 6000) : dauer);
+  const sichtbar = [...box.querySelectorAll('.toast:not(.weg)')];
+  for (const alt of sichtbar.slice(0, -3)) toastEntfernen.get(alt)?.();
+  timer = setTimeout(entfernen, knoepfe.length ? Math.max(dauer, 6000) : dauer);
   return entfernen;
 }
 

@@ -21,6 +21,11 @@ const BEHAELTER_ML = { Tasse: 150 };
 // Einheiten, die man nur ganz kauft (Schätzung über die Abteilung: angebrochene zählen voll)
 const PACK_EINHEITEN = new Set(['Packung', 'Bund', 'Dose', 'Glas', 'Becher', 'Kopf', 'Knolle', 'Stange', 'Rolle', 'Schale',
   'Flasche', 'Tafel', 'Topf']);
+// Lässt sich so eine Menge nicht umrechnen, ist jede eine ganze Packung ('2 Pck. Spaghetti', '3 Flaschen Milch',
+// '2 Kugeln Mozzarella'); nicht 'Stange' ('3 Stangen Staudensellerie' ist eine Staude)
+const ZAEHL_EINHEITEN = new Set([...PACK_EINHEITEN, 'Kugel'].filter((u) => u !== 'Stange'));
+// Eigene Einträge meinen das Gekaufte: 'Wasser' auf der Liste ist Mineralwasser, kein Leitungswasser
+const MANUELL_SCHLUESSEL = { wasser: 'mineralwasser' };
 // Form-Endungen, die dasselbe Produkt meinen ('paprikaschote' → 'paprika', 'knoblauchzehe' → 'knoblauch')
 const FORM_RE = /^(.{3,}?)(schote|zehe|stange|knolle|filet|würfel)$/;
 
@@ -171,11 +176,26 @@ export function mengeInEinheit(teile, eintrag) {
 
 // ---------------------------------------------------------------- Kosten
 
+// Anzahl ganzer Packungen aus Mengen, die sich nicht umrechnen lassen (gezählte Packungen; mit `stueck` auch
+// Stück ohne Stückgewicht: '2 Butter' auf der Einkaufsliste sind zwei Packungen Butter)
+function gezaehltePackungen(teile, e, stueck) {
+  let n = 0;
+  for (const t of teile || []) {
+    const q = parseZahl(t?.qty2) ?? parseZahl(t?.qty);
+    if (q == null || q <= 0) continue;
+    const { menge, basis } = inBasis(q, t.unit);
+    if (menge == null || basis == null || umrechnen(menge, basis, e) != null) continue;
+    if (ZAEHL_EINHEITEN.has(basis) || (stueck && basis === 'Stück')) n += menge;
+  }
+  return n;
+}
+
 // Ganze Packungen (lose Ware anteilig); ohne umrechenbare Menge eine kleinste Packung
-function packKosten(e, teile, preis) {
+function packKosten(e, teile, preis, stueck = false) {
   const menge = mengeInEinheit(teile, e);
-  if (menge == null) return { betrag: preis, packungen: 1 };
-  const anteil = menge / e.packMenge;
+  const gezaehlt = gezaehltePackungen(teile, e, stueck);
+  if (menge == null && !gezaehlt) return { betrag: preis, packungen: 1 };
+  const anteil = (menge ?? 0) / e.packMenge + gezaehlt;
   const packungen = e.lose ? rund(anteil) : Math.max(1, Math.ceil(anteil - 1e-9));
   return { betrag: packungen * preis, packungen };
 }
@@ -229,28 +249,56 @@ function imVorrat(vorrat, key) {
 const ergebnis = (betrag, laden, quelle, geschaetzt, packungen) =>
   ({ betrag: cent(betrag), laden, quelle, geschaetzt, packungen });
 
-function kostenIntern(key, teile, ids, t, eigen, abteilung, vorrat) {
-  if (vorrat) return ergebnis(0, null, 'vorrat', false, 0);
+// o: mitLaeden (Betrag je Laden mitliefern), kaufen (Grundvorrat der Tabelle trotzdem kaufen), stueck (Stück =
+// Packung, für eigene Einträge)
+function kostenIntern(key, teile, ids, t, eigen, abteilung, vorrat, o = {}) {
+  const jeLaden = o.mitLaeden ? {} : null;
+  const mit = (e) => (jeLaden ? { ...e, jeLaden } : e);
+  if (vorrat) return mit(ergebnis(0, null, 'vorrat', false, 0));
   const eintrag = key ? suchePreis(t, key) : null;
+  const tabellenVorrat = Boolean(eintrag?.vorrat) && !o.kaufen;
   const kategorie = eintrag ? null : kategorieKosten(abteilung ? t.kategorie[abteilung] : null, teile);
   let best = null;
   for (const laden of ids) {
     let k = null;
     const pseudo = eigen && typeof eigen === 'object'
       ? eigenerEintrag(eigen[laden], eintrag) ?? eigenerEintrag(eigen.alle, eintrag) : null;
-    if (pseudo) k = { ...packKosten(pseudo, teile, pseudo.packPreis), quelle: 'eigen', geschaetzt: false };
-    else if (eintrag && !eintrag.vorrat) {
+    if (pseudo) k = { ...packKosten(pseudo, teile, pseudo.packPreis, o.stueck), quelle: 'eigen', geschaetzt: false };
+    else if (eintrag && !tabellenVorrat) {
       const bekannt = eintrag.laeden ? parseZahl(eintrag.laeden[laden]) : null;
       const preis = bekannt ?? eintrag.packPreis * (t.ladenFaktor[laden] ?? 1);
-      k = { ...packKosten(eintrag, teile, preis), quelle: 'tabelle', geschaetzt: true };
+      k = { ...packKosten(eintrag, teile, preis, o.stueck), quelle: 'tabelle', geschaetzt: true };
     } else if (kategorie) {
       k = { betrag: kategorie.betrag * (t.ladenFaktor[laden] ?? 1), packungen: null, quelle: 'kategorie', geschaetzt: true };
     }
+    if (k && jeLaden) jeLaden[laden] = cent(k.betrag);
     if (k && (!best || k.betrag < best.betrag - 1e-9)) best = { ...k, laden };
   }
-  if (best) return ergebnis(best.betrag, best.laden, best.quelle, best.geschaetzt, best.packungen);
-  if (eintrag?.vorrat) return ergebnis(0, null, 'vorrat', false, 0);
-  return ergebnis(0, null, 'unbekannt', true, null);
+  if (best) return mit(ergebnis(best.betrag, best.laden, best.quelle, best.geschaetzt, best.packungen));
+  if (tabellenVorrat) return mit(ergebnis(0, null, 'vorrat', false, 0));
+  return mit(ergebnis(0, null, 'unbekannt', true, null));
+}
+
+/**
+ * Läden ohne unnötigen zweiten Laden: Hauptladen ist der, in dem der ganze Einkauf am wenigsten kostet
+ * (Gleichstand → der erste); eine Zeile, die dort genauso viel kostet wie im günstigsten Laden, kommt dorthin.
+ * posten: [{ betrag, laden, jeLaden: { ladenId: € } }] → Laden je Posten in derselben Reihenfolge (null bleibt null).
+ */
+export function verteileLaeden(posten, laeden) {
+  const liste = Array.isArray(posten) ? posten : [];
+  const ids = [...new Set(Array.isArray(laeden) ? laeden : [])];
+  const summe = new Map(ids.map((id) => [id, 0]));
+  for (const p of liste) {
+    if (!p?.laden || !p.jeLaden) continue;
+    for (const id of ids) summe.set(id, summe.get(id) + (Number.isFinite(p.jeLaden[id]) ? p.jeLaden[id] : p.betrag));
+  }
+  let haupt = null;
+  for (const id of ids) if (haupt == null || summe.get(id) < summe.get(haupt) - 0.005) haupt = id;
+  return liste.map((p) => {
+    if (!p?.laden) return null;
+    const dort = p.jeLaden?.[haupt];
+    return Number.isFinite(dort) && dort <= p.betrag + 0.005 ? haupt : p.laden;
+  });
 }
 
 /**
@@ -258,17 +306,23 @@ function kostenIntern(key, teile, ids, t, eigen, abteilung, vorrat) {
  * { betrag, laden, quelle: 'eigen'|'tabelle'|'kategorie'|'vorrat'|'unbekannt', geschaetzt, packungen }.
  * Eigene Preise (eigenePreise[schluessel][ladenId|'alle'] = { preis, menge, einheit }) gehen vor; Tabellenpreise
  * in ganzen Packungen (lose Ware anteilig), ohne Menge eine kleinste Packung. `vorrat`: Schlüssel, die nichts kosten.
+ * Mit `jeLaden: true` zusätzlich jeLaden: { ladenId: € } (für verteileLaeden).
  */
-export function kostenFuer(schluessel, teile, laeden, { eigenePreise = {}, abteilung = null, tabelle, vorrat = null } = {}) {
+export function kostenFuer(schluessel, teile, laeden, { eigenePreise = {}, abteilung = null, tabelle, vorrat = null,
+  jeLaden = false } = {}) {
   const t = tabelleVon(tabelle);
   const key = norm(schluessel);
-  return kostenIntern(key, teile, ladenListe(laeden, t), t, eigenePreise?.[key] ?? null, abteilung, imVorrat(vorrat, key));
+  return kostenIntern(key, teile, ladenListe(laeden, t), t, eigenePreise?.[key] ?? null, abteilung, imVorrat(vorrat, key),
+    { mitLaeden: jeLaden });
 }
 
 /**
  * Kosten der Zeilen einer Einkaufsliste (aus einkaufsliste.berechneListe; auch die Liste selbst) →
  * { gesamt, proLaden: { id: € }, proZeile: Map(mergeKey → { betrag, laden, geschaetzt, quelle }) }.
- * Teilweise Abgehaktes zählt mit dem Rest; erledigte, versteckte und Vorrat-Zeilen zählen nicht.
+ * Teilweise Abgehaktes zählt mit dem Rest; erledigte, versteckte und Vorrat-Zeilen zählen nicht. Eigene Einträge
+ * werden gekauft, auch wenn Tabelle oder Vorrat sie zum Grundvorrat zählen ('Olivenöl', 'Wasser') – die Liste zeigt
+ * sie ja als offen; '2 Butter' sind zwei Packungen.
+ * Gleich teure Zeilen kommen in den Hauptladen (siehe verteileLaeden).
  */
 export function kostenFuerZeilen(zeilen, laeden, { eigenePreise = {}, tabelle, vorrat = null } = {}) {
   const t = tabelleVon(tabelle);
@@ -277,19 +331,27 @@ export function kostenFuerZeilen(zeilen, laeden, { eigenePreise = {}, tabelle, v
     : Array.isArray(zeilen?.abteilungen) ? zeilen.abteilungen.flatMap((a) => a.zeilen || []) : [];
   const proLaden = Object.fromEntries(ids.map((id) => [id, 0]));
   const proZeile = new Map();
+  const berechnet = [];
   let gesamt = 0;
   for (const z of liste) {
     if (!z || z.erledigt || z.imVorrat || z.versteckt) continue;
     const teile = Array.isArray(z.rest) ? z.rest : Array.isArray(z.teile) ? z.teile : [];
-    const key = norm(z.manuell ? postenSchluessel(z.manuell) || zutatSchluessel(z.name) : z.mergeKey ?? z.name);
+    const manuell = Boolean(z.manuell);
+    const key = norm(manuell ? postenSchluessel(z.manuell) || zutatSchluessel(z.name) : z.mergeKey ?? z.name);
     const eigen = eigenePreise?.[z.mergeKey] ?? eigenePreise?.[key] ?? null;
     // alles schon abgehakt (Rest leer, aber Mengen vorhanden) → nichts mehr zu kaufen
     const k = teile.length === 0 && z.teile?.length > 0 ? ergebnis(0, null, 'tabelle', true, 0)
-      : kostenIntern(key, teile, ids, t, eigen, z.abteilung ?? null, imVorrat(vorrat, key));
-    proZeile.set(z.mergeKey, { betrag: k.betrag, laden: k.laden, geschaetzt: k.geschaetzt, quelle: k.quelle });
+      : kostenIntern(manuell ? MANUELL_SCHLUESSEL[key] ?? key : key, teile, ids, t, eigen, z.abteilung ?? null,
+        !manuell && imVorrat(vorrat, key), { mitLaeden: ids.length > 1, kaufen: manuell, stueck: manuell });
+    berechnet.push([z.mergeKey, k]);
     gesamt += k.betrag;
-    if (k.laden && Object.hasOwn(proLaden, k.laden)) proLaden[k.laden] += k.betrag;
   }
+  const zuordnung = verteileLaeden(berechnet.map(([, k]) => k), ids);
+  berechnet.forEach(([mergeKey, k], i) => {
+    const laden = zuordnung[i];
+    proZeile.set(mergeKey, { betrag: k.betrag, laden, geschaetzt: k.geschaetzt, quelle: k.quelle });
+    if (laden && Object.hasOwn(proLaden, laden)) proLaden[laden] += k.betrag;
+  });
   for (const id of ids) proLaden[id] = cent(proLaden[id]);
   return { gesamt: cent(gesamt), proLaden, proZeile };
 }

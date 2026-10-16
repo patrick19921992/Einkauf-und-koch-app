@@ -401,6 +401,10 @@ export async function zeige(container, route) {
   }
 
   await zeichne();
+  // Angefragter Tag mitten in der Woche (z. B. Start eines übernommenen Plans): gleich dorthin scrollen
+  if (angefragt && einst && angefragt !== wochenstart(angefragt, einst.wochenstart)) {
+    container.querySelector(`[data-tag="${angefragt}"]`)?.scrollIntoView({ block: 'start' });
+  }
   const abmelden = db.beobachte(({ store } = {}) => {
     if (!BEOBACHTETE.has(store)) return;
     clearTimeout(timer);

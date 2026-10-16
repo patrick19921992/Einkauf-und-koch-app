@@ -287,12 +287,21 @@ export async function entferne(store, id) {
   meldeAenderung(store, [id]);
 }
 
+/**
+ * Lösch-Markierungen, die bleiben: gelöschte Grundrezepte und KI-Ideen (ids 'grund-…', 'ki-…') merken sich,
+ * dass „Automatisch planen“ sie nicht mehr vorschlagen soll. Rein.
+ */
+export function bleibendeMarkierung(store, d) {
+  return store === 'recipes' && d?.deleted === true && /^(grund|ki)-/.test(String(d.id ?? ''));
+}
+
 /** Entfernt Lösch-Markierungen, die älter als `tage` sind. Gibt die Anzahl zurück. */
 export async function bereinige(tage = 90) {
   const grenze = Date.now() - tage * TAG_MS;
   let anzahlEntfernt = 0;
   for (const store of SYNC_STORES) {
-    const alt = (await alle(store, { mitGeloeschten: true })).filter((d) => d.deleted && d.updatedAt < grenze);
+    const alt = (await alle(store, { mitGeloeschten: true }))
+      .filter((d) => d.deleted && d.updatedAt < grenze && !bleibendeMarkierung(store, d));
     if (!alt.length) continue;
     await transaktion([store], 'readwrite', async (tx) => {
       const os = tx.objectStore(store);

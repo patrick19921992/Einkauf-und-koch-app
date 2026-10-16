@@ -2,7 +2,7 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import worker, {
   ERLAUBTE_HOSTS, ZWISCHEN_HOSTS, ERLAUBTE_ORIGINS, hostErlaubt, pruefeZielUrl, corsHeaders,
-  sammleJsonLd, erlaubteOrigins, KI_SCHEMA, pruefeKiBody, kiPrompt, leseKiAntwort,
+  sammleJsonLd, erlaubteOrigins, KI_SCHEMA, pruefeKiBody, kiPrompt, leseKiAntwort, kiFehlerKennung,
 } from '../proxy/worker.js';
 
 const APP = 'https://patrick19921992.github.io';
@@ -512,6 +512,37 @@ test('KI: Tageskontingent → 429 limit, ohne rohe Fehlermeldung', async () => {
     assert.deepEqual(JSON.parse(text), { fehler: 'limit' });
     assert.doesNotMatch(text, /neurons|upgrade/i);
   }
+});
+
+test('KI: nur das Tageskontingent heißt „limit“ – ausgelastet und falsches Modell haben eigene Kennungen', async () => {
+  // Codes laut Cloudflare: 3036 = Tageskontingent, 3040 = kurz ausgelastet, 5007/3042/5035/5016 = Modell passt nicht
+  const faelle = [
+    ["3036: You have used up your daily free allocation of 10,000 neurons. Please upgrade to Cloudflare's Workers Paid plan", 429, 'limit'],
+    [Object.assign(new Error('AiError'), { code: 3036 }), 429, 'limit'],
+    ['3040: Capacity temporarily exceeded, please try again.', 429, 'beschaeftigt'],
+    [Object.assign(new Error('InferenceUpstreamError'), { code: 3040 }), 429, 'beschaeftigt'],
+    ['Rate limited, please slow down', 429, 'beschaeftigt'],
+    ['429 Too Many Requests', 429, 'beschaeftigt'],
+    ['5007: No such model @cf/gibt/es-nicht or task', 502, 'ki-modell'],
+    ['3042: The model name is invalid', 502, 'ki-modell'],
+    ['5035: This model requires a Workers Paid plan.', 502, 'ki-modell'],
+    ['AiError: max_completion_tokens (7200) exceeds the model limit (4096)', 502, 'ki-modell'],
+    ['Input exceeds context window limit', 502, 'ki-modell'],
+    ['8001: Invalid input (json_schema not supported)', 502, 'ki-modell'],
+    ["JSON Mode couldn't be met", 502, 'ki-format'],
+    ['3043: Internal server error', 502, 'ki'],
+    ['Network connection lost.', 502, 'ki'],
+  ];
+  for (const [fehler, status, kennung] of faelle) {
+    const e = fehler instanceof Error ? fehler : new Error(fehler);
+    assert.deepEqual(kiFehlerKennung(e), { status, fehler: kennung }, e.message);
+    const antwort = await worker.fetch(kiPost(KI_BODY), { AI: kiAttrappe(e) });
+    assert.equal(antwort.status, status, e.message);
+    assert.equal(await antwort.text(), JSON.stringify({ fehler: kennung }), e.message);
+  }
+  // auch ein geworfener Text (kein Error-Objekt)
+  assert.deepEqual(kiFehlerKennung('4006: daily free allocation used up'), { status: 429, fehler: 'limit' });
+  assert.deepEqual(kiFehlerKennung(undefined), { status: 502, fehler: 'ki' });
 });
 
 test('KI: kaputtes JSON → 502 ki-format, andere Fehler → 502 ki; Modelltext wird nie zurückgegeben', async () => {

@@ -3,7 +3,7 @@
 // nur holeKiRezepte() greift aufs Netz zu. KI-Rezepte sind Ideen – die App sagt das auch so.
 
 import { EINHEITEN, parseZeile, parseZeilen, zutatSchluessel } from './zutaten.js';
-import { ALLERGENE, PROTEINE, erkenneProtein, normalisiereProfil, passtZumProfil } from './planer.js';
+import { PROTEINE, erkenneProtein, normalisiereProfil, passtZumProfil } from './planer.js';
 
 // ---------------------------------------------------------------- Schema und Fehler
 
@@ -53,6 +53,10 @@ const MELDUNGEN = {
     + `durch die aktuelle proxy/worker.js und tippe „Deploy“. Danach: ${KI_ANLEITUNG}.`,
   limit: 'Das kostenlose KI-Kontingent für heute ist aufgebraucht (10.000 Neurons pro Tag). Morgen geht es wieder – '
     + 'der Plan klappt auch ohne neue Ideen.',
+  beschaeftigt: 'Die KI ist gerade ausgelastet – versuch es in einer Minute noch einmal.',
+  'ki-modell': 'Das KI-Modell deines Import-Dienstes passt nicht. Hast du im Worker die Variable KI_MODELL angelegt? '
+    + 'Dann lösch sie (Settings → Variables and Secrets) und tippe „Deploy“ – sonst ersetze den Code des Workers durch '
+    + 'die aktuelle proxy/worker.js.',
   origin: 'Der Import-Dienst lehnt Anfragen dieser App ab. Trag die Adresse der App im Worker unter ERLAUBTE_ORIGINS '
     + 'ein (Cloudflare → Worker → Settings → Variables and Secrets).',
   netz: `Die KI ist gerade nicht erreichbar. ${SPAETER}`,
@@ -69,17 +73,18 @@ const MELDUNGEN = {
 };
 // Grund → Code (danach richtet sich die Ansicht); sonst Grund = Code
 const CODES = {
-  'proxy-adresse': 'kein-proxy', veraltet: 'ki-fehlt', ki: 'netz', dienst: 'netz', 'nicht-erreichbar': 'netz',
-  offline: 'netz', zeit: 'netz', anfrage: 'ungueltig', antwort: 'ungueltig',
+  'proxy-adresse': 'kein-proxy', veraltet: 'ki-fehlt', 'ki-modell': 'ki-fehlt', ki: 'netz', beschaeftigt: 'netz',
+  dienst: 'netz', 'nicht-erreichbar': 'netz', offline: 'netz', zeit: 'netz', anfrage: 'ungueltig', antwort: 'ungueltig',
 };
 // Kennung `fehler` des Workers → Grund
 const DIENST_GRUENDE = {
-  'ki-fehlt': 'ki-fehlt', limit: 'limit', origin: 'origin', methode: 'veraltet', 'ki-format': 'ungueltig', ki: 'ki',
-  ungueltig: 'anfrage', 'zu-gross': 'anfrage', 'kein-json': 'anfrage',
+  'ki-fehlt': 'ki-fehlt', limit: 'limit', beschaeftigt: 'beschaeftigt', 'ki-modell': 'ki-modell', origin: 'origin',
+  methode: 'veraltet', 'ki-format': 'ungueltig', ki: 'ki', ungueltig: 'anfrage', 'zu-gross': 'anfrage', 'kein-json': 'anfrage',
 };
 
 /**
  * Fehler bei KI-Ideen. code: 'kein-proxy' | 'ki-fehlt' | 'limit' | 'origin' | 'netz' | 'ungueltig';
+ * grund ist der genaue Anlass (z. B. 'beschaeftigt' bei code 'netz', 'ki-modell' bei 'ki-fehlt');
  * message ist ein fertiger deutscher Text für einen Toast.
  */
 export class KiFehler extends Error {
@@ -177,29 +182,131 @@ const NICHT_VEGETARISCH = ['gelatine', 'worcester', 'fischsauce', 'fischsoße', 
   'fleischbrühe', 'rinderbrühe', 'hühnerbrühe', 'geflügelbrühe', 'kalbsfond', 'rinderfond', 'geflügelfond', 'wildfond',
   'fischfond', 'bratenfond', 'bratensaft', 'schweineschmalz', 'gänseschmalz', 'sardelle', 'anchovis', 'knochenmark'];
 const NICHT_VEGAN = ['honig', 'gelée royale', 'schellack'];
+// … außer in diesen Wörtern (Austernpilze und Honigmelone sind vegan)
+const VERSTECKT_AUSSER = ['austernpilz', 'austernseitling', 'honigmelone'];
 const MAX = { titel: 80, zeile: 120, schritt: 400, zutaten: 30, schritte: 12 };
 // Kein Zutatenname: nur eine Einheit ('200 g' → 'g') oder ein Füllwort
 const KEIN_NAME = new Set([...Object.entries(EINHEITEN).flatMap(([id, e]) => [id, e.name, e.plural]),
   'gramm', 'kilo', 'liter', 'stk', 'etwas', 'zutaten', 'nach belieben'].map((w) => w.toLowerCase().replace(/\.$/, '')));
 const hatNamen = (z) => /\p{L}{2}/u.test(z?.name ?? '') && !KEIN_NAME.has(z.name.toLowerCase().replace(/\.$/, '').trim());
 
-// Wort im Text: kurze Wörter (≤ 3 Zeichen, z. B. 'ei') nur als ganzes Wort, sonst als Teil ('pilz' in 'pilzpfanne')
-function enthaeltWort(text, wort) {
-  const w = String(wort ?? '').toLowerCase().trim();
-  if (!w) return false;
-  return w.length > 3 ? text.includes(w) : text.split(/[^\p{L}]+/u).includes(w);
+// ---------------------------------------------------------------- Texte prüfen (Titel, Schritte, „oder …“)
+// KI-Rezepte nennen Zutaten oft nur in den Schritten („Speck auslassen“) oder als Alternative
+// („Räuchertofu oder Speck“). Diese Texte werden in Stücke zerlegt und wie Zutaten geprüft.
+
+const TOKEN_RE = /[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*|\S/gu;
+// Grenzen zwischen Stücken; nach „und“/„oder“ gilt eine Verneinung weiter („ohne Butter und Sahne“)
+const AUFZAEHLUNG = new Set(['und', 'oder', 'bzw', 'beziehungsweise', 'sowie', 'alternativ', 'wahlweise']);
+const GRENZE = new Set(['mit', 'in', 'im', 'ins', 'auf', 'aufs', 'zum', 'zur', 'für', 'nach', 'dazu', 'dann', 'danach',
+  'anschließend', 'aber', 'bis', 'bei', 'beim', 'während', 'sobald']);
+// Was darauf folgt, kommt nicht hinein („ohne Speck“, „statt Butter“) oder ist nur ein Vergleich („wie Rührei“)
+const VERNEINUNG = new Set(['ohne', 'statt', 'anstatt', 'anstelle', 'kein', 'keine', 'keinen', 'keinem', 'keiner', 'keines',
+  'wie', 'ähnlich']);
+// Kein Tier, kein Allergen: hacken/gehackt („Hack“ und „Gehacktes“ sind Fleisch), Kürbisfleisch & Co., fleischlos,
+// Bratensatz, Genuss und nussig ('nuss'), butterweich, milchig, halbieren/probieren ('bier'), mehligkochend ('mehl');
+// Rinde ist kein Rind
+const HACKEN_RE = /^(?:hacken|hackt|gehackt(?:e[nmr]?)?)$/i;
+const HARMLOS_RE = new RegExp(`^(?:${[
+  '[\\p{L}-]*(?:frucht|kokos|kürbis|avocado|melonen?|mango|auberginen?|tomaten|zucchini|papaya|ananas|pfirsich|kiwi)-?fleisch',
+  'fleisch(?:los|frei)\\p{L}*', 'bratensatz', '\\p{L}*genu(?:ss|ß)\\p{L}*', 'nussig\\p{L}*', 'butter(?:weich|zart)\\p{L}*',
+  'milchig\\p{L}*', '\\p{L}+bier(?:en|t|te|ten|tem|tes|st)', 'mehlig\\p{L}*'].join('|')})$`, 'u');
+// Gerichtsformen, die es auch ohne Fleisch, Milch oder Weizen gibt (Linsen-Gulasch, Nussbraten, Chia-Pudding,
+// spanische Tortilla, „Öl zum Braten“) – zählen nur, wenn sie ein Tier im Namen tragen („Schweinebraten“)
+const FORMEN = ['gulaschs?', 'schnitzeln?', 'steaks?', 'rouladen?', 'frikadellen?', 'buletten?', 'köttbullar', 'cevapcici',
+  'köfte', 'kofta', 'gyros', 'döner', 'kebabs?', 'schaschliks?', 'wiener', 'braten', 'medaillons?', 'geschnetzelte[nmrs]?',
+  'patty', 'patties', 'puddings?', 'tortillas?'].join('|');
+const FORM_RE = new RegExp(`^(?:${FORMEN})$`);
+const FORM_ENDE_RE = new RegExp(`(?:${FORMEN})$`);         // 'Linsenköfte', 'Portobellosteaks'
+// „das Fleisch“ ohne Tierart: in Schritten meist das Fleisch aus der Zutatenliste
+const FLEISCH_WORT_RE = /^fleisch(?:es|stücke?n?|stückchen|würfeln?|streifen|scheiben)?$/;
+// Wörter, die ein Stück als Ersatzprodukt kennzeichnen ('vegane Wurst', 'Tofu') – fallen nie weg
+const ERSATZ_RE = /vegan|vegetar|veggie|pflanzlich|ersatz|soja|tofu|seitan|tempeh|lupine/;
+const GROSS_RE = /^\p{Lu}/u;
+// Partizip als Adjektiv am Satzanfang („Gebratener Reis“, „Geriebenen Käse …“) ist kein Hauptwort – „Gehacktes“ schon
+const PARTIZIP_RE = /^ge\p{L}+(?:t|en)(?:e|er|es|en|em)$/u;
+
+// Wörter der Zutatenzeilen (ohne Einheiten und Füllwörter)
+function zutatenWoerter(zeilen) {
+  const woerter = new Set();
+  for (const z of zeilen) for (const w of z.toLowerCase().match(/\p{L}+/gu) ?? []) if (!KEIN_NAME.has(w)) woerter.add(w);
+  return woerter;
 }
 
-// Nennt der Titel etwas aus „Lieber nicht“ oder einem gewählten Allergen („Pilzpfanne“)? → Wort | null
-function titelTreffer(titel, p) {
-  const gruppen = [...p.ohne.map((w) => ({ woerter: [w], ausser: [] })), ...ALLERGENE.filter((a) => p.allergene.includes(a.id))];
-  for (const { woerter, ausser = [] } of gruppen) {
-    let t = titel.toLowerCase();
-    for (const a of ausser) t = t.split(a).join(' ');          // 'kokosmilch' ist keine Milch
-    const wort = woerter.find((w) => enthaeltWort(t, w));
-    if (wort) return wort;
+// Nennt ein Schritt nur eine Zutat der Liste („Milch erhitzen“ bei Hafermilch)? Die ist dort schon geprüft.
+function inZutaten(wort, woerter) {
+  if (woerter.has(wort)) return true;
+  if (wort.length <= 3 || ERSATZ_RE.test(wort)) return false;
+  for (const w of woerter) if (w.includes(wort)) return true;
+  return false;
+}
+
+/**
+ * Text → Stücke ohne Verneintes („Reis ohne Butter kochen“ → nur „reis“): { text, nomen } mit dem Text klein
+ * geschrieben und den Hauptwörtern (groß geschrieben, samt 'vegane' davor) – nur in ihnen stehen Tiere, Verben
+ * wie „braten“ zählen so nicht. bekannt: Wörter der Zutatenliste weglassen; „das Fleisch“ landet in merker.fleisch.
+ */
+function textStuecke(text, { bekannt = null, merker = {} } = {}) {
+  const stuecke = [];
+  let woerter = [], nomen = [], ersatz = [], verneint = false;
+  const schliessen = () => {
+    if (woerter.length && !verneint) stuecke.push({ text: woerter.join(' '), nomen });
+    woerter = [];
+    nomen = [];
+    ersatz = [];
+  };
+  for (const roh of einzeilig(text).match(TOKEN_RE) ?? []) {
+    const wort = roh.toLowerCase();
+    if (!/[\p{L}\p{N}]/u.test(wort) || GRENZE.has(wort)) {
+      schliessen();
+      verneint = false;
+    } else if (AUFZAEHLUNG.has(wort)) {
+      schliessen();
+    } else if (VERNEINUNG.has(wort)) {
+      schliessen();
+      verneint = true;
+    } else if (!HACKEN_RE.test(wort) && !HARMLOS_RE.test(wort)) {
+      const teile = wort.replace(/rinden?$/, '').split('-').filter((t) => {
+        if (!t || FORM_RE.test(t)) return false;
+        if (FLEISCH_WORT_RE.test(t)) {
+          if (!verneint) merker.fleisch = true;
+          return false;
+        }
+        return !(bekannt && inZutaten(t, bekannt));
+      });
+      if (!teile.length) continue;
+      const w = teile.join('-');
+      woerter.push(w);
+      if (GROSS_RE.test(roh) && (w === 'gehacktes' || !PARTIZIP_RE.test(w))) nomen.push([...ersatz, w].join(' '));
+      else if (ERSATZ_RE.test(w)) ersatz.push(w);
+    }
   }
-  return null;
+  schliessen();
+  return stuecke;
+}
+
+// Allergene und „Lieber nicht“ (wie passtZumProfil) in Textstücken; tierisch: Milch, Ei, Honig oder Pesto darin
+function pruefeStuecke(texte, p) {
+  const pseudo = { title: '', mahlzeit: 'haupt', protein: ['vegan'], totalMin: 5, ingredients: texte.map((name) => ({ name })) };
+  const alle = { ...p, protein: PROTEIN_IDS, kochzeit: 'egal' };
+  const passt = passtZumProfil(pseudo, alle);
+  const tierisch = !passtZumProfil(pseudo, { ...alle, allergene: ['laktose', 'ei'], ohne: [] }).ok
+    || texte.some((t) => !/vegan|pflanzlich/.test(t) && verstecktIn(t, ['honig', 'pesto']));
+  return { grund: passt?.ok ? null : passt?.grund || 'Passt nicht zu den Vorlieben', tierisch };
+}
+
+// Proteine aus mehreren Erkennungen: Fleisch/Fisch aus allen, sonst vegetarisch, wenn eine Tierprodukte fand
+function vereine(...listen) {
+  const alle = listen.flat();
+  const fleisch = FLEISCH.filter((id) => alle.includes(id));
+  if (fleisch.length) return fleisch;
+  return alle.includes('vegetarisch') ? ['vegetarisch'] : ['vegan'];
+}
+
+// Enthält ein Text ein Wort der Liste (Ausnahmen wie 'austernpilz' vorher entfernt)?
+function verstecktIn(text, woerter) {
+  let t = text;
+  for (const a of VERSTECKT_AUSSER) t = t.split(a).join(' ');
+  return woerter.some((w) => t.includes(w));
 }
 
 // Zahl aus Zahl oder Text ('4', '4 Portionen', '2,5'), sonst null
@@ -268,14 +375,36 @@ export function bewerteKiRezept(roh, profil, index = 0) {
   if (ingredients.length < 3) return nein('Zu wenige Zutaten');
   if (schritte.length < 2) return nein('Zu wenige Schritte');
 
-  const erkannt = erkenneProtein({ title, ingredients });
+  // Zutaten (Schlüssel) und zusätzlich als Text: ganze Zeilen mit „oder …“, Titel und Schritte
+  // (Zeilen ganz, in Titel und Schritten nur die Hauptwörter, die nicht schon in der Zutatenliste stehen)
+  const merker = { fleisch: false };
+  const zeilen = zutaten.flatMap((z) => textStuecke(z));
+  const bekannt = zutatenWoerter(zutaten);
+  const saetze = [title, ...schritte].flatMap((t) => textStuecke(t, { bekannt, merker }));
+  const texte = [...zeilen, ...saetze].map((s) => s.text);
+  const imText = pruefeStuecke(texte, p);
   const behauptet = Array.isArray(roh.protein) ? roh.protein.filter((x) => typeof x === 'string') : [];
-  const diaet = bestimmeProtein(behauptet, Array.isArray(erkannt) ? erkannt : []);
+  // Hauptwörter einzeln; eins für Fleisch ohne Tierart („Filets“, „Bratensaft“) zählt wie „das Fleisch“,
+  // eine Gerichtsform mit Pflanzlichem davor („Linsenköfte“) gar nicht
+  const tiere = [];
+  const tiereIn = (text) => erkenneProtein({ zutaten: [text] }).filter((id) => FLEISCH.includes(id));
+  for (const nomen of saetze.flatMap((s) => s.nomen)) {
+    const e = tiereIn(nomen);
+    const form = e.length ? FORM_ENDE_RE.exec(nomen) : null;
+    if (form && form.index >= 3 && !tiereIn(nomen.slice(0, form.index)).length) continue;
+    if (e.length >= 3) merker.fleisch = true;
+    else tiere.push(...e);
+  }
+  let erkannt = vereine(erkenneProtein({ title, ingredients }), erkenneProtein({ zutaten: zeilen.map((s) => s.text) }),
+    tiere, imText.tierisch ? ['vegetarisch'] : []);
+  // „das Fleisch“ ohne Tierart zählt nur, wenn sonst nirgends Fleisch oder Fisch steht (wie im Planer: Rind)
+  if (merker.fleisch && !FLEISCH.some((id) => erkannt.includes(id) || behauptet.includes(id))) erkannt = ['rind'];
+  const diaet = bestimmeProtein(behauptet, erkannt);
   if (!diaet.protein) return nein(diaet.grund);
-  const schluessel = ingredients.map((z) => zutatSchluessel(z.name));
+  const schluessel = [...ingredients.map((z) => zutatSchluessel(z.name)), ...texte];
   const fleischlos = !diaet.protein.some((id) => FLEISCH.includes(id));
   const versteckt = [...(fleischlos ? NICHT_VEGETARISCH : []), ...(diaet.protein.includes('vegan') ? NICHT_VEGAN : [])];
-  if (schluessel.some((k) => versteckt.some((w) => k.includes(w)))) return nein('Versteckte tierische Zutat');
+  if (schluessel.some((k) => verstecktIn(k, versteckt))) return nein('Versteckte tierische Zutat');
 
   const rezept = {
     id: kiId(title),
@@ -291,11 +420,11 @@ export function bewerteKiRezept(roh, profil, index = 0) {
     schritte,
     herkunft: 'ki',
   };
-  // Vorlieben, „Lieber nicht“ und Allergene wie beim Planen (die Kochzeit prüft erst der Planer)
+  // Vorlieben, „Lieber nicht“ und Allergene wie beim Planen (die Kochzeit prüft erst der Planer),
+  // danach dieselben Wörter in Titel, Schritten und Alternativen
   const passt = passtZumProfil(kiRezeptZuRezept(rezept), { ...p, kochzeit: 'egal' });
   if (!passt?.ok) return nein(passt?.grund || 'Passt nicht zu den Vorlieben');
-  const wort = titelTreffer(title, p);
-  if (wort) return nein(`Enthält ${wort}`);
+  if (imText.grund) return nein(imText.grund);
   return { index, rezept, grund: null };
 }
 

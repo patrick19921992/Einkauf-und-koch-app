@@ -2,9 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   PROTEINE, ALLERGENE, MAHLZEITEN, STANDARD_PROFIL, normalisiereProfil, erkenneProtein, rezeptMeta, passtZumProfil,
-  plane, tausche, kostenDesPlans, zeitText, kochzeitPasst,
+  plane, tausche, kostenDesPlans, zeitText, kochzeitPasst, ohneBedeutung,
 } from '../js/planer.js';
 import { parseZeilen } from '../js/zutaten.js';
+import { formatEuroGerundet } from '../js/preise.js';
+import { ladeGrundrezepte } from '../js/daten/rezepte.js';
 
 // Kleine, erfundene Preistabelle und Rezepte: Tests hängen nicht an den echten Daten
 const TABELLE = {
@@ -353,7 +355,7 @@ test('plane: Vorrat und eigene Preise kosten weniger', () => {
   assert.ok(billig.kosten.gesamt <= normal.kosten.gesamt);
 });
 
-test('plane: Budget – günstiger tauschen, sonst Hinweis auf das Minimum', () => {
+test('plane: Budget – günstiger tauschen, sonst Hinweis auf den günstigsten gefundenen Plan', () => {
   const profil = { tage: 6, mahlzeiten: ['mittag', 'abend'], kochzeit: 'egal', personen: 4 };
   const frei = plan(profil);
   const grosszuegig = plan({ ...profil, budget: frei.kosten.gesamt + 5 });
@@ -363,8 +365,9 @@ test('plane: Budget – günstiger tauschen, sonst Hinweis auf das Minimum', () 
   assert.equal(unmoeglich.imBudget, false);
   assert.ok(unmoeglich.kosten.gesamt <= frei.kosten.gesamt);
   assert.equal(unmoeglich.ueberBudget, Math.round((unmoeglich.kosten.gesamt - 5) * 100) / 100);
-  assert.deepEqual(unmoeglich.hinweise,
-    [`Mit diesen Vorlieben sind ≈ ${Math.ceil(unmoeglich.kosten.gesamt)} € das Minimum (Budget: 5 €).`]);
+  assert.deepEqual(unmoeglich.hinweise, ['Das Budget von 5 € reicht mit diesen Vorlieben nicht: Der günstigste ' +
+    `gefundene Plan kostet ${formatEuroGerundet(unmoeglich.kosten.gesamt)}.`]);
+  assert.match(unmoeglich.hinweise[0], /kostet ≈ \d+ €\.$/);
   assert.equal(new Set(ids(unmoeglich)).size, 12); // weiter ohne doppelte Gerichte
   // Abwechslung macht den Fisch zum zweiten Gericht; mit knappem Budget wird er gegen Nudeln getauscht
   const v1 = rezept('v1', 'Nudeln mit Zwiebeln', ['250 g Nudeln', '1 Zwiebel'], { protein: ['vegan'], tags: ['pasta'] });
@@ -445,5 +448,267 @@ test('plane: 14 Tage × 3 Mahlzeiten über 150 Rezepte ist schnell', () => {
     const ms = performance.now() - t;
     assert.equal(p.eintraege.length + p.fehlend.length, 42);
     assert.ok(ms < 1500, `${Math.round(ms)} ms`);
+  }
+});
+
+// ---------------------------------------------------------------- Prüfbefunde (Lieber nicht, Erkennung, Vielfalt)
+
+test('erkenneProtein: weitere Fleisch-, Wurst- und Fischwörter, Fleisch unbekannter Art zählt als jedes Fleisch', () => {
+  const p = (...zeilen) => erkenneProtein({ zutaten: zeilen });
+  const faelle = {
+    schwein: ['4 Nackensteaks', '1 kg Rippchen', '6 Krakauer', '4 Frankfurter', '200 g Serrano', '4 Cordon bleu',
+      '4 Schaschlikspieße', '200 g Bauchfleisch'],
+    rind: ['150 g Pastrami', '8 Merguez', '500 g Wildgulasch', '4 Steaks', '500 g Gulasch'],
+    fisch: ['400 g Seehecht', '400 g Tilapiafilet', '400 g Viktoriabarschfilet', '400 g Wels', '4 Sprotten', '1 Aal',
+      '200 g Bückling', '200 g Hummer', '1 TL Dashi', '2 EL Austernsauce', '200 g Kalmare'],
+    vegetarisch: ['2 EL Ghee', '200 g Paneer', '200 g Tsatsiki', '2 EL Butterreinfett', '500 g Käse-Tortellini',
+      '2 Pck. Mie-Nudeln', '200 g Löffelbiskuits', '2 Halloumi-Steaks', '50 g Grana Padano'],
+    vegan: ['200 g Sojageschnetzeltes', '4 Tofu-Würstchen', '2 vegane Bratwürste', '1 Blumenkohlsteak',
+      '500 g Austernpilze', '500 ml Gemüsefond', '200 g Wildreis', '1 Pck. Bratensoße', '2 Pilz-Gulasch'],
+  };
+  for (const [soll, zeilen] of Object.entries(faelle)) {
+    for (const z of zeilen) assert.deepEqual(p(z), [soll], z);
+  }
+  for (const z of ['500 g Geschnetzeltes', '4 Minutensteaks', '400 g Leber', '500 ml Bratenfond', '400 g Döner']) {
+    assert.deepEqual(p(z), ['rind', 'schwein', 'gefluegel'], z);
+  }
+  // Ersatz-Wort nur im anderen Teil: das Fleisch zählt trotzdem
+  assert.deepEqual(p('500 g Hähnchenbrust in Sojasauce'), ['gefluegel']);
+  assert.deepEqual(p('250 g Garnelen in Tofu-Marinade'), ['fisch']);
+  assert.deepEqual(p('300 g Rindfleisch mit Seitan'), ['rind']);
+  assert.deepEqual(p('200 g Tofu mit Speck'), ['schwein']);
+});
+
+test('rezeptMeta: angegebenes Protein gilt nie weniger streng als die Zutaten (bearbeitete Kopien)', () => {
+  const mit = (r, zeile) => ({ ...r, ingredients: [...r.ingredients, ...parseZeilen(zeile)] });
+  const speck = mit(HAUPT[0], '150 g Speckwürfel'); // vegan angegeben
+  assert.deepEqual(rezeptMeta(speck).protein, ['schwein']);
+  assert.equal(passtZumProfil(speck, { protein: ['vegan'] }).ok, false);
+  assert.equal(passtZumProfil(speck, { protein: ['vegetarisch'] }).ok, false);
+  assert.deepEqual(rezeptMeta(mit(HAUPT[5], '100 g Speckwürfel')).protein, ['schwein']); // vegetarisch angegeben
+  assert.deepEqual(rezeptMeta(mit(HAUPT[0], '50 g Butter')).protein, ['vegetarisch']);
+  assert.deepEqual(rezeptMeta(mit(HAUPT[1], '100 g Speck')).protein, ['gefluegel', 'schwein']);
+  // vorsichtig angegeben bleibt: vegetarisch bleibt vegetarisch, auch wenn nichts Tierisches erkannt wird
+  assert.deepEqual(rezeptMeta({ ...HAUPT[0], protein: ['vegetarisch'] }).protein, ['vegetarisch']);
+  assert.deepEqual(rezeptMeta(HAUPT[2]).protein, ['rind', 'schwein']);
+});
+
+test('rezeptMeta: Teige, Brot zum Backen, Butter, Saucen, Dips, Desserts und Getränke sind keine Mahlzeit', () => {
+  const eigen = (title, zeilen, extra = {}) => ({ id: 'e', title, servings: 4, ingredients: parseZeilen(zeilen.join('\n')),
+    ...extra });
+  const keine = [
+    eigen('Dinkelbrot', ['500 g Dinkelmehl', '1 Würfel Hefe', '350 ml Wasser']),
+    eigen('Kräuterbutter', ['250 g Butter', '1 Bund Petersilie']),
+    eigen('Pizzateig (Grundrezept)', ['500 g Mehl', '1 Würfel Hefe']),
+    eigen('Pflaumenkuchen vom Blech', ['500 g Mehl', '80 g Zucker', '1,5 kg Pflaumen']),
+    eigen('Tiramisu', ['500 g Mascarpone', '200 g Löffelbiskuits']),
+    eigen('Guacamole', ['3 Avocados', '1 Limette']),
+    eigen('Vinaigrette', ['4 EL Olivenöl', '2 EL Essig']),
+    eigen('Eistee mit Pfirsich', ['1 l Wasser', '2 Pfirsiche']),
+    eigen('Apfelmus selbst gemacht', ['1 kg Äpfel', '50 g Zucker']),
+    eigen('Tomatensauce', ['2 Dosen Tomaten', '1 Zwiebel']),
+    eigen('Erdbeereis', ['500 g Erdbeeren', '200 ml Sahne']),
+    eigen('Pizzaboden – Basisrezept', ['400 g Mehl']),
+  ];
+  for (const r of keine) assert.equal(rezeptMeta(r).mahlzeit, null, r.title);
+  const gerichte = [
+    eigen('Zwiebelkuchen', ['1 kg Zwiebeln', '200 g Mehl', '1 Würfel Hefe', '200 g Speck']),
+    eigen('Eierpfannkuchen mit Apfelmus', ['250 g Mehl', '3 Eier', '500 ml Milch']),
+    eigen('Milchreis mit Kirschen', ['250 g Milchreis', '1 l Milch']),
+    eigen('Avocado-Brot', ['4 Scheiben Brot', '2 Avocados']),
+    eigen('Butter-Hähnchen mit Reis', ['600 g Hähnchenbrust', '50 g Butter', '250 g Reis']),
+    eigen('Gemüseplatte', ['1 Brokkoli', '4 Möhren']),
+    eigen('Brotsalat', ['1 Baguette', '4 Tomaten']),
+  ];
+  for (const r of gerichte) assert.equal(rezeptMeta(r).mahlzeit, 'haupt', r.title);
+});
+
+test('plane: eigene Rezepte, die fast nichts kosten, sind Zutaten statt Mahlzeit', () => {
+  const eigen = (id, title, zeilen, servings) => ({ ...rezept(id, title, zeilen), servings, herkunft: undefined,
+    mahlzeit: undefined, protein: undefined });
+  const oel = eigen('e1', 'Zwiebelöl', ['250 ml Öl', '1 Zwiebel'], 8); // 1 € für 8 Portionen
+  const reis = eigen('e2', 'Zwiebelreis', ['200 g Reis', '2 Zwiebeln'], 2);
+  const p = plane({ rezepte: [oel, reis], profil: { tage: 2 }, heute: HEUTE, tabelle: TABELLE });
+  assert.deepEqual(ids(p), ['e2', 'e2']);
+  // mit Mahlzeit-Angabe (Grund- oder bearbeitetes Rezept) entscheidet die Angabe
+  const angegeben = plane({ rezepte: [{ ...oel, mahlzeit: 'haupt' }], profil: { tage: 1 }, heute: HEUTE, tabelle: TABELLE });
+  assert.deepEqual(ids(angegeben), ['e1']);
+});
+
+test('passtZumProfil: „Lieber nicht“ mit Tierart, Gruppe oder Allergen-Wort wirkt wie die Auswahl', () => {
+  const r = (zeilen) => rezept('x', 'X', zeilen);
+  const ohne = (zeilen, wort) => passtZumProfil(r(zeilen), { ohne: wort }).ok;
+  // Schwein: auch Speck, Schinken, Wurst, Kassler und gemischtes Hack
+  for (const z of ['100 g Speckwürfel', '4 Scheiben Kochschinken', '4 Bratwürste', '400 g Kassler', '2 Wiener Würstchen',
+    '500 g gemischtes Hackfleisch', '1 Pck. Gelatine']) {
+    assert.equal(ohne([z, '200 g Reis'], 'Schwein'), false, z);
+    assert.equal(ohne([z, '200 g Reis'], 'Schweinefleisch'), false, z);
+    assert.equal(ohne([z, '200 g Reis'], 'Fleisch'), false, z);
+  }
+  assert.equal(ohne(['400 g Hähnchenbrustfilet'], 'Schwein'), true);
+  // Rind trifft gemischtes Hack, Geflügel/Hähnchen alles Geflügel, Fleisch aber keinen Fisch
+  assert.equal(ohne(['500 g Hackfleisch'], 'Rind'), false);
+  assert.equal(ohne(['500 g Rinderhackfleisch'], 'Rindfleisch'), false);
+  for (const w of ['Geflügel', 'Hähnchen', 'Huhn']) {
+    assert.equal(ohne(['400 g Putenbrust'], w), false, w);
+    assert.equal(ohne(['1 l Hühnerbrühe'], w), false, w);
+  }
+  assert.equal(ohne(['200 g Lachsfilet'], 'Fleisch'), true);
+  assert.equal(ohne(['200 g Fleischtomaten'], 'Fleisch'), true);
+  assert.equal(ohne(['200 g Lachsfilet'], 'Fisch'), false);
+  // Gruppen: Milch wie Laktose (Kokosmilch bleibt), Weizen ohne Hafer, Nüsse samt Mandeln
+  assert.equal(ohne(['200 ml Sahne'], 'Milch'), false);
+  assert.equal(ohne(['100 g Butter'], 'Milchprodukte'), false);
+  assert.equal(ohne(['400 ml Kokosmilch'], 'Milch'), true);
+  assert.equal(ohne(['250 g Spaghetti'], 'Weizen'), false);
+  assert.equal(ohne(['2 EL Sojasauce'], 'Weizen'), false);
+  assert.equal(ohne(['100 g Haferflocken'], 'Weizen'), true);
+  assert.equal(ohne(['50 g gemahlene Mandeln'], 'Nüsse'), false);
+  assert.equal(ohne(['2 Eier'], 'Eier'), false);
+  // Wortteile ohne Fehltreffer: 'Wein' ist nicht 'Schwein', 'Lamm' nicht 'Flammkuchen', Leberkäse kein Käse
+  assert.equal(ohne(['400 g Schweinefilet'], 'Wein'), true);
+  assert.equal(ohne(['100 ml Weißwein'], 'Wein'), false);
+  assert.equal(ohne(['1 Rolle Flammkuchenteig'], 'Lamm'), true);
+  assert.equal(ohne(['500 g Lammkeule'], 'Lamm'), false);
+  assert.equal(ohne(['125 g Mozzarella'], 'Käse'), false);
+  assert.equal(ohne(['4 Scheiben Leberkäse'], 'Käse'), true);
+  assert.equal(ohne(['2 Salamis'], 'Wurst'), false);
+  assert.equal(passtZumProfil(r(['100 g Speck']), { ohne: 'Schwein' }).grund, 'Enthält schwein');
+  // Erklärung für die Anzeige
+  assert.equal(ohneBedeutung('Schwein'), 'alle Gerichte mit Schweinefleisch, auch Speck, Schinken und Wurst');
+  assert.equal(ohneBedeutung('Fleisch'), 'alle Gerichte mit Fleisch (Fisch bleibt erlaubt)');
+  assert.equal(ohneBedeutung('Hähnchen'), 'alle Gerichte mit Geflügel (Hähnchen, Pute, Ente …)');
+  assert.equal(ohneBedeutung('Fisch'), 'alle Gerichte mit Fisch und Meeresfrüchten');
+  assert.match(ohneBedeutung('Milch'), /^wie „Laktose“: milch, sahne, butter/);
+  assert.match(ohneBedeutung('Pilze'), /^Zutaten mit pilz, champignon/);
+  assert.equal(ohneBedeutung('Koriander'), 'Zutaten mit „koriander“ im Namen');
+  assert.equal(ohneBedeutung(' '), '');
+});
+
+test('plane: „Lieber nicht: Schwein, Geflügel“ als Freitext lässt keine solchen Gerichte im Plan (Grundsammlung)', () => {
+  const grund = ladeGrundrezepte();
+  const nach = new Map(grund.map((r) => [r.id, r]));
+  for (const seed of [1, 2, 3]) {
+    const p = plane({ rezepte: grund, profil: { ohne: 'Schwein, Geflügel', tage: 14, mahlzeiten: ['frueh', 'abend'] },
+      seed, heute: HEUTE });
+    assert.equal(p.eintraege.length, 28);
+    for (const e of p.eintraege) {
+      const r = nach.get(e.rezeptId);
+      assert.ok(!r.protein.includes('schwein') && !r.protein.includes('gefluegel'), `${seed}: ${e.titel}`);
+    }
+  }
+});
+
+test('Allergene: jede Auswahl schließt die Grundrezepte mit passenden Zutaten aus (unabhängige Stichwörter)', () => {
+  // zweite, unabhängige Liste typischer Produkte; auch Paniertes und Teigwaren mit Ei
+  const MERKMALE = {
+    gluten: new RegExp(['mehl', 'nudel', 'spaghetti', 'penne', 'lasagne', 'tortellini', 'gnocchi', 'spätzle', 'brot',
+      'brötchen', 'toast', 'baguette', 'wrap', 'tortilla', 'couscous', 'bulgur', 'grieß', 'paniermehl', 'teig', 'knödel',
+      'fischstäbchen', 'röstzwiebel', 'sojaso', 'haferflocken', 'müsli'].join('|')),
+    ei: /(?:^|[\s-])eier?(?:$|[\s,])|eigelb|mayonnaise|spätzle|tortellini|mie-nudel|eiernudel/,
+    laktose: /milch(?!reis)|sahne|butter|käse|joghurt|quark|schmand|mozzarella|parmesan|feta|crème fraîche|creme fraiche/,
+    fisch: /fisch|lachs|forelle|kabeljau|garnele|matjes|hering|thunfisch|sardelle|krabbe/,
+    nuesse: /nuss|nüsse|mandel|cashew|pinienkern|pistazie|walnuss|haselnuss/,
+    soja: /soja|tofu|edamame/,
+  };
+  const ausser = new RegExp(['kokosmilch', 'hafermilch', 'sojamilch', 'mandelmilch', 'reismilch', 'muskatnuss', 'kokosnuss',
+    'erdnussbutter', 'kakaobutter', 'reisnudel', 'glasnudel'].join('|'), 'g');
+  const grund = ladeGrundrezepte();
+  for (const [id, re] of Object.entries(MERKMALE)) {
+    const durch = grund.filter((r) => passtZumProfil(r, { allergene: [id], kochzeit: 'egal' }).ok &&
+      r.ingredients.some((z) => re.test(String(z.name).toLowerCase().replace(ausser, ' '))));
+    assert.deepEqual(durch.map((r) => r.title), [], id);
+  }
+  const titel = (id) => grund.filter((r) => !passtZumProfil(r, { allergene: [id], kochzeit: 'egal' }).ok).map((r) => r.title);
+  assert.ok(titel('gluten').includes('Fischstäbchen mit Kartoffelpüree und Erbsen'));
+  assert.ok(titel('gluten').includes('Kartoffelsuppe mit Majoran'));
+  assert.ok(titel('ei').includes('Tortellini in Tomaten-Sahne-Sauce'));
+});
+
+test('plane: Frühstück auch dann, wenn nur Fleischsorten gewählt sind; Hauptgerichte bleiben beim Fleisch', () => {
+  const p = plan({ tage: 4, mahlzeiten: ['frueh', 'abend'], protein: ['rind', 'gefluegel'], kochzeit: 'egal' });
+  assert.deepEqual(p.fehlend, []);
+  for (const e of p.eintraege) {
+    const pr = nachId.get(e.rezeptId).protein;
+    if (e.slot === 'frueh') assert.ok(['vegetarisch', 'vegan'].includes(pr[0]), e.titel);
+    else assert.ok(pr.some((x) => ['rind', 'gefluegel'].includes(x)), e.titel);
+  }
+  assert.equal(passtZumProfil(FRUEH[0], { protein: ['schwein'] }).ok, true);
+  assert.equal(passtZumProfil(HAUPT[5], { protein: ['schwein'] }).ok, false);
+  assert.equal(passtZumProfil(FRUEH[0], { protein: ['vegan'] }).ok, false); // vegan bleibt streng
+});
+
+test('plane: Nudeln höchstens dreimal in sieben Hauptgerichten, auch wenn die offene Packung sie billig macht', () => {
+  const nudeln = ['Tomaten', 'Zwiebeln', 'Paprika', 'Brokkoli', 'Champignons', 'Sahne'].map((was, i) =>
+    rezept(`n${i}`, `Nudeln mit ${was}`, ['125 g Nudeln', i % 2 ? '1 Zwiebel' : '1 Paprika'],
+      { protein: ['vegan'], tags: ['pasta'] }));
+  const andere = ['Reis mit Brokkoli', 'Kartoffeln mit Paprika', 'Couscous mit Zwiebeln', 'Reis mit Champignons',
+    'Kartoffeln mit Brokkoli'].map((titel, i) => rezept(`a${i}`, titel,
+    [['150 g Reis', '600 g Kartoffeln', '150 g Couscous'][i % 3], ['1 Brokkoli', '1 Paprika', '1 Zwiebel'][i % 3]],
+    { protein: ['vegan'], tags: [['reis', 'kartoffeln', ''][i % 3]].filter(Boolean) }));
+  for (const seed of [1, 2, 3, 4, 5, 6]) {
+    const p = plane({ rezepte: [...nudeln, ...andere], profil: { tage: 7 }, seed, heute: HEUTE, tabelle: TABELLE });
+    const pasta = p.eintraege.map((e) => e.rezeptId.startsWith('n'));
+    assert.ok(pasta.filter(Boolean).length <= 3, `seed ${seed}: ${ids(p).join()}`);
+    assert.ok(!pasta.some((x, i) => x && pasta[i + 1] && pasta[i + 2]), `seed ${seed}: dreimal in Folge`);
+  }
+});
+
+test('plane: Grundsammlung – höchstens drei Nudelgerichte in sieben Abendessen (auch schnell und vegan)', () => {
+  const grund = ladeGrundrezepte();
+  const pasta = new Set(grund.filter((r) => r.tags.includes('pasta')).map((r) => r.id));
+  for (const profil of [{}, { kochzeit: 'schnell' }, { protein: ['vegan'] }]) {
+    for (const seed of [1, 2, 3, 4, 5]) {
+      const p = plane({ rezepte: grund, profil: { ...profil, tage: 7 }, seed, heute: HEUTE });
+      const n = p.eintraege.filter((e) => pasta.has(e.rezeptId)).length;
+      assert.ok(n <= 3, `${JSON.stringify(profil)} seed ${seed}: ${n} Nudelgerichte`);
+    }
+  }
+});
+
+test('plane: beim Sparen höchstens zweimal dasselbe Frühstück in sieben Tagen', () => {
+  const fruehs = [1, 2, 3, 4, 5].map((n) => rezept(`b${n}`, `Frühstück ${n}`,
+    [`${40 * n} g Haferflocken`, n > 2 ? '1 Banane' : '100 ml Milch', `${n} Eier`],
+    { mahlzeit: 'frueh', protein: ['vegetarisch'], totalMin: 10 }));
+  const p = plane({ rezepte: fruehs, profil: { tage: 7, mahlzeiten: ['frueh'], budget: 1 }, heute: HEUTE, tabelle: TABELLE });
+  assert.equal(p.imBudget, false);
+  const anzahl = {};
+  for (const id of ids(p)) anzahl[id] = (anzahl[id] || 0) + 1;
+  assert.ok(Object.values(anzahl).every((n) => n <= 2), JSON.stringify(anzahl));
+  assert.ok(p.eintraege.every((e, i, a) => i === 0 || e.rezeptId !== a[i - 1].rezeptId));
+});
+
+test('tausche: Budget-Hinweis von plane() fällt weg, „Nur … Hauptgerichte“ bleibt', () => {
+  const kontext = { rezepte: ALLE, tabelle: TABELLE };
+  const p = plan({ tage: 3, budget: 1 });
+  assert.equal(p.hinweise.length, 1);
+  assert.match(p.hinweise[0], /^Das Budget von 1 € reicht/);
+  const t = tausche(p, 1, kontext);
+  assert.equal(t.imBudget, false);
+  assert.deepEqual(t.hinweise, []);
+  // nur zwei Fischgerichte: der Hinweis darauf bleibt nach dem Tauschen eines Frühstücks
+  const f = plan({ tage: 4, mahlzeiten: ['frueh', 'abend'], protein: ['fisch'], budget: 1 });
+  assert.equal(f.hinweise.length, 2);
+  const tf = tausche(f, 0, kontext);
+  assert.notEqual(tf.eintraege[0].rezeptId, f.eintraege[0].rezeptId);
+  assert.deepEqual(tf.hinweise, ['Nur 2 passende Hauptgerichte für 4 Mahlzeiten – einige kommen doppelt vor.']);
+  // ohne Alternative bleibt der Plan, wie er war
+  assert.equal(tausche(f, 1, kontext), f);
+});
+
+test('plane und kostenDesPlans: gleich teure Zutaten kommen in den Hauptladen (kein zweiter Laden ohne Ersparnis)', () => {
+  const gleich = (preis) => Object.fromEntries(['aldi', 'lidl', 'penny', 'netto', 'kaufland', 'rewe', 'edeka']
+    .map((id) => [id, preis]));
+  // Nudeln und Tomaten kosten überall gleich, der Rest bei Rewe mehr (Faktor 1,5)
+  const tabelle = { ...TABELLE, preise: [['nudel', 1.0, 500, 'g', { laeden: gleich(1.0) }],
+    ['tomate, gehackt', 0.5, 400, 'g', { container: 'Dose', laeden: gleich(0.5) }], ...TABELLE.preise] };
+  for (const laeden of [['rewe', 'aldi'], ['aldi', 'rewe']]) {
+    const p = plane({ rezepte: [HAUPT[0], HAUPT[1]], profil: { tage: 2, laeden }, heute: HEUTE, tabelle });
+    assert.equal(p.kosten.proLaden.rewe, 0, laeden.join());
+    assert.equal(p.kosten.proLaden.aldi, p.kosten.gesamt);
+    const k = kostenDesPlans(p.eintraege, nachId, p.profil, { tabelle });
+    assert.deepEqual(k.proLaden, p.kosten.proLaden);
+    assert.ok(k.zeilen.filter((z) => z.laden).every((z) => z.laden === 'aldi'));
+    assert.ok(k.zeilen.every((z) => !('jeLaden' in z)));
   }
 });

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  LAEDEN, PREIS_STAND, findePreis, mengeInEinheit, kostenFuer, kostenFuerZeilen, formatEuro, formatEuroGerundet,
+  LAEDEN, PREIS_STAND, findePreis, mengeInEinheit, kostenFuer, kostenFuerZeilen, verteileLaeden, formatEuro,
+  formatEuroGerundet,
 } from '../js/preise.js';
 import { PREISE, LADEN_FAKTOR, KATEGORIE_SCHAETZUNG } from '../js/daten/preise-tabelle.js';
 import { ABTEILUNGEN, berechneListe } from '../js/einkaufsliste.js';
@@ -32,7 +33,14 @@ const TABELLE = {
     ['tk-erbse', 1.5, 750, 'g'],
     ['ei', 2.0, 10, 'Stück', { stueckGewicht: 60 }],
     ['butter', 2.0, 250, 'g', { laeden: { rewe: 1.5 } }],
+    ['spaghetti', 0.9, 500, 'g', { laeden: { aldi: 0.9, lidl: 0.9, penny: 0.9, netto: 0.9, kaufland: 0.9, rewe: 0.9,
+      edeka: 0.9 } }],
+    ['mozzarella', 0.8, 125, 'g'],
+    ['staudensellerie', 1.3, 1, 'Stück', { stueckGewicht: 500 }],
     ['salz', 0.4, 500, 'g', { vorrat: true }],
+    ['olivenöl, vorrat', 6.0, 750, 'ml', { vorrat: true }],
+    ['wasser', 0, 1000, 'ml', { vorrat: true }],
+    ['mineralwasser', 0.2, 1500, 'ml'],
   ],
   ladenFaktor: { aldi: 1, lidl: 1, penny: 1.1, netto: 1.1, kaufland: 1.2, rewe: 1.5, edeka: 2 },
   kategorie: { fleisch: { proKg: 10, pauschal: 3 }, 'obst-gemuese': { proKg: 3, proStueck: 0.5, pauschal: 1 } },
@@ -283,4 +291,82 @@ test('echte Preistabelle: gültiges Format, jede Zeile über ihren Schlüssel au
     assert.ok(['proKg', 'proStueck', 'pauschal'].some((f) => k[f] > 0), id);
   }
   for (const k of ['salz', 'pfeffer', 'wasser']) assert.equal(findePreis(k)?.vorrat, true, k);
+});
+
+test('kostenFuer: gezählte Packungen, Flaschen und Kugeln zählen einzeln, wenn sie sich nicht umrechnen lassen', () => {
+  assert.deepEqual([kostenFuer('nudel', [teil(2, 'Packung')], ['lidl'], opt).betrag,
+    kostenFuer('nudel', [teil(2, 'Packung')], ['lidl'], opt).packungen], [2, 2]);
+  assert.equal(kostenFuer('milch', [teil(3, 'Flasche')], ['lidl'], opt).betrag, 3);
+  assert.equal(kostenFuer('mozzarella', [teil(2, 'Kugel')], ['lidl'], opt).betrag, 1.6);
+  // zusammen mit Umrechenbarem: 500 g + 1 Packung = 2 Packungen
+  assert.equal(kostenFuer('nudel', [teil(500, 'g'), teil(1, 'Packung')], ['lidl'], opt).betrag, 2);
+  // im Rezept: Stück ohne Stückgewicht und Stangen bleiben eine Packung ('3 Stangen Staudensellerie' = 1 Staude)
+  assert.equal(kostenFuer('nudel', [teil(2, 'Stück')], ['lidl'], opt).betrag, 1);
+  assert.equal(kostenFuer('staudensellerie', [teil(3, 'Stange')], ['lidl'], opt).betrag, 1.3);
+  // umrechenbare Behälter bleiben wie bisher ('1 Dose Mais' = eine Packung)
+  assert.equal(kostenFuer('mais', [teil(2, 'Dose')], ['lidl'], opt).betrag, 1.8);
+});
+
+test('kostenFuer: jeLaden liefert den Betrag in jedem Laden', () => {
+  const k = kostenFuer('reis', [teil(500, 'g')], ['rewe', 'lidl'], { ...opt, jeLaden: true });
+  assert.deepEqual(k, { betrag: 2, laden: 'lidl', quelle: 'tabelle', geschaetzt: true, packungen: 1,
+    jeLaden: { rewe: 3, lidl: 2 } });
+  assert.equal('jeLaden' in kostenFuer('reis', [teil(500, 'g')], ['rewe', 'lidl'], opt), false);
+});
+
+test('verteileLaeden: gleich teure Zeilen in den Hauptladen, echte Ersparnis bleibt im anderen Laden', () => {
+  const posten = [
+    { betrag: 0.9, laden: 'rewe', jeLaden: { rewe: 0.9, aldi: 0.9 } }, // gleich teuer
+    { betrag: 2, laden: 'aldi', jeLaden: { rewe: 3, aldi: 2 } },
+    { betrag: 1.5, laden: 'rewe', jeLaden: { rewe: 1.5, aldi: 2 } }, // bei Rewe wirklich günstiger
+    { betrag: 0, laden: null },
+  ];
+  assert.deepEqual(verteileLaeden(posten, ['rewe', 'aldi']), ['aldi', 'aldi', 'rewe', null]);
+  assert.deepEqual(verteileLaeden([], ['lidl']), []);
+  assert.deepEqual(verteileLaeden(null, ['lidl']), []);
+});
+
+test('kostenFuerZeilen: kein zweiter Laden ohne Ersparnis, egal in welcher Reihenfolge die Läden gewählt sind', () => {
+  const zeilen = [
+    { mergeKey: 'spaghetti', name: 'Spaghetti', teile: [teil(500, 'g')], rest: [teil(500, 'g')] },
+    { mergeKey: 'reis', name: 'Reis', teile: [teil(1, 'kg')], rest: [teil(1, 'kg')] },
+  ];
+  for (const laeden of [['rewe', 'lidl'], ['lidl', 'rewe']]) {
+    const k = kostenFuerZeilen(zeilen, laeden, opt);
+    assert.deepEqual(k.proLaden, { rewe: 0, lidl: 2.9 }, laeden.join());
+    assert.equal(k.proZeile.get('spaghetti').laden, 'lidl');
+  }
+  // ein eigener Preis macht Rewe für Reis günstiger: Rewe ist dann der Hauptladen, die gleich teuren Spaghetti
+  // kommen mit; mit teurerer Butter bei Rewe bleibt die Butter bei Lidl
+  const eigenePreise = { reis: { rewe: { preis: 1, menge: 1, einheit: 'kg' } } };
+  const k = kostenFuerZeilen(zeilen, ['lidl', 'rewe'], { ...opt, eigenePreise });
+  assert.deepEqual([k.proZeile.get('reis').laden, k.proZeile.get('spaghetti').laden], ['rewe', 'rewe']);
+  assert.deepEqual(k.proLaden, { lidl: 0, rewe: 1.9 });
+  const butter = [...zeilen, { mergeKey: 'butter', name: 'Butter', teile: [teil(250, 'g')], rest: [teil(250, 'g')] }];
+  const teurer = { ...eigenePreise, butter: { rewe: { preis: 2.5, menge: 250, einheit: 'g' } } };
+  const k2 = kostenFuerZeilen(butter, ['lidl', 'rewe'], { ...opt, eigenePreise: teurer });
+  assert.deepEqual([...k2.proZeile.values()].map((z) => z.laden), ['rewe', 'rewe', 'lidl']);
+});
+
+test('kostenFuerZeilen: eigene Einträge – „2 Butter“ sind zwei Packungen, Grundvorrat wird gekauft', () => {
+  const manuell = (id, name, qty, unit = null) => ({ id, kind: 'manual', name, qty, qty2: null, unit, checked: false });
+  const runde = { id: 't1', from: '2026-10-19', to: '2026-10-25', closedAt: null };
+  const manuelle = [manuell('m1', 'Butter', 2), manuell('m2', 'Milch', 3), manuell('m3', 'Spaghetti', 2, 'Pck.'),
+    manuell('m4', 'Salz', null), manuell('m5', 'Wasser', 6), manuell('m6', 'Zwiebeln', 3)];
+  const liste = berechneListe({ manuelle, runde });
+  const k = kostenFuerZeilen(liste, ['lidl'], opt);
+  const betrag = (id) => k.proZeile.get(`manuell:${id}`);
+  assert.equal(betrag('m1').betrag, 4); // 2 × 250 g
+  assert.equal(betrag('m2').betrag, 3); // 3 × 1 l
+  assert.equal(betrag('m3').betrag, 1.8);
+  assert.deepEqual([betrag('m4').betrag, betrag('m4').quelle], [0.4, 'tabelle']);
+  assert.equal(betrag('m5').betrag, 1.2); // 'Wasser' auf der Liste = Mineralwasser
+  assert.equal(betrag('m6').betrag, 1); // Stückgewicht bekannt: 300 g → eine Packung
+  // auch mit 'wasser' im eigenen Vorrat (Leitungswasser fürs Kochen): ein eigener Eintrag wird gekauft
+  assert.equal(kostenFuerZeilen(liste, ['lidl'], { ...opt, vorrat: ['wasser'] }).proZeile.get('manuell:m5').betrag, 1.2);
+  // Rezept-Zeilen dagegen: Grundvorrat kostet nichts
+  const rezept = { id: 'r1', title: 'Nudeln', servings: 2, ingredients: parseZeilen('250 g Nudeln\n1 TL Salz') };
+  const planEintraege = [{ id: 'p1', date: '2026-10-20', slot: 'abend', recipeId: 'r1', servings: 2, tripId: null }];
+  const mitRezept = kostenFuerZeilen(berechneListe({ planEintraege, rezepte: [rezept], runde }), ['lidl'], opt);
+  assert.deepEqual([mitRezept.proZeile.get('salz').betrag, mitRezept.proZeile.get('salz').quelle], [0, 'vorrat']);
 });

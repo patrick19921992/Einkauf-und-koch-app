@@ -183,7 +183,7 @@ test('berechneListe: zwei Rezepte skaliert und zusammengefasst', () => {
   // Gulasch ×2, Suppe ×0,5
   const zwiebel = zeile(l, 'zwiebel');
   assert.deepEqual(zwiebel.teile, [{ qty: 4.5, qty2: null, unit: 'Stück' }]);
-  assert.equal(zwiebel.text, '4½');
+  assert.equal(zwiebel.text, '5'); // zum Einkaufen ganze Stück (4,5 → 5)
   assert.equal(zwiebel.abteilung, 'obst-gemuese');
   assert.deepEqual(zwiebel.quellen, [
     { planEntryId: 'e1', recipeId: 'r-gulasch', titel: 'Gulasch', datum: '2026-10-19' },
@@ -198,7 +198,7 @@ test('berechneListe: zwei Rezepte skaliert und zusammengefasst', () => {
   assert.equal(zeile(l, 'rotwein').abteilung, 'alkohol');
   // Spanne: (1–2) × 2 + 1 × 0,5 → 2,5–4,5
   assert.deepEqual(zeile(l, 'knoblauchzehe').teile, [{ qty: 2.5, qty2: 4.5, unit: 'Stück' }]);
-  assert.equal(zeile(l, 'knoblauchzehe').text, '2½–4½');
+  assert.equal(zeile(l, 'knoblauchzehe').text, '3–5');
   // Gruppen-Überschrift ist keine Zutat
   assert.equal(alleZeilen(l).some((z) => /soße/i.test(z.mergeKey)), false);
   // jede Zeile ist vollständig
@@ -339,7 +339,7 @@ test('berechneListe: eigene Einträge bleiben einzeln', () => {
   // nicht mit der Rezept-Zeile 'zwiebel' zusammengeführt, eigene Abteilung gilt
   assert.equal(zeile(l, 'manuell:m3').abteilung, 'sonstiges');
   assert.equal(zeile(l, 'manuell:m3').text, '2');
-  assert.equal(zeile(l, 'zwiebel').text, '4½');
+  assert.equal(zeile(l, 'zwiebel').text, '5');
   assert.equal(zeile(l, 'manuell:m4'), undefined);
   assert.equal(zeile(l, 'manuell:m5').abteilung, 'konserven');
   assert.equal(l.anzahlGesamt, l.anzahlOffen + 1);
@@ -411,7 +411,7 @@ test('berechneListe: Abhaken, nachträglich mehr → Rest', () => {
   const l2 = liste({ zustaende, planEintraege: mehr });
   const z = zeile(l2, 'zwiebel');
   assert.equal(z.erledigt, false);
-  assert.equal(z.text, '6½');
+  assert.equal(z.text, '7');
   assert.deepEqual(z.rest, [{ qty: 2, qty2: null, unit: 'Stück' }]);
   assert.equal(z.restText, '2');
   assert.equal(zeile(l2, 'rindergulasch').restText, '500 g');
@@ -619,4 +619,18 @@ test('listeAlsText: Titel, Abteilungen, Rest statt Gesamt, ohne Erledigtes und V
   assert.equal(listeAlsText(l).split('\n')[0], '— Obst & Gemüse —');
   assert.equal(listeAlsText({ abteilungen: [] }, { titel: 'Leer' }), 'Leer');
   assert.equal(listeAlsText(null), '');
+});
+
+test('zumEinkaufen: ganze Stücke und Packungen, Gramm und Löffel bleiben genau', async () => {
+  const { zumEinkaufen } = await import('../js/einkaufsliste.js');
+  const t = zumEinkaufen([
+    { qty: 0.375, qty2: null, unit: null },
+    { qty: 1.875, qty2: null, unit: 'Stück' },
+    { qty: 9.75, qty2: null, unit: 'Zehe' },
+    { qty: 1.2, qty2: 2.4, unit: 'Dose' },
+    { qty: 337.5, qty2: null, unit: 'g' },
+    { qty: 1.5, qty2: null, unit: 'TL' },
+    { qty: 3, qty2: null, unit: null },
+  ]);
+  assert.deepEqual(t.map((x) => [x.qty, x.qty2]), [[1, null], [2, null], [10, null], [2, 3], [337.5, null], [1.5, null], [3, null]]);
 });

@@ -68,9 +68,17 @@ nimmt nur Anfragen von der App-Adresse an und ruft nur bekannte Rezeptseiten ab
    oder sagt, was mit diesen Vorlieben mindestens nötig ist.
 3. Ergebnis prüfen: Gesamtkosten, Summe je Laden, Budget-Hinweis. Jedes Gericht lässt sich
    **tauschen** oder **ansehen**; „Neu planen“ würfelt neu, „Ändern“ öffnet die Vorlieben.
-4. **„Übernehmen“**: Die Gerichte kommen in den Wochenplan (vorhandene Einträge behalten oder
-   ersetzen), die verwendeten Rezepte in deine Rezeptliste. Danach geht es mit einem Tipp zur
-   Einkaufsliste für genau diesen Zeitraum.
+   Ein Grundrezept, das ihr nicht mögt: „Ansehen“ → **„Nicht mehr vorschlagen“**.
+4. **„Übernehmen“**: Die Gerichte kommen in den Wochenplan, die verwendeten Rezepte in deine
+   Rezeptliste. Ist im Zeitraum schon etwas geplant, fragt die App: **„Nur freie Mahlzeiten füllen“**
+   (Standard) oder **„Ersetzen“** (nennt, was entfernt wird, und warnt bei schon Eingekauftem).
+   Gekochtes und Notizen wie „Essen gehen“ bleiben immer stehen, und keine Mahlzeit bekommt ein
+   zweites Gericht. Danach geht es mit einem Tipp zur Einkaufsliste für genau diesen Zeitraum –
+   oder mit **„Rückgängig“** zurück zum Plan.
+
+Die Supermärkte gelten für den ganzen Haushalt: Was du im Planer oder unter **Mehr → Läden & Preise**
+wählst, nutzen Planer und Einkaufsliste gleichermaßen. Gelöschte Grundrezepte schlägt der Planer
+nicht mehr vor.
 
 Allergie-Filter sind eine Hilfe, **keine Garantie** – Zutaten bitte immer selbst prüfen.
 Das Planen klappt auch offline; nur KI-Ideen brauchen Internet.
@@ -78,10 +86,14 @@ Das Planen klappt auch offline; nur KI-Ideen brauchen Internet.
 ### Preise sind Schätzungen
 
 - Alle Preise sind **eigene Schätzwerte, Stand 10/2026** – keine Live-Preise, keine Angebote.
-  Grundlage ist der typische Eigenmarken-Preis beim Discounter; Rewe und Edeka sind etwas teurer
-  angesetzt. Die App rechnet in ganzen Packungen und nimmt je Zutat den günstigsten gewählten Laden.
-- **Grundvorrat** wie Salz, Pfeffer, Gewürze, Speiseöl, Essig, Mehl, Zucker, Brühe und Wasser gilt
-  als zu Hause vorhanden und kostet im Plan nichts.
+  Grundlage ist der typische Packungspreis der Discounter-Eigenmarke. Grundnahrungsmittel wie Milch,
+  Butter, Eier, Nudeln, Reis und Dosentomaten kosten in jedem Laden gleich viel (Einstiegs-Eigenmarken);
+  alles andere ist je nach Laden etwas teurer angesetzt, bei Rewe und Edeka etwa 12 % über Aldi/Lidl.
+  Die App rechnet in ganzen Packungen und nimmt je Zutat den günstigsten gewählten Laden.
+- **Grundvorrat** gilt als zu Hause vorhanden und kostet im Plan nichts: Salz, Pfeffer, Wasser,
+  Speiseöl (auch Olivenöl), Essig, Zucker, Mehl, Speisestärke, Backpulver, getrocknete Gewürze und
+  Kräuter, Lorbeerblätter und Instant-Brühe. Trägst du so etwas selbst in die Einkaufsliste ein,
+  zählt es mit seinem Preis.
 - In der **Einkaufsliste** steht bei jedem Posten „≈ 1,29 €“ (bei mehreren Läden mit dem günstigsten
   Laden), oben die Summe. „Nach Laden“ sortiert die Liste nach Supermarkt.
 - **Eigene Preise:** Posten → ⋮ → „Preis eintragen“ (Preis, Menge, Laden oder „Alle Läden“). Eigene
@@ -102,8 +114,10 @@ andere Rezepte in deiner Rezeptliste. Einrichten (einmalig, im Browser):
 3. In der App **Mehr → Import-Dienst → „Testen“**: Dort steht dann „KI-Rezeptideen: verfügbar“.
 
 Der kostenlose Plan enthält **10.000 Neurons pro Tag** (etwa 40 KI-Anfragen) und kann keine Kosten
-erzeugen. Ist das Kontingent aufgebraucht, sagt die App „Morgen geht es wieder“ und plant ohne neue
-Ideen. Cloudflare nutzt die Anfragen nicht zum Trainieren. Ein anderes Modell lässt sich über die
+erzeugen. Ist das Kontingent aufgebraucht, sagt die App „Morgen geht es wieder“, plant ohne neue
+Ideen und hakt die KI-Option für diese Sitzung ab. Klappt die KI nicht, steht der Grund samt
+Anleitung beim Plan; meldet der Import-Dienst, dass die KI fehlt, ist die Option gesperrt, bis sie
+eingerichtet ist. Cloudflare nutzt die Anfragen nicht zum Trainieren. Ein anderes Modell lässt sich über die
 Text-Variable `KI_MODELL` im Worker einstellen (Settings → Variables and Secrets), Standard ist
 `@cf/google/gemma-4-26b-a4b-it`. Titel deiner eigenen Rezepte werden nicht an die KI geschickt.
 

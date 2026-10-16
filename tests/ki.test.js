@@ -7,6 +7,7 @@ import {
 import worker, { KI_SCHEMA as WORKER_SCHEMA } from '../proxy/worker.js';
 import { parseZeile } from '../js/zutaten.js';
 import { passtZumProfil, rezeptMeta } from '../js/planer.js';
+import { GRUNDREZEPTE } from '../js/daten/rezepte.js';
 
 const DIENST = 'https://ek-import.beispiel.workers.dev';
 const APP = 'https://patrick19921992.github.io';
@@ -145,6 +146,14 @@ test('holeKiRezepte: alle Fehler als KiFehler mit deutscher Meldung', async () =
 
   await fall('limit', mitAntwort(429, { fehler: 'limit' }), /heute.*aufgebraucht/);
   await fall('limit', mitAntwort(429, ''), /10\.000 Neurons/);
+  // kurz ausgelastet ist kein aufgebrauchtes Tageskontingent
+  const voll = await fall('netz', mitAntwort(429, { fehler: 'beschaeftigt' }), /ausgelastet.*in einer Minute/);
+  assert.equal(voll.grund, 'beschaeftigt');
+  assert.doesNotMatch(voll.message, /Kontingent|Morgen/);
+  // falsches Modell: Hinweis auf KI_MODELL statt „morgen wieder“
+  const modell = await fall('ki-fehlt', mitAntwort(502, { fehler: 'ki-modell' }), /KI_MODELL/);
+  assert.equal(modell.grund, 'ki-modell');
+  assert.match(modell.message, /Deploy/);
   await fall('origin', mitAntwort(403, { fehler: 'origin', meldung: 'x' }), /ERLAUBTE_ORIGINS/);
   await fall('ungueltig', mitAntwort(502, { fehler: 'ki-format' }), /keine brauchbare Antwort/);
   await fall('netz', mitAntwort(502, { fehler: 'ki' }), /später/);
@@ -175,6 +184,30 @@ test('KiFehler: eigener Text und Standardtexte je Code', () => {
     assert.ok(e.message.length > 20, code);
     assert.doesNotMatch(e.message, /undefined|\$\{/);
   }
+  assert.match(new KiFehler('netz', null, { grund: 'beschaeftigt' }).message, /ausgelastet/);
+  assert.match(new KiFehler('ki-fehlt', null, { grund: 'ki-modell' }).message, /KI_MODELL/);
+});
+
+test('Ganzer Weg: Fehler von Workers AI → passende Meldung (Kontingent, ausgelastet, Modell)', async () => {
+  const mitFehler = (text) => (url, init) => worker.fetch(new Request(url, { ...init, headers: { ...init.headers, Origin: APP } }),
+    { AI: { run: async () => { throw new Error(text); } } });
+  const body = kiAnfrage({ protein: ['vegan'] });
+  const fall = async (text) => fehlerVon(holeKiRezepte(DIENST, body, { fetchFn: mitFehler(text) }));
+  const tag = await fall("3036: You have used up your daily free allocation of 10,000 neurons. Please upgrade to Cloudflare's Workers Paid plan");
+  assert.deepEqual([tag.code, tag.grund], ['limit', 'limit']);
+  assert.match(tag.message, /Morgen geht es wieder/);
+  for (const text of ['3040: Capacity temporarily exceeded, please try again.', 'Rate limited, please slow down']) {
+    const e = await fall(text);
+    assert.deepEqual([e.code, e.grund, e.status], ['netz', 'beschaeftigt', 429], text);
+    assert.doesNotMatch(e.message, /Kontingent|Morgen/, text);
+  }
+  for (const text of ['5007: No such model @cf/gibt/es-nicht or task', 'max_completion_tokens (7200) exceeds the model limit (4096)']) {
+    const e = await fall(text);
+    assert.deepEqual([e.code, e.grund], ['ki-fehlt', 'ki-modell'], text);
+    assert.doesNotMatch(e.message, /Kontingent|Morgen/, text);
+  }
+  const sonst = await fall('3043: Internal server error');
+  assert.deepEqual([sonst.code, sonst.grund], ['netz', 'ki']);
 });
 
 test('pruefeKiRezept: gültiges Rezept im Rohformat, gut lesbar', () => {
@@ -256,6 +289,89 @@ test('pruefeKiRezept: Allergene und „Lieber nicht“ (Zutaten und Titel)', () 
   assert.ok(pruefeKiRezept(mit({ title: 'Kokosmilch-Curry mit Reis' }), vegan({ allergene: ['laktose', 'ei'] })));
   // Kochzeit prüft erst der Planer
   assert.ok(pruefeKiRezept(mit({ totalMin: 90 }), vegan({ kochzeit: 'schnell' })));
+});
+
+test('pruefeKiRezept: Schritte, Titel und Alternativen („oder …“) werden mitgeprüft', () => {
+  const basis = (extra) => ({ title: 'Gemüse-Reis-Pfanne', servings: 2, totalMin: 30, mahlzeit: 'haupt', protein: ['vegetarisch'],
+    zutaten: ['250 g Reis', '1 Zwiebel', '2 Möhren'], schritte: ['Reis 15 Minuten kochen.', 'Alles mischen.'], ...extra });
+  const vegetarisch = { protein: ['vegetarisch', 'vegan'] };
+  const nein = (roh, profil, muster) => {
+    const { rezept, grund } = bewerteKiRezept(roh, profil);
+    assert.equal(rezept, null, JSON.stringify(roh));
+    if (muster) assert.match(grund, muster);
+  };
+  // Tiere nur in den Schritten, im Titel oder als Alternative
+  nein(basis({ schritte: ['Speck in einer Pfanne 5 Minuten auslassen.', 'Reis zugeben.'] }), vegetarisch, /fleischlos/);
+  nein(basis({ schritte: ['Das Fleisch 5 Minuten anbraten.', 'Reis zugeben.'] }), vegetarisch, /fleischlos/);
+  nein(basis({ schritte: ['Reis kochen.', 'Wer mag, gibt gewürfelten Schinken dazu.'] }), vegetarisch);
+  nein(basis({ title: 'Putenpfanne mit Reis' }), vegetarisch, /fleischlos/);
+  nein(basis({ zutaten: ['250 g Reis', '1 Zwiebel', '150 g Räuchertofu oder Speck'] }), vegetarisch, /fleischlos/);
+  nein(basis({ zutaten: ['250 g Reis', '1 Zwiebel', '400 g Hähnchenbrust in Sojasauce mariniert'] }), vegetarisch);
+  // Ei, Milch, Honig in einem „veganen“ Gericht
+  const vegan = { protein: ['vegan'] };
+  nein(basis({ protein: ['vegan'], schritte: ['Reis 10 Minuten kochen.', 'Ein Ei unterrühren.'] }), vegan, /vegan/);
+  nein(basis({ protein: ['vegan'], schritte: ['Reis kochen.', 'Mit Crème fraîche servieren.'] }), vegan, /vegan/);
+  nein(basis({ protein: ['vegan'], zutaten: ['250 g Reis', '1 Zwiebel', '200 ml Hafermilch (oder Kuhmilch)'] }), vegan);
+  nein(basis({ protein: ['vegan'], zutaten: ['250 g Reis', '1 Zwiebel', '1 EL Agavendicksaft (oder Honig)'] }), vegan);
+  // Allergene und „Lieber nicht“ in den Schritten
+  nein(basis({ schritte: ['Reis 10 Minuten kochen.', 'Mit Parmesan bestreuen.'] }), { protein: ['vegetarisch'], allergene: ['laktose'] },
+    /Laktose/);
+  nein(basis({ schritte: ['Reis kochen.', 'Mit gerösteten Walnüssen bestreuen.'] }), { protein: ['vegetarisch'], allergene: ['nuesse'] });
+  nein(basis({ schritte: ['Reis kochen.', 'Dazu Brot reichen.'] }), { protein: ['vegetarisch'], allergene: ['gluten'] }, /Gluten/);
+  nein(basis({ schritte: ['Reis kochen.', 'Champignons anbraten und zugeben.'] }), { protein: ['vegetarisch'], ohne: ['Pilze'] }, /pilz/);
+  nein(basis({ title: 'Champignon-Reis-Pfanne' }), { protein: ['vegetarisch'], ohne: ['Pilze'] });
+  // Fleisch, das nicht gewählt ist, auch bei Fleischgerichten
+  nein(basis({ protein: ['gefluegel'], zutaten: ['400 g Hähnchenbrust', '250 g Reis', '1 Paprika'],
+    schritte: ['Hähnchen 6 Minuten braten.', 'Mit Speckwürfeln bestreuen.'] }), { protein: ['gefluegel'] }, /Schwein/);
+
+  // Kein Fehlalarm: Verneintes, Vergleiche, Verben, Gerichtsformen und Wörter aus der Zutatenliste
+  const durch = (roh, profil) => {
+    const { rezept, grund } = bewerteKiRezept(roh, profil);
+    assert.ok(rezept, `${roh.title}: ${grund}`);
+    return rezept;
+  };
+  const v = (title, zutaten, schritte) => basis({ title, protein: ['vegan'], zutaten, schritte });
+  durch(v('Linsen-Bolognese', ['250 g Spaghetti', '150 g rote Linsen', '1 Zwiebel', '1 Dose gehackte Tomaten (400 g)'],
+    ['Zwiebel fein hacken und 3 Minuten braten.', 'Linsen und Tomaten 15 Minuten köcheln.', 'Mit Spaghetti servieren.']), vegan);
+  durch(v('Haferbrei mit Beeren', ['80 g Haferflocken', '300 ml Hafermilch', '100 g Beeren'],
+    ['Milch erhitzen.', 'Haferflocken einrühren und 5 Minuten quellen lassen.']), vegan);
+  durch(v('Rührtofu', ['200 g Tofu', '2 Tomaten', '1 TL Kurkuma'],
+    ['Tofu zerbröseln, bis er wie Rührei aussieht.', 'In Öl 5 Minuten braten.']), { protein: ['vegan'], allergene: ['ei'] });
+  durch(v('Spaghetti Aglio e Olio', ['250 g Spaghetti', '2 Zehen Knoblauch', '4 EL Olivenöl'],
+    ['Spaghetti kochen.', 'Knoblauch anbraten – ganz ohne Speck und Käse.', 'Statt Butter etwas Nudelwasser unterrühren.']), vegan);
+  durch(v('Blumenkohl-Steaks', ['1 Blumenkohl', '2 EL Öl', '1 Bund Petersilie'],
+    ['Blumenkohl in Scheiben schneiden.', 'Die Steaks je Seite 5 Minuten braten.', 'Petersilie hacken.']), vegan);
+  durch(v('Linsenköfte mit Salat', ['150 g rote Linsen', '100 g Bulgur', '1 Zwiebel'],
+    ['Linsen 15 Minuten kochen.', 'Köfte formen und servieren.']), vegan);
+  durch(v('Pilzgulasch', ['500 g Champignons', '2 Zwiebeln', '1 EL Paprikapulver'],
+    ['Pilze vierteln.', 'Das Gulasch 20 Minuten schmoren.']), vegan);
+  durch(v('Gebratener Reis', ['250 g Reis', '1 Paprika', '2 EL Sojasauce'],
+    ['Reis kochen.', 'Gemüse 4 Minuten braten.', 'Mit Sojasauce würzen.']), vegan);
+  durch(v('Kürbissuppe', ['1 Hokkaido-Kürbis', '1 Zwiebel', '800 ml Gemüsebrühe', '200 ml Kokosmilch'],
+    ['Das Kürbisfleisch würfeln.', 'Gemüse halbieren, 20 Minuten kochen, bis es butterweich ist.', 'Nussig abschmecken.']),
+  { protein: ['vegan'], allergene: ['nuesse', 'gluten', 'laktose'] });
+  durch(v('Chili mit veganem Hack', ['200 g veganes Hack', '1 Dose Kidneybohnen', '1 Dose Tomaten'],
+    ['Das Hack krümelig anbraten.', 'Bohnen und Tomaten 20 Minuten köcheln.']), vegan);
+  // Austernpilze und Honigmelone sind vegan
+  durch(v('Austernpilz-Pfanne', ['250 g Reis', '1 Zwiebel', '200 g Austernpilze'], ['Reis kochen.', 'Austernpilze anbraten.']), vegan);
+  durch(v('Melonensalat', ['1/2 Honigmelone', '1 Gurke', '1 Bund Minze'], ['Melone würfeln.', 'Alles mischen.']), vegan);
+  // „das Fleisch“ und „die Filets“ meinen bei Fleisch- und Fischgerichten deren Hauptzutat
+  durch(basis({ title: 'Hähnchen-Pfanne', protein: ['gefluegel'], zutaten: ['400 g Hähnchenbrust', '1 Paprika', '250 g Reis'],
+    schritte: ['Das Fleisch in Streifen schneiden.', 'Die Filets 6 Minuten braten.', 'Den Bratensatz lösen.'] }), { protein: ['gefluegel'] });
+  durch(basis({ title: 'Lachs mit Kartoffeln', protein: ['fisch'], zutaten: ['2 Lachsfilets', '500 g Kartoffeln', '1 Zitrone'],
+    schritte: ['Kartoffeln 20 Minuten kochen.', 'Den Fisch 4 Minuten braten.'] }), { protein: ['fisch'] });
+});
+
+test('pruefeKiRezept: kein Grundrezept wird als KI-Antwort fälschlich verworfen', () => {
+  // Die Grundrezepte sind geprüft – ihre Titel und Schritte zeigen, wie normale Rezepttexte aussehen
+  const falsch = [];
+  for (const roh of GRUNDREZEPTE) {
+    const profil = { protein: roh.protein.includes('vegan') ? ['vegan'] : roh.protein };
+    const { rezept, grund } = bewerteKiRezept(roh, profil);
+    if (!rezept) falsch.push(`${roh.id} ${roh.title}: ${grund}`);
+    else assert.deepEqual([...rezept.protein].sort(), [...profil.protein].sort(), roh.id);
+  }
+  assert.deepEqual(falsch, []);
 });
 
 test('pruefeKiRezept: unvollständige oder kaputte Antworten → null', () => {
