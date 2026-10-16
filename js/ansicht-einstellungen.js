@@ -11,6 +11,8 @@ const MAHLZEITEN = [['frueh', 'Frühstück'], ['mittag', 'Mittag'], ['abend', 'A
 const WOCHENSTART = [[1, 'Montag'], [0, 'Sonntag'], [6, 'Samstag']];
 const PROBE_TEXT = 'Schritt 1: Die Zwiebeln fein würfeln und in 2 Esslöffeln Butter glasig dünsten.';
 const PROXY_BEISPIEL = 'https://rezepte.dein-name.workers.dev';
+const STANDARD_ORIGIN = 'https://patrick19921992.github.io'; // wie ERLAUBTE_ORIGINS in proxy/worker.js
+const MAX_DATEI_BYTES = 50 * 1024 * 1024; // größere Dateien sind sicher keine Sicherung
 
 // Ersetzt den Inhalt; null/false werden ausgelassen
 const fuelle = (ziel, ...kinder) => ziel.replaceChildren(...kinder.flat(Infinity).filter((k) => k != null && typeof k !== 'boolean'));
@@ -30,11 +32,11 @@ function zeile(titel, beschreibung, ...rechts) {
     el('div', null, el('div', { class: 'fett' }, titel), beschreibung ? el('div', { class: 'nebentext' }, beschreibung) : null), ...rechts);
 }
 
-/** Bytes → '0,4 MB' bzw. '12 GB'. */
+/** Bytes → '0,4 MB', '250 MB' bzw. '1 GB' (ab 1000 MB, sonst liest sich „1.016 MB“ schlecht). */
 function groesse(bytes) {
   const mb = Math.max(0.1, bytes / (1024 * 1024));
   const zahl = (x) => x.toLocaleString('de-DE', { maximumFractionDigits: x < 10 ? 1 : 0 });
-  return mb >= 1024 ? `${zahl(mb / 1024)} GB` : `${zahl(mb)} MB`;
+  return mb >= 1000 ? `${zahl(mb / 1024)} GB` : `${zahl(mb)} MB`;
 }
 
 /** 'heute, 14:30 Uhr' / 'gestern' / 'vor 5 Tagen (10.10.2026)' / 'nie'. */
@@ -61,12 +63,22 @@ function proxyNormal(text) {
   const t = String(text ?? '').trim();
   if (!t) return '';
   try {
-    const u = new URL(/^[a-z]+:\/\//i.test(t) ? t : `https://${t}`);
-    if (u.protocol !== 'https:' || u.username || u.password) return null;
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? t : `https://${t}`);
+    // http nur unter der Adresse der App selbst (lokaler Test); andere erlaubt die CSP ohnehin nicht
+    const eigen = u.origin === location.origin;
+    if (!(u.protocol === 'https:' || eigen) || u.username || u.password) return null;
+    if (!eigen && u.hostname !== 'localhost' && !u.hostname.includes('.')) return null; // Tippfehler wie „https://rezepte“
     return `${u.origin}${u.pathname.replace(/\/+$/, '')}`;
   } catch {
     return null;
   }
+}
+
+/** Erklärung, wenn ein Server antwortet, die App aber nicht lesen darf (CORS/ERLAUBTE_ORIGINS). */
+function originHinweis() {
+  const fremd = location.origin !== STANDARD_ORIGIN;
+  return `Unter der Adresse antwortet ein Server, aber nicht für diese App. Ist es die Adresse des Import-Dienstes?${fremd
+    ? ` Dann im Worker unter „Settings“ → „Variables and Secrets“ die Text-Variable ERLAUBTE_ORIGINS mit ${location.origin} anlegen.` : ''}`;
 }
 
 export async function zeige(container) {
@@ -156,11 +168,20 @@ export async function zeige(container) {
     dateiFeld.value = ''; // dieselbe Datei darf erneut gewählt werden
     if (!datei) return;
     fuelle(sicherungMeldung);
+    if (datei.size > MAX_DATEI_BYTES) {
+      fehler(`Die Datei ist zu groß für eine Sicherung (${groesse(datei.size)}). Bitte die Datei „rezepte-backup-….json“ wählen.`);
+      return;
+    }
     let daten;
     try {
       daten = JSON.parse(await datei.text());
     } catch (f) {
-      fehler('Die Datei ist keine gültige Sicherung (kein JSON).', f);
+      console.warn(f); // technische Meldung des Browsers hilft hier niemandem
+      fehler('Die Datei ist keine gültige Sicherung (kein JSON). Bitte die Datei „rezepte-backup-….json“ (oder .txt) wählen.');
+      return;
+    }
+    if (!daten || typeof daten !== 'object' || typeof daten.daten !== 'object' || !daten.daten) {
+      fehler('Die Datei ist keine Sicherung dieser App.');
       return;
     }
     const rezepte = Array.isArray(daten?.daten?.recipes) ? daten.daten.recipes.filter((r) => r && !r.deleted).length : 0;
@@ -170,7 +191,7 @@ export async function zeige(container) {
       'Pro Eintrag gewinnt der neuere Stand, gelöscht wird nichts.', { titel: 'Sicherung einlesen', ja: 'Einlesen' }))) return;
     try {
       const erg = await db.importiere(daten);
-      toast(`${erg.neu} neu, ${erg.aktualisiert} aktualisiert${erg.uebersprungen ? `, ${erg.uebersprungen} unverändert` : ''}`, { dauer: 5000 });
+      toast(`Eingelesen: ${erg.neu} neu, ${erg.aktualisiert} aktualisiert${erg.uebersprungen ? `, ${erg.uebersprungen} unverändert` : ''}`, { dauer: 5000 });
       navigiere('#/mehr', { ersetzen: true }); // neu zeichnen: Haushalts-Einstellungen können sich geändert haben
     } catch (f) {
       fehler(f?.message || 'Die Sicherung konnte nicht eingelesen werden.');
@@ -212,7 +233,7 @@ export async function zeige(container) {
   // Ping an `${proxy}?ping=1`; klappt es, wird die Adresse gleich gespeichert
   async function proxyTesten(k) {
     const url = proxyNormal(proxyFeld.value);
-    if (!url) return fuelle(proxyMeldung, fehlerAnzeige(url === null ? 'Die Adresse ist ungültig (nur https).' : 'Bitte zuerst die Adresse eingeben.'));
+    if (!url) return fuelle(proxyMeldung, fehlerAnzeige(url === null ? `Die Adresse ist ungültig. Bitte eine vollständige https-Adresse eingeben, z. B. ${PROXY_BEISPIEL}` : 'Bitte zuerst die Adresse eingeben.'));
     k.disabled = true;
     fuelle(proxyMeldung, el('p', { class: 'nebentext' }, 'Teste Verbindung…'));
     const ziel = new URL(url);
@@ -226,16 +247,23 @@ export async function zeige(container) {
         if (neu) { proxyFeld.value = url; await speichern({ proxyUrl: url }); }
         meldung = el('p', { class: 'hinweis erfolg' }, `Verbindung klappt${json.version ? ` (Version ${json.version})` : ''}.${neu ? ' Adresse gespeichert.' : ''}`);
       } else {
-        meldung = fehlerAnzeige(json?.fehler === 'origin'
-          ? 'Der Dienst lehnt diese App-Adresse ab. Im Worker muss die Adresse der App in ERLAUBTE_ORIGINS stehen.'
+        meldung = fehlerAnzeige(json?.fehler === 'origin' ? originHinweis()
           : `Unerwartete Antwort (Status ${antwort.status}). Ist das die Adresse des Import-Dienstes?`);
       }
     } catch (f) {
-      const zeit = f?.name === 'TimeoutError';
-      meldung = fehlerAnzeige(zeit ? 'Keine Antwort nach 10 Sekunden.' : 'Keine Verbindung. Adresse und Internet prüfen.', zeit ? null : f);
+      console.warn('Import-Dienst nicht erreichbar:', f);
+      meldung = fehlerAnzeige(await pingFehler(f, ziel.href));
     }
     k.disabled = false;
     return fuelle(proxyMeldung, meldung);
+  }
+  // Warum der Ping scheiterte: Zeit, offline, Server antwortet ohne Freigabe für die App, gar nicht erreichbar
+  async function pingFehler(f, adresse) {
+    if (f?.name === 'TimeoutError') return 'Keine Antwort nach 10 Sekunden. Bitte Adresse und Internet prüfen.';
+    if (navigator.onLine === false) return 'Du bist offline. Bitte später noch einmal testen.';
+    const erreichbar = await fetch(adresse, { mode: 'no-cors', cache: 'no-store', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(10000) })
+      .then(() => true, () => false);
+    return erreichbar ? originHinweis() : 'Keine Verbindung. Bitte Adresse und Internet prüfen.';
   }
 
   // ---------------------------------------------------------------- Planung
@@ -320,9 +348,12 @@ export async function zeige(container) {
 
   // ---------------------------------------------------------------- App
   async function nachUpdateSuchen(k) {
+    const text = k.lastChild.textContent;
     k.disabled = true;
+    k.lastChild.textContent = 'Suche nach Updates…';
     const r = await pruefeUpdate().catch(() => 'offline');
     k.disabled = false;
+    k.lastChild.textContent = text;
     if (r === 'neu') toast('Neue Version gefunden.', { aktion: { text: 'Neu laden', onclick: ladeNeu } });
     else toast(r === 'aktuell' ? 'Die App ist aktuell.' : r === 'offline' ? 'Keine Verbindung – bitte später noch einmal versuchen.'
       : 'Updates sind hier nicht verfügbar (ohne Service Worker).');
@@ -344,11 +375,14 @@ export async function zeige(container) {
       el('label', { class: 'feld' }, el('span', null, 'Adresse des Dienstes'), proxyFeld),
       el('div', { class: 'leiste' }, knopf('Speichern', proxySpeichern, 'primaer'), knopf('Testen', proxyTesten)),
       proxyMeldung,
+      // Gleiche Schritte wie im Kopf von proxy/worker.js
       hilfe('So richtest du den Dienst ein (kostenlos)', el('ol', null,
-        el('li', null, 'Auf dash.cloudflare.com ein kostenloses Konto anlegen (keine Zahlungsdaten nötig).'),
-        el('li', null, 'Workers & Pages → Create → Worker („Hello World“) → Deploy.'),
-        el('li', null, 'Edit code: den Inhalt durch die Datei proxy/worker.js aus dem App-Repository ersetzen → Deploy.'),
-        el('li', null, 'Die angezeigte Adresse (https://….workers.dev) kopieren, oben einfügen, Speichern, Testen.')))),
+        el('li', null, 'Auf dash.cloudflare.com kostenlos registrieren und anmelden (keine Zahlungsdaten nötig).'),
+        el('li', null, 'Links „Workers & Pages“ → „Create“ (Erstellen) → Vorlage „Hello World“ → „Deploy“.'),
+        el('li', null, '„Edit code“ (Code bearbeiten) öffnen und den vorhandenen Code komplett durch den gesamten Inhalt der Datei proxy/worker.js aus dem App-Repository ersetzen → „Deploy“.'),
+        el('li', null, 'Die angezeigte Adresse https://<name>.<konto>.workers.dev kopieren, oben einfügen, „Speichern“ und „Testen“ tippen. Die Adresse gehört nur hier in die App, nicht ins öffentliche Repository.')),
+      location.origin === STANDARD_ORIGIN ? null : el('p', { class: 'nebentext' },
+        `Diese App läuft unter ${location.origin}. Damit der Dienst ihr antwortet: im Worker unter „Settings“ → „Variables and Secrets“ eine Text-Variable ERLAUBTE_ORIGINS mit dieser Adresse anlegen (mehrere mit Komma getrennt).`))),
     abschnitt('Planung', el('div', { class: 'karte' },
       zeile('Standard-Portionen', 'Für neue Einträge im Wochenplan', el('span', { class: 'stepper' }, weniger, portionenAusgabe, mehr)),
       el('label', { class: 'einstellung' }, el('span', { class: 'fett' }, 'Woche beginnt am'),

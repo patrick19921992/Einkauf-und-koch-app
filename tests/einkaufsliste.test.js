@@ -279,6 +279,8 @@ test('postenSchluessel: Notiz-Zusatz, Dose und Glas bei Frischware', () => {
   assert.equal(k('1 Dose Tomaten (400 g)'), 'tomate, dose');
   assert.equal(k('400 g Tomaten (aus der Dose)'), 'tomate, dose');
   assert.equal(k('400 g Tomaten aus der Dose'), 'tomate, dose');
+  assert.equal(k('200 g passierte Tomaten aus der Dose'), 'tomate, passiert');
+  assert.equal(k('1 Glas Kapern'), 'kaper');
   assert.equal(k('1 Dose Erbsen'), 'erbse, dose');
   assert.equal(k('1 Glas Rote Bete'), 'rote bete, glas');
   assert.equal(k('1 Dose Kichererbsen'), 'kichererbse');

@@ -184,8 +184,9 @@ test('zutatSchluessel: Produkt-Zusätze bleiben im Schlüssel, Zubereitung nicht
   gleich(['frisch gemahlener schwarzer Pfeffer', 'schwarzer Pfeffer, gemahlen'], 'schwarzer pfeffer');
   gleich(['getrockneter Majoran', 'Majoran, getrocknet', 'Majoran'], 'majoran');
   gleich(['Zimt, gemahlen', 'Zimt'], 'zimt');
+  gleich(['Bio- Pfeffer', 'bio-bio-Pfeffer', 'BIO Pfeffer'], 'pfeffer');
   // idempotent
-  for (const k of ['tomate, passiert', 'mandel, gemahlen', 'thymian, getrocknet', 'tomaten in öl, getrocknet']) gleich([k], k);
+  for (const k of ['tomate, passiert', 'mandel, gemahlen', 'thymian, getrocknet', 'tomaten in öl, getrocknet', 'bio-']) gleich([k], k);
 });
 
 test('produktName: Produkt-Zusatz aus der Notiz', () => {
@@ -309,6 +310,9 @@ test('formatMenge: Umrechnung, Spannen und Mehrzahl', () => {
   assert.equal(formatMenge(3, null, 'TL'), '1 EL');
   assert.equal(formatMenge(6, 9, 'TL'), '2–3 EL');
   assert.equal(formatMenge(4, null, 'TL'), '4 TL');
+  assert.equal(formatMenge(7.5, null, 'TL'), '2½ EL');
+  assert.equal(formatMenge(4.5, 6, 'TL'), '1½–2 EL');
+  assert.equal(formatMenge(5, null, 'TL'), '5 TL');
   assert.equal(formatMenge(2, null, 'Dose'), '2 Dosen');
   assert.equal(formatMenge(1, null, 'Dose'), '1 Dose');
   assert.equal(formatMenge(2, null, 'Prise'), '2 Prisen');

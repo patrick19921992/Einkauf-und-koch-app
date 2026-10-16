@@ -29,6 +29,8 @@ let innerhalbNavigiert = false;
 let registrierung = null;
 let wartenderSW = null;
 let updateAngefordert = false;
+let neuGeladen = false;
+let neuladenAusstehend = false;
 
 // ---------------------------------------------------------------- DOM-Helfer
 
@@ -153,6 +155,8 @@ export function kopfAktionen(...knoepfe) {
 
 // ---------------------------------------------------------------- Meldungen
 
+const toastEntfernen = new WeakMap();
+
 /**
  * Kurze Meldung unten. Optional mit Aktion, z. B. { text: 'Rückgängig', onclick }.
  * Gibt eine Funktion zum vorzeitigen Schließen zurück.
@@ -176,7 +180,11 @@ export function toast(text, { aktion = null, dauer = 3500 } = {}) {
       },
     }, aktion.text));
   }
+  toastEntfernen.set(t, entfernen);
   box.append(t);
+  // höchstens drei Meldungen gleichzeitig, die älteste geht zuerst
+  const offen = [...box.querySelectorAll('.toast:not(.weg)')];
+  for (const alt of offen.slice(0, -3)) toastEntfernen.get(alt)?.();
   timer = setTimeout(entfernen, aktion ? Math.max(dauer, 6000) : dauer);
   return entfernen;
 }
@@ -267,6 +275,10 @@ export function dialog({ titel = '', inhalt = null, knoepfe = [{ text: 'OK', wer
       // Klick auf den abgedunkelten Hintergrund
       if (ev.target === d && schliessbar) schliesseDialog(null);
     };
+    d.onclose = () => {
+      // Vom Browser erzwungenes Schließen (z. B. zweimal Zurück trotz schliessbar: false)
+      if (dialogAufloesen === resolve && !d.open) schliesseDialog(null);
+    };
     d.showModal();
     // Eigener Verlaufseintrag, damit die Zurück-Geste nur den Dialog schließt.
     // Läuft noch das Zurückspulen eines vorherigen Dialogs, erst danach eintragen.
@@ -352,7 +364,13 @@ function leseRoute() {
   const fragezeichen = ohneRaute.indexOf('?');
   const pfad = fragezeichen >= 0 ? ohneRaute.slice(0, fragezeichen) : ohneRaute;
   const query = new URLSearchParams(fragezeichen >= 0 ? ohneRaute.slice(fragezeichen + 1) : '');
-  const teile = pfad.split('/').filter(Boolean).map((t) => decodeURIComponent(t));
+  const teile = pfad.split('/').filter(Boolean).map((t) => {
+    try {
+      return decodeURIComponent(t);
+    } catch {
+      return t; // kaputte %-Folge (z. B. abgeschnittener Link): roh weitergeben statt abzustürzen
+    }
+  });
   return { hash, pfad, teile, query };
 }
 
@@ -396,6 +414,11 @@ async function zeigeRoute() {
   if (!def) {
     history.replaceState(null, '', STANDARD_ROUTE);
     zeigeRoute();
+    return;
+  }
+  if (neuladenAusstehend && !def.vollbild) {
+    // Ein anderer Tab hat die neue Version aktiviert: jetzt (nach dem Kochen) neu laden
+    neuLaden();
     return;
   }
   if (aufraeumen) {
@@ -509,18 +532,54 @@ function zeigeUpdateBanner() {
 }
 
 function merkeWartenden(sw) {
+  if (!sw || sw.state === 'redundant') return;
   wartenderSW = sw;
   zeigeUpdateBanner();
 }
 
+/** Lädt genau einmal neu (Update-Wechsel und Sicherheits-Timer dürfen nicht doppelt laden). */
+function neuLaden() {
+  if (neuGeladen) return;
+  neuGeladen = true;
+  location.reload();
+}
+
+/** Wartet, bis ein installierender Service Worker fertig ist (oder scheitert). */
+function warteAufInstallation(sw, ms = 30000) {
+  return new Promise((resolve) => {
+    if (!sw || sw.state !== 'installing') {
+      resolve();
+      return;
+    }
+    const fertig = () => {
+      if (sw.state === 'installing') return;
+      sw.removeEventListener('statechange', fertig);
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      sw.removeEventListener('statechange', fertig);
+      resolve();
+    }, ms);
+    sw.addEventListener('statechange', fertig);
+  });
+}
+
 async function registriereServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
-  const hatteController = !!navigator.serviceWorker.controller;
-  let neuGeladen = false;
+  let bisherigerController = navigator.serviceWorker.controller;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (neuGeladen || !(hatteController || updateAngefordert)) return;
-    neuGeladen = true;
-    location.reload();
+    // Erstinstallation (clients.claim): Seite läuft schon mit der neuesten Version
+    if (!bisherigerController) {
+      bisherigerController = navigator.serviceWorker.controller;
+      if (!updateAngefordert) return;
+    }
+    // Wechsel aus einem anderen Tab: nicht mitten beim Kochen neu laden, sondern beim nächsten Seitenwechsel
+    if (!updateAngefordert && document.body.classList.contains('kochmodus')) {
+      neuladenAusstehend = true;
+      return;
+    }
+    neuLaden();
   });
   try {
     registrierung = await navigator.serviceWorker.register('./sw.js', { scope: './' });
@@ -549,21 +608,26 @@ export async function pruefeUpdate() {
   } catch {
     return 'offline';
   }
-  if (registrierung.waiting || registrierung.installing) {
-    if (registrierung.waiting) merkeWartenden(registrierung.waiting);
+  // update() kehrt zurück, sobald das Skript geladen ist – die Installation (Dateien laden) abwarten,
+  // damit „Neu laden“ danach wirklich die neue Version startet
+  await warteAufInstallation(registrierung.installing);
+  if (registrierung.waiting) {
+    merkeWartenden(registrierung.waiting);
     return 'neu';
   }
-  return 'aktuell';
+  return registrierung.installing ? 'neu' : 'aktuell';
 }
 
 /** Lädt die neue Version (falls eine wartet), sonst einfach neu. */
 export function ladeNeu() {
-  if (wartenderSW) {
+  const sw = registrierung?.waiting || wartenderSW;
+  if (sw && sw.state !== 'redundant') {
     updateAngefordert = true;
-    wartenderSW.postMessage({ typ: 'SKIP_WAITING' });
-    setTimeout(() => location.reload(), 3000);
+    sw.postMessage({ typ: 'SKIP_WAITING' });
+    // Sicherheitsnetz, falls der Wechsel ausbleibt
+    setTimeout(neuLaden, 3000);
   } else {
-    location.reload();
+    neuLaden();
   }
 }
 

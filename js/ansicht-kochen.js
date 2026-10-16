@@ -12,8 +12,15 @@ const WISCH_PX = 60;
 const ALTE_TIMER_MS = 3 * 3600000;  // so lange abgelaufene Timer werden beim Öffnen verworfen
 const TIMER_HINWEIS = 'Timer klingeln nur, solange die App offen und der Bildschirm an ist.';
 const VIBRATION = [400, 200, 400, 200, 400];
+// Abkürzung samt Punkt ersetzen; war der Punkt zugleich Satzende, bleibt er (Pause beim Vorlesen)
+const abk = (wort) => (treffer, ...rest) => {
+  const [pos, text] = rest.slice(-2);
+  return wort + (treffer.endsWith('.') && /^(?:\s*$|\s+[A-ZÄÖÜ])/.test(text.slice(pos + treffer.length)) ? '.' : '');
+};
 // Abkürzungen, die die Sprachausgabe sonst buchstabiert
-const SPRECHEN = [[/\bEL\b/g, 'Esslöffel'], [/\bTL\b/g, 'Teelöffel'], [/\bMin\b\.?/g, 'Minuten'], [/\bStd\b\.?/g, 'Stunden'],
+const SPRECHEN = [[/\bEL\b/g, 'Esslöffel'], [/\bTL\b/g, 'Teelöffel'],
+  [/(?<![\d,.])1\s?[Mm]in\b\.?/g, abk('1 Minute')], [/(?<![\d,.])1\s?Std\b\.?/g, abk('1 Stunde')],
+  [/\b[Mm]in\b\.?/g, abk('Minuten')], [/\bStd\b\.?/g, abk('Stunden')],
   [/\bca\./gi, 'circa'], [/\bevtl\./gi, 'eventuell'], [/\bz\.\s?B\./g, 'zum Beispiel'], [/\bPck\./g, 'Packung'],
   [/(\d)\s?°\s?C?\b/g, '$1 Grad'], [/(\d)\s?g\b/g, '$1 Gramm'], [/(\d)\s?kg\b/g, '$1 Kilogramm'], [/(\d)\s?ml\b/g, '$1 Milliliter'],
   [/(\d)\s?[-–]\s?(\d)/g, '$1 bis $2']];
@@ -61,6 +68,18 @@ function waehleStimme(sprache, wunsch) {
   return (wunsch && stimmen.find((v) => v.voiceURI === wunsch || v.name === wunsch)) ||
     deutsch.find((v) => deDE(v) && v.localService) || deutsch.find(deDE) || deutsch[0] || null;
 }
+
+/** Navigation API: { eigen: Schlüssel dieses Eintrags, vorher: Hash des vorherigen Eintrags der App | null } oder null. */
+function verlaufsLage() {
+  const nav = globalThis.navigation;
+  try {
+    const vorher = nav.currentEntry.index > 0 ? nav.entries()[nav.currentEntry.index - 1] : null;
+    return { eigen: nav.currentEntry.key, vorher: vorher?.sameDocument && vorher.url ? new URL(vorher.url).hash : null };
+  } catch {
+    return null; // Browser ohne Navigation API
+  }
+}
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Ersetzt den Inhalt; null/false werden ausgelassen
 const fuelle = (ziel, ...kinder) => ziel.replaceChildren(...kinder.flat(Infinity).filter((k) => k != null && typeof k !== 'boolean'));
@@ -131,6 +150,8 @@ function wachhaltung(melden) {
 
 export async function zeige(container, route) {
   const id = route.teile[1];
+  const rezeptHash = `#/rezept/${encodeURIComponent(id)}`;
+  const lage = verlaufsLage(); // vor dem ersten Dialog lesen (Dialoge legen eigene Einträge an)
   const [rezept, einstellungen] = await Promise.all([db.hole('recipes', id), db.holeEinstellungen()]);
   const koch = el('div', { class: 'koch' });
   container.append(koch);
@@ -280,7 +301,7 @@ export async function zeige(container, route) {
     const box = el('div', { class: 'koch-start' }, el('h2', null, 'Fertig – guten Appetit!'), el('p', { class: 'nebentext' }, rezept.title || ''));
     fuelle(koch, kopf('Fertig'), fortschritt, box, timerLeiste, el('div', { class: 'koch-navi' },
       knopf('', () => zeigeSchritt(schritte.length - 1), symbol(SYMBOLE.zurueck), 'Letzter Schritt'),
-      knopf('primaer', () => navigiere(`#/rezept/${encodeURIComponent(id)}`, { ersetzen: true }), 'Zurück zum Rezept')));
+      knopf('primaer', () => zumRezept(), 'Zurück zum Rezept')));
     // Plan-Eintrag aus ?plan=…, sonst der heutige, noch nicht gekochte Eintrag dieses Rezepts
     const planId = route.query.get('plan');
     const eintrag = await (planId ? db.hole('planEntries', planId)
@@ -313,7 +334,18 @@ export async function zeige(container, route) {
       { titel: 'Kochmodus verlassen?', ja: 'Verlassen', nein: 'Weiterkochen' });
       if (!ok) return;
     }
-    if (aktiv) zurueck();
+    if (aktiv) zurueckOder(lage?.vorher);
+  }
+  // Kam der Kochmodus vom Rezept, geht es im Verlauf zurück (kein doppelter Eintrag)
+  const zumRezept = () => zurueckOder(lage?.vorher?.split('?')[0] === rezeptHash);
+
+  // Zurück zur vorherigen Seite der App (klappt auch nach Neuladen), sonst zum Rezept statt zur Liste
+  async function zurueckOder(imVerlauf) {
+    if (imVerlauf === undefined) return void zurueck(); // Browser ohne Navigation API
+    if (!imVerlauf) return void navigiere(rezeptHash, { ersetzen: true });
+    // erst warten, bis ein Dialog seinen eigenen Verlaufseintrag wieder abgebaut hat
+    for (let i = 0; i < 20 && navigation.currentEntry?.key !== lage.eigen; i++) await pause(50);
+    if (aktiv) { if (navigation.currentEntry?.key === lage.eigen) history.back(); else zurueck(); }
   }
 
   // ---------------------------------------------------------------- Timer
@@ -436,6 +468,8 @@ export async function zeige(container, route) {
   const lauscher = [[koch, 'touchstart', beiBeruehrung], [koch, 'touchend', beiLoslassen], [koch, 'touchcancel', () => { wisch = null; }],
     [document, 'keydown', beiTaste], [document, 'visibilitychange', beiSichtbarkeit]];
   for (const [ziel, typ, fn] of lauscher) ziel.addEventListener(typ, fn, { passive: typ.startsWith('touch') });
+  // Waagerechtes Wischen blättert Schritte – nicht zusätzlich im Browser-Verlauf (Chrome mit Touch/Touchpad)
+  document.documentElement.style.overscrollBehaviorX = 'none';
   let ladeVerzoegerung = null; // Timer-Änderungen (auch aus anderen Tabs) gesammelt nachladen
   const abmelden = db.beobachte(({ store }) => {
     if (store === 'timers') { clearTimeout(ladeVerzoegerung); ladeVerzoegerung = setTimeout(() => ladeTimer().catch(() => {}), 100); }
@@ -456,5 +490,6 @@ export async function zeige(container, route) {
     wach.freigeben();
     ton.schliessen();
     alarm.remove();
+    document.documentElement.style.overscrollBehaviorX = '';
   };
 }

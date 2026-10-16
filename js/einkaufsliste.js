@@ -217,7 +217,7 @@ function abteilungIntern(key, aliase, einheiten) {
 // Dose/Glas in Notiz oder Name ('Tomaten (aus der Dose)', 'Tomaten aus der Dose')
 const DOSE_NOTIZ_RE = /(?:^|[^\p{L}])(?:dosen?|konserven?)(?!\p{L})/iu;
 const GLAS_NOTIZ_RE = /(?:^|[^\p{L}])glas(?!\p{L})/iu;
-const BEHAELTER_NAME_RE = / (?:aus der dose|aus der konserve|in der dose|aus dem glas|im glas)$/;
+const BEHAELTER_NAME_RE = / (?:aus der dose|aus der konserve|in der dose|aus dem glas|im glas)(?=,|$)/;
 
 /**
  * Schlüssel einer Zutat für die Einkaufsliste: zutatSchluessel samt Produkt-Zusatz aus der Notiz.
@@ -231,7 +231,7 @@ export function postenSchluessel(zutat) {
   let glas = !dose && (zutat?.unit === 'Glas' || GLAS_NOTIZ_RE.test(note));
   const m = k.match(BEHAELTER_NAME_RE);
   if (m) {
-    k = zutatSchluessel(k.slice(0, m.index));
+    k = zutatSchluessel(k.slice(0, m.index) + k.slice(m.index + m[0].length));
     if (m[0].includes('glas')) glas = !dose;
     else dose = true;
   }

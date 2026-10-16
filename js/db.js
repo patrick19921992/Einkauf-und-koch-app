@@ -98,11 +98,18 @@ function oeffne() {
       anlegen('settings');
       anlegen('timers');
     };
+    // Blockiert ein alter Tab das Öffnen: kurz warten (er schließt meist von selbst), dann abbrechen
+    let blockiert = null;
     req.onblocked = () => {
-      reject(new Error('Die App ist noch in einem anderen Tab geöffnet. Bitte dort schließen und neu laden.'));
+      blockiert ??= setTimeout(() => {
+        blockiert = 'aus';
+        reject(new Error('Die App ist noch in einem anderen Tab geöffnet. Bitte dort schließen und neu laden.'));
+      }, 5000);
     };
     req.onsuccess = () => {
       const db = req.result;
+      if (blockiert === 'aus') return db.close(); // zu spät geöffnet: Verbindung nicht liegen lassen
+      clearTimeout(blockiert);
       db.onversionchange = () => {
         db.close();
         dbVersprechen = null;
@@ -120,10 +127,20 @@ function oeffne() {
   return dbVersprechen;
 }
 
-async function transaktion(stores, modus, arbeit) {
+async function transaktion(stores, modus, arbeit, nochmal = true) {
   const db = await oeffne();
+  let tx;
+  try {
+    tx = db.transaction(stores, modus);
+  } catch (e) {
+    // Verbindung wurde vom Browser geschlossen (z. B. lange im Hintergrund): einmal neu öffnen
+    if (nochmal && e?.name === 'InvalidStateError') {
+      dbVersprechen = null;
+      return transaktion(stores, modus, arbeit, false);
+    }
+    throw e;
+  }
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(stores, modus);
     let ergebnis;
     tx.oncomplete = () => resolve(ergebnis);
     tx.onerror = () => reject(tx.error);
@@ -285,21 +302,70 @@ export async function bereinige(tage = 90) {
 
 // ---------------------------------------------------------------- Einstellungen
 
+const MAHLZEITEN = ['frueh', 'mittag', 'abend', 'snack'];
+const istTextListe = (v) => Array.isArray(v) && v.every((x) => typeof x === 'string');
+
+// Prüft einen gespeicherten Wert (z. B. aus einer fremden oder alten Sicherung); ungültig → Standard
+const PRUEFUNG = {
+  wochenstart: (v) => [0, 1, 6].includes(v),
+  standardPortionen: (v) => Number.isFinite(v) && v >= 1 && v <= 99,
+  mahlzeiten: (v) => istTextListe(v) && v.length > 0 && v.every((m) => MAHLZEITEN.includes(m)),
+  abteilungsReihenfolge: (v) => v === null || istTextListe(v),
+  vorrat: istTextListe,
+  geraetId: (v) => v === null || typeof v === 'string',
+  proxyUrl: (v) => typeof v === 'string',
+  ttsStimme: (v) => typeof v === 'string',
+  ttsTempo: (v) => Number.isFinite(v) && v >= 0.5 && v <= 2,
+  autoVorlesen: (v) => typeof v === 'boolean',
+  letzteSicherung: (v) => v === null || Number.isFinite(v),
+};
+
+// Einstellungen werden nacheinander geschrieben, damit gleichzeitige Änderungen sich nicht überschreiben
+let einstellungsKette = Promise.resolve();
+function nacheinander(arbeit) {
+  const r = einstellungsKette.then(arbeit);
+  einstellungsKette = r.catch(() => {});
+  return r;
+}
+
+/** Gültiger Wert einer Einstellung oder undefined. Zahlen aus Formularfeldern kommen manchmal als Text. */
+function gueltig(k, v) {
+  if (typeof v === 'string' && typeof STANDARD_EINSTELLUNGEN[k] === 'number' && v.trim()) v = Number(v);
+  if (v === undefined || !PRUEFUNG[k](v)) return undefined;
+  return Array.isArray(v) ? [...v] : v;
+}
+
+function zusammenfuehren(haushalt, geraet) {
+  const e = { ...STANDARD_EINSTELLUNGEN };
+  for (const k of HAUSHALT_SCHLUESSEL) e[k] = gueltig(k, haushalt?.[k]) ?? e[k];
+  for (const k of GERAET_SCHLUESSEL) e[k] = gueltig(k, geraet?.[k]) ?? e[k];
+  return e;
+}
+
 /** Alle Einstellungen zusammengeführt (Haushalt + Gerät, mit Standardwerten). */
 export async function holeEinstellungen() {
   const [haushalt, geraet] = await Promise.all([hole('settings', 'haushalt'), hole('settings', 'geraet')]);
-  const e = { ...STANDARD_EINSTELLUNGEN };
-  for (const k of HAUSHALT_SCHLUESSEL) if (haushalt && haushalt[k] !== undefined) e[k] = haushalt[k];
-  for (const k of GERAET_SCHLUESSEL) if (geraet && geraet[k] !== undefined) e[k] = geraet[k];
+  const e = zusammenfuehren(haushalt, geraet);
   if (!e.geraetId) {
-    e.geraetId = neueId();
-    await speichere('settings', { ...(geraet || {}), id: 'geraet', geraetId: e.geraetId });
+    // Geräte-Kennung einmalig anlegen (nacheinander, damit parallele Aufrufe dieselbe bekommen)
+    e.geraetId = await nacheinander(async () => {
+      const g = await hole('settings', 'geraet');
+      if (g?.geraetId) return g.geraetId;
+      const id = neueId();
+      await speichere('settings', { ...(g || {}), id: 'geraet', geraetId: id });
+      return id;
+    });
   }
   return e;
 }
 
 /** Speichert einen Teil der Einstellungen. Unbekannte Schlüssel werden ignoriert. */
 export async function speichereEinstellungen(teil) {
+  await nacheinander(() => schreibeEinstellungen(teil));
+  return holeEinstellungen();
+}
+
+async function schreibeEinstellungen(teil) {
   const [haushalt, geraet] = await Promise.all([hole('settings', 'haushalt'), hole('settings', 'geraet')]);
   const h = { ...(haushalt || {}), id: 'haushalt' };
   const g = { ...(geraet || {}), id: 'geraet' };
@@ -316,7 +382,6 @@ export async function speichereEinstellungen(teil) {
   }
   if (hGeaendert) await speichere('settings', h);
   if (gGeaendert) await speichere('settings', g);
-  return holeEinstellungen();
 }
 
 // ---------------------------------------------------------------- Sicherung
@@ -371,7 +436,10 @@ export async function importiere(sicherung) {
   }
   const zaehler = { neu: 0, aktualisiert: 0, uebersprungen: 0 };
   for (const store of SYNC_STORES) {
-    const eingehend = Array.isArray(s.daten[store]) ? s.daten[store].filter((d) => d && d.id) : [];
+    // nur Datensätze mit gültiger id (sonst bricht IndexedDB die ganze Übernahme ab)
+    const eingehend = Array.isArray(s.daten[store])
+      ? s.daten[store].filter((d) => d && typeof d === 'object' && !Array.isArray(d) && typeof d.id === 'string' && d.id)
+      : [];
     if (!eingehend.length) continue;
     const vorhanden = new Map((await alle(store, { mitGeloeschten: true })).map((d) => [d.id, d]));
     const uebernehmen = [];
@@ -391,13 +459,18 @@ export async function importiere(sicherung) {
   }
   const e = s.daten.einstellungen;
   if (e && typeof e === 'object') {
-    const vorhanden = await hole('settings', 'haushalt');
-    if (importEntscheidung(vorhanden, e) !== 'uebersprungen') {
+    await nacheinander(async () => {
+      const vorhanden = await hole('settings', 'haushalt');
+      if (importEntscheidung(vorhanden, e) === 'uebersprungen') return;
       const h = { id: 'haushalt', createdAt: e.createdAt, updatedAt: e.updatedAt || Date.now() };
-      for (const k of HAUSHALT_SCHLUESSEL) if (e[k] !== undefined) h[k] = e[k];
+      // nur gültige Werte übernehmen, sonst bleibt der bisherige Stand
+      for (const k of HAUSHALT_SCHLUESSEL) {
+        const v = gueltig(k, e[k]) ?? vorhanden?.[k];
+        if (v !== undefined) h[k] = v;
+      }
       await transaktion(['settings'], 'readwrite', (tx) => anfrage(tx.objectStore('settings').put(h)));
       meldeAenderung('settings', ['haushalt']);
-    }
+    });
   }
   return zaehler;
 }

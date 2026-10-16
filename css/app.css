@@ -6,10 +6,12 @@
   color-scheme: light dark;
   --primaer: #2e7d32;            /* Füllfarbe (Knöpfe, Kopfzeile) */
   --auf-primaer: #fff;
-  --primaer-text: #2e7d32;       /* grüner Text / Symbole auf Fläche */
+  --primaer-text: #2b7a30;       /* grüner Text / Symbole auf Fläche (≥ 4,5:1 auch auf --flaeche-2) */
   --primaer-stark: #1b5e20;      /* Text auf hellem Grün */
   --primaer-hell: #e3f1e4; --erfolg-rand: #81c784; --hintergrund: #f5f7f3; --flaeche: #fff; --flaeche-2: #edf1ec; --feld: #fff;
   --text: #1a1f1b; --gedimmt: #5a635c; --linie: #dde3dc; --linie-stark: #b3beb4;
+  --feld-rand: #879489;          /* Rand von Eingabefeldern (≥ 3:1) */
+  --dlg-rand: transparent; --abdunkeln: rgb(0 0 0 / .5);
   --warn-bg: #fff3e0; --warn-text: #8a4b00; --warn-rand: #ef6c00; --warn-badge: #ffe0b2;
   --erfolg-bg: #e8f5e9; --fehler-bg: #fdecea; --fehler-text: #7f1d1d; --gefahr: #c62828;
   --invers-bg: #2b312c; --invers-text: #f1f4f1; --invers-aktion: #a5d6a7;
@@ -26,6 +28,7 @@
     --primaer-text: #81c784; --primaer-stark: #a5d6a7; --primaer-hell: #1e3a20; --erfolg-rand: #2e7d32;
     --hintergrund: #111311; --flaeche: #1b1e1b; --flaeche-2: #262a26; --feld: #151815;
     --text: #e5e9e5; --gedimmt: #a3aca4; --linie: #313731; --linie-stark: #4f5850;
+    --feld-rand: #646e65; --dlg-rand: #3d453e; --abdunkeln: rgb(0 0 0 / .7);
     --warn-bg: #36270f; --warn-text: #ffcc80; --warn-rand: #ff9800; --warn-badge: #4a3210;
     --erfolg-bg: #1a2e1b; --fehler-bg: #3a1614; --fehler-text: #ffb4ab;
     --invers-bg: #e3e8e3; --invers-text: #1a1f1b; --invers-aktion: #1b5e20;
@@ -39,6 +42,7 @@ body.kochmodus {
   color-scheme: dark; --primaer-text: #81c784; --primaer-stark: #a5d6a7; --primaer-hell: #1e3a20; --erfolg-rand: #2e7d32;
   --hintergrund: #0d0f0d; --flaeche: #181b18; --flaeche-2: #232723; --feld: #151815;
   --text: #f1f4f1; --gedimmt: #a9b2aa; --linie: #2e342e; --linie-stark: #4f5850;
+  --feld-rand: #646e65; --dlg-rand: #3d453e; --abdunkeln: rgb(0 0 0 / .7);
   --warn-bg: #36270f; --warn-text: #ffcc80; --warn-rand: #ff9800; --warn-badge: #4a3210;
   --erfolg-bg: #1a2e1b; --fehler-bg: #3a1614; --fehler-text: #ffb4ab; --invers-bg: #e3e8e3; --invers-text: #1a1f1b; --invers-aktion: #1b5e20;
   --fokus: #81c784; --hover: rgb(255 255 255 / .08); --druck: rgb(255 255 255 / .14);
@@ -138,6 +142,9 @@ main#inhalt:focus { outline: none; }
   background: transparent; color: var(--invers-aktion); font-weight: 700; cursor: pointer;
 }
 @keyframes toast-ein { from { opacity: 0; transform: translateY(12px); } }
+@media (max-width: 760px) {
+  body:has(.fab) .toasts { bottom: calc(var(--unten) + var(--banner-hoehe) + 88px); }
+}
 
 /* Kochmodus: Vollbild ohne Kopf und Navigation */
 body.kochmodus { padding-bottom: 0; }
@@ -251,7 +258,7 @@ svg.symbol { display: inline-block; width: 24px; height: 24px; flex-shrink: 0; f
 
 /* ------------------------------------------------------------------ Formulare */
 input, select, textarea {
-  width: 100%; min-height: 48px; margin: 0; padding: 10px 12px; border: 1px solid var(--linie-stark); border-radius: 10px;
+  width: 100%; min-height: 48px; margin: 0; padding: 10px 12px; border: 1px solid var(--feld-rand); border-radius: 10px;
   background-color: var(--feld); color: var(--text); font: inherit; font-size: 1rem; line-height: 1.35;
 }
 textarea { min-height: 120px; resize: vertical; }
@@ -312,11 +319,11 @@ a.listen-eintrag, button.listen-eintrag {
 
 /* ------------------------------------------------------------------ Dialog */
 dialog.dlg {
-  width: min(520px, calc(100% - 32px)); max-width: none; max-height: calc(100% - 32px); padding: 0; border: 0;
+  width: min(520px, calc(100% - 32px)); max-width: none; max-height: calc(100% - 32px); padding: 0; border: 1px solid var(--dlg-rand);
   border-radius: 20px; overflow: hidden; background: var(--flaeche); color: var(--text); box-shadow: var(--schatten-hoch);
 }
 dialog.dlg[open] { display: flex; flex-direction: column; animation: dlg-ein .18s ease-out; }
-dialog.dlg::backdrop { background: rgb(0 0 0 / .5); animation: einblenden .18s ease-out; }
+dialog.dlg::backdrop { background: var(--abdunkeln); animation: einblenden .18s ease-out; }
 .dlg-titel { padding: 20px 20px 4px; font-size: 1.25rem; }
 .dlg-inhalt { flex: 1 1 auto; min-height: 0; max-height: 70vh; overflow-y: auto; overscroll-behavior: contain; padding: 12px 20px; }
 .dlg-inhalt:first-child { padding-top: 20px; }
@@ -413,7 +420,7 @@ dialog.dlg::backdrop { background: rgb(0 0 0 / .5); animation: einblenden .18s e
   padding: 12px 16px 6px; border-radius: var(--rund-gross) var(--rund-gross) 0 0; background: var(--flaeche);
   font-size: .8125rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--primaer-text);
 }
-.seite .abteilung > h2 { position: sticky; top: calc(var(--kopf-hoehe) + var(--eingabe-hoehe)); z-index: 5; }
+.seite .abteilung > h2 { position: sticky; top: calc(var(--kopf-hoehe) + var(--eingabe-hoehe)); z-index: 5; box-shadow: 0 1px 0 var(--linie); }
 :is(.abteilung, .klappe) .liste { overflow: visible; border: 0; border-radius: 0; background: transparent; }
 .posten { display: flex; align-items: center; gap: 4px; min-height: 56px; padding: 0 4px 0 16px; border-top: 1px solid var(--linie); }
 .posten > label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 14px; min-height: 56px; padding: 6px 0; cursor: pointer; }
@@ -444,6 +451,7 @@ details > summary::before { /* Pfeil ▸ / ▾ */
 details[open] > summary::before { transform: rotate(45deg); }
 details[open] > summary { border-radius: var(--rund-gross) var(--rund-gross) 0 0; }
 details.klappe > summary { color: var(--gedimmt); }
+details.klappe > :not(summary):not(.liste) { margin: 0 16px 12px; }
 details.hilfe > :not(summary) { margin: 0 16px 12px; }
 .aktionen-leiste { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
 .aktionen-leiste > * { flex: 1 1 auto; }
@@ -457,14 +465,14 @@ details.hilfe > :not(summary) { margin: 0 16px 12px; }
 .koch > :is(.koch-schritt, .koch-start) { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .koch-kopf { display: flex; align-items: center; gap: 8px; min-height: 56px; padding: 4px 12px 4px 4px; }
 .koch-zaehler {
-  flex: 1; min-width: 0; font-size: 1.125rem; font-weight: 700; font-variant-numeric: tabular-nums;
+  flex: 1 0 auto; max-width: 100%; font-size: 1.125rem; font-weight: 700; font-variant-numeric: tabular-nums;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .wachhalten {
-  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; flex-shrink: 0;
-  background: var(--primaer-hell); color: var(--primaer-stark); font-size: .75rem; font-weight: 600; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 4px 10px; border-radius: 999px; flex-shrink: 1;
+  background: var(--primaer-hell); color: var(--primaer-stark); font-size: .75rem; font-weight: 600; line-height: 1.25;
 }
-.wachhalten::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.wachhalten::before { content: ""; flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 .wachhalten.aus { background: var(--warn-badge); color: var(--warn-text); }
 .fortschritt { height: 4px; margin: 0 16px; overflow: hidden; border-radius: 2px; background: var(--flaeche-2); }
 .fortschritt > * { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--primaer-text); transition: width .3s ease; }
@@ -492,6 +500,7 @@ details.hilfe > :not(summary) { margin: 0 16px 12px; }
 .koch-start h2 { font-size: 1.5rem; }
 details.koch-zutaten { margin: 4px 16px; border: 1px solid var(--linie); border-radius: var(--rund-gross); background: var(--flaeche); }
 details.koch-zutaten > :not(summary) { max-height: 38vh; max-height: 38dvh; overflow-y: auto; padding: 0 16px 12px; }
+@media (max-height: 820px) { details.koch-zutaten > :not(summary) { max-height: 28vh; max-height: 28dvh; } }
 .alarm-overlay {
   position: fixed; inset: 0; z-index: 100; margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 32px;
   padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));

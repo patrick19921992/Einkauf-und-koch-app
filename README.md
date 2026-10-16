@@ -57,7 +57,9 @@ nimmt nur Anfragen von der App-Adresse an und ruft nur bekannte Rezeptseiten ab
 - **Einkaufen:** Reiter Einkauf. Abhaken funktioniert ohne Netz. Falsche Abteilung? Zeile → ⋮ →
   „Abteilung ändern“ – die App merkt es sich. Nach dem Einkauf „Einkauf abschließen“.
 - **Kochen:** Rezept → „Kochen“ → „Kochmodus starten“. Wischen oder große Knöpfe für weiter/zurück.
-- **Updates:** Erscheint „Neue Version verfügbar“, auf „Neu laden“ tippen.
+- **Updates:** Erscheint „Neue Version verfügbar“, auf „Neu laden“ tippen (oder unter Mehr →
+  „Nach Update suchen“). Im Kochmodus wartet der Hinweis, bis du fertig bist – es wird nie mitten
+  beim Kochen neu geladen.
 
 ## Wichtige Grenzen
 
@@ -105,5 +107,9 @@ Ohne Build-Werkzeuge und ohne npm-Pakete. Mit Node.js 22 oder neuer:
 ```bash
 node --test                 # alle Tests
 node tools/build.mjs        # Veröffentlichung nach _site/ zusammenstellen
-npx http-server _site       # lokal ansehen (http://localhost:8080)
+cd _site && python3 -m http.server 8080   # lokal ansehen: http://localhost:8080/
 ```
+
+Alle Pfade sind relativ, die App läuft also auch lokal unter einer anderen Adresse. Offline-Liste
+und Update-Hinweise gibt es nur in der gebauten Fassung (`_site`): Im Quellordner ist die Dateiliste
+in `sw.js` leer, dort kommt alles direkt aus dem Netz.

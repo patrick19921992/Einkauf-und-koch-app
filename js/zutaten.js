@@ -396,7 +396,7 @@ export function zutatSchluessel(name) {
   s = toks.join(' ').toLowerCase().replace(/^(?:beste wahl|feine welt|gut & günstig) +/, '');
   // vorne: Produkt-Zusätze merken, Zubereitung und 'bio' weg
   for (;;) {
-    s = s.replace(/^bio-/, '');
+    s = s.replace(/^(?:bio- *)+/, '') || s;
     const leer = s.indexOf(' ');
     if (leer < 0) break;
     const wort = s.slice(0, leer);
@@ -524,7 +524,8 @@ function mengenTeile(qty, qty2, unit) {
   let b = zahlOk(qty2) && Number(qty2) !== a ? Number(qty2) : null;
   let id = einheitId(unit);
   const teilen = (d) => { a /= d; if (b != null) b /= d; };
-  const dreierTL = (x) => x >= 3 && Math.abs(x / 3 - Math.round(x / 3)) < 1e-6;
+  // ab 3 TL in ganzen oder halben EL: 9 TL → 3 EL, 7,5 TL → 2½ EL (4 TL bleiben 4 TL)
+  const dreierTL = (x) => x >= 3 && Math.abs((x * 2) / 3 - Math.round((x * 2) / 3)) < 1e-6;
   if (id === 'g' && a >= 1000) { teilen(1000); id = 'kg'; }
   else if (id === 'ml' && a >= 1000) { teilen(1000); id = 'l'; }
   else if (id === 'TL' && dreierTL(a) && (b == null || dreierTL(b))) { teilen(3); id = 'EL'; }
